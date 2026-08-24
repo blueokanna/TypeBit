@@ -51,15 +51,15 @@ jobs:
       - name: Check bare-metal no_std build
         run: cargo check --target aarch64-unknown-none --no-default-features
 
-  # MSRV as declared in Cargo.toml (1.87, required by courierust).
+  # MSRV as declared in Cargo.toml (1.89, required by courierust 1.0.2).
   msrv:
-    name: MSRV 1.87
+    name: MSRV 1.89
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.87
-        uses: dtolnay/rust-toolchain@1.87.0
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Check on MSRV
         run: cargo check --features std

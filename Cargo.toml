@@ -2,8 +2,7 @@
 name = "typebit"
 version = "0.1.0"
 edition = "2021"
-# `courierust` 1.0 uses `is_multiple_of` (stabilized 1.87).
-rust-version = "1.87"
+rust-version = "1.89"
 license = "AGPL-3.0-or-later"
 authors = ["blueokanna HyphenTeam"]
 description = "TypeBit: a no_std universal download engine for torrent (v1/v2, DHT, PEX, web seeds), eD2k/eMule, Xunlei, FlashGet, QQDL, IPFS, Kad and direct HTTP(S)/FTP, with provable-download receipts and a semantic utility scheduler."
