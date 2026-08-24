@@ -1,11 +1,7 @@
-//! MD4 message digest (RFC 1320), `no_std` + alloc.
-//!
-//! Implemented because the eD2k/eMule network identifies files by the MD4
-//! of their content (`ed2k://|file|<name>|<size>|<md4>|/`). MD4 is broken
-//! for collision resistance; it is used here purely for eMule-link
-//! compatibility and **never** for integrity-critical receipts (those use
-//! Ed25519/SHA-256). Streams larger than 2^61 bytes are not supported
-//! (the length field is 64-bit, consistent with the RFC).
+//! MD4 (RFC 1320), `no_std` + alloc, for eMule file identification
+//! (`ed2k://|file|<name>|<size>|<md4>|/`). Broken for collision resistance;
+//! used only for eMule-link compatibility, **never** for receipts
+//! (those use Ed25519/SHA-256). 64-bit length field (RFC-consistent).
 
 use alloc::vec::Vec;
 

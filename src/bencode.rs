@@ -1,10 +1,6 @@
-//! Bencode codec (BEP-3) with strict resource limits.
-//!
-//! Used for `.torrent` metainfo, tracker announce/scrape responses and DHT
-//! KRPC messages. Byte strings preserve raw bytes (torrents carry binary
-//! hash data). The parser also exposes a raw-range walker so the exact
-//! bencoded `info` dictionary can be captured for infohash computation
-//! without re-encoding.
+//! Bencode codec (BEP-3) with strict resource limits, for `.torrent`
+//! metainfo, tracker announce/scrape and DHT KRPC. Exposes a raw-range
+//! walker to capture the exact `info` dict for infohash computation.
 
 use crate::error::{Error, Result};
 use alloc::collections::BTreeMap;

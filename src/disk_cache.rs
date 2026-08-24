@@ -1,8 +1,6 @@
-//! Write-back disk cache. Piece blocks are buffered and flushed in large,
-//! offset-ordered coalesced batches — fewer writes, fewer seeks, and a
-//! piece is flushed to stable storage before it is verified/published.
-//!   hash verifies, so only good data ever reaches the disk.
-//! * **Read-through**: serving while seeding reads coalesced pages too.
+//! Write-back disk cache: blocks are buffered and flushed in large,
+//! offset-ordered coalesced batches (fewer writes/seeks); a piece hits
+//! stable storage before it is verified. Read-through serves seeding reads.
 //!
 //! `no_std + alloc`, zero `unsafe`.
 

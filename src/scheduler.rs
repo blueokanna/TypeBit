@@ -1,24 +1,14 @@
-//! Semantic, utility-driven piece scheduler.
-//!
-//! Implements the research-grade scheduling model from the spec:
+//! Semantic, utility-driven piece scheduler:
 //!
 //! ```text
 //! p* = argmax_p [ α·U_task(p) + β·U_availability(p) − γ·C_network(p) − δ·R_integrity(p) ]
 //! ```
 //!
-//! * `U_task` is content-aware: video files prefer head+tail (so playback
-//!   can start while downloading), archives prefer the tail (central
-//!   directory) and head (local headers), model weights prefer the head
-//!   (metadata/shards).
-//! * `U_availability` rewards *rarity* (rarest-first keeps the swarm
-//!   healthy and unblocks peers).
-//! * `C_network` penalizes pieces far from the current download frontier
-//!   (disk-locality, reduced seeks).
-//! * `R_integrity` penalizes pieces touched by suspicious peers
-//!   (anti-poisoning / anti-pollution).
-//!
-//! The [`Scheduler`] produces a per-piece integer utility vector consumed
-//! by [`crate::picker::Picker`].
+//! `U_task` is content-aware (video: head+tail; archives: tail then head;
+//! weights: head), `U_availability` rewards rarity (rarest-first),
+//! `C_network` penalizes pieces far from the frontier, `R_integrity` pieces
+//! touched by suspicious peers. Produces a per-piece integer utility vector
+//! consumed by [`crate::picker::Picker`].
 
 use crate::metainfo::Torrent;
 use alloc::vec::Vec;

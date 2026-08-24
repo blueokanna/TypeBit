@@ -146,7 +146,6 @@ impl Bitfield {
         }
         let mut w = from as usize / 64;
         let mut b = from % 64;
-        // scan within word: check each bit
         loop {
             if w >= self.words.len() {
                 return None;

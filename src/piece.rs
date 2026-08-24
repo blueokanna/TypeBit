@@ -1,9 +1,6 @@
-//! Per-torrent piece/block state tracking.
-//!
-//! A torrent is split into pieces (`piece_length` bytes each, last one
-//! possibly shorter); every piece is split into 16 KiB blocks. This module
-//! tracks which pieces are verified-complete, which are partially received,
-//! and which blocks have arrived for the in-flight pieces.
+//! Per-torrent piece/block state tracking: pieces of `piece_length` bytes
+//! (last possibly shorter), each split into 16 KiB blocks. Tracks verified,
+//! partially-received, and in-flight block state.
 
 use crate::bitfield::Bitfield;
 use crate::consts::BLOCK_LEN;

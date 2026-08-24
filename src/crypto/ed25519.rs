@@ -1,11 +1,8 @@
 //! Ed25519 (RFC 8032) — pure `no_std`, zero `unsafe`, from scratch.
 //!
-//! This is the signature primitive behind TypeBit's *provable download /
-//! availability receipts*. Field arithmetic is radix-2^51 with 5×u64 limbs
-//! over GF(2^255 − 19); points are Edwards extended coordinates; scalars
-//! are reduced modulo the group order L with a 512→256 bit binary
-//! shift-subtract reduction. Correctness is pinned by the RFC 8032 §7.1
-//! test vectors.
+//! The signature primitive behind provable-download receipts: radix-2^51
+//! 5×u64 limbs over GF(2^255 − 19), Edwards extended coordinates, scalars
+//! mod group order L; pinned by RFC 8032 §7.1 vectors.
 
 use super::sha512::Sha512;
 use alloc::vec::Vec;

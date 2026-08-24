@@ -1,10 +1,6 @@
-//! Per-torrent session: the heart of the engine.
-//!
-//! A [`TorrentSession`] owns everything for one torrent: peer connections,
-//! piece/block bookkeeping, the utility scheduler, tracker/DHT/PEX peer
-//! discovery, metadata fetching (magnet links), the receipt book and the
-//! swarm monitor. It talks to the outside world through a [`SessionCtx`]
-//! that carries the host, the shared disk cache, the DHT and an event sink.
+//! Per-torrent session: owns peer connections, piece/block bookkeeping, the
+//! utility scheduler, tracker/DHT/PEX discovery, metadata fetching (magnet
+//! links), receipts and the swarm monitor; talks outward via [`SessionCtx`].
 
 use crate::bitfield::Bitfield;
 use crate::consts::BLOCK_LEN;
@@ -248,6 +244,9 @@ pub struct SessionCtx<'a, H: Host> {
 }
 
 impl TorrentSession {
+    /// Cap on remembered PEX endpoints (flood bound).
+    const MAX_PEX_KNOWN: usize = 2048;
+
     /// Create a session from a parsed torrent.
     pub fn from_torrent(torrent: Torrent, cfg: SessionConfig, now: u64) -> Result<TorrentSession> {
         let info_hash = torrent.info_hash;
@@ -1078,6 +1077,9 @@ impl TorrentSession {
                 total_size,
                 data,
             } => {
+                if total_size > crate::consts::MAX_METADATA_SIZE {
+                    return Err(Error::Protocol);
+                }
                 let meta = match self.metadata.as_mut() {
                     Some(m) => m,
                     None => return Ok(()),
@@ -1085,6 +1087,8 @@ impl TorrentSession {
                 if meta.size == 0 {
                     meta.size = total_size;
                     meta.requested = Bitfield::new(total_size.div_ceil(16 * 1024));
+                } else if meta.size != total_size {
+                    return Err(Error::Protocol);
                 }
                 if piece as usize >= meta.requested.len() as usize {
                     return Ok(());
@@ -1445,6 +1449,10 @@ impl TorrentSession {
     // ---------- peer queue / discovery ----------
 
     fn enqueue_peer(&mut self, addr: NetAddr, source: DiscoverySource, now: u64) {
+        // absolute cap on queued candidates (flood bound)
+        if self.connect_queue.len() >= 4 * self.cfg.max_peers.max(1) as usize {
+            return;
+        }
         if self.peers.len() as u32 >= self.cfg.max_peers {
             return;
         }
@@ -1531,7 +1539,7 @@ impl TorrentSession {
             if self.peers.get(&conn).map(|p| p.addr) == Some(a) {
                 continue;
             }
-            if !self.pex_known.contains(&a) {
+            if !self.pex_known.contains(&a) && self.pex_known.len() < Self::MAX_PEX_KNOWN {
                 self.pex_known.push(a);
             }
             self.enqueue_peer(a, DiscoverySource::Pex, ctx.now);
@@ -1765,7 +1773,8 @@ impl TorrentSession {
             None => return Ok(()),
         };
         let pi = t.piece_info(index)?;
-        if begin + length > pi.len {
+        // Bound length and guard against u32 overflow in begin + length.
+        if length > BLOCK_LEN || (begin as u64) + (length as u64) > pi.len as u64 {
             return Err(Error::Protocol);
         }
         // read the block from disk cache (absolute offset)

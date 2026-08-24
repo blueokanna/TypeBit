@@ -1,8 +1,6 @@
-//! Peer exchange (BEP-11 / BEP-11.1) — facade over the wire codec.
-//!
-//! `ut_pex` peers are exchanged inside extended messages; the codec lives
-//! in [`crate::wire::PexMsg`]. This module adds the swarm-level helpers
-//! (compact encoding of peer lists with flags).
+//! Peer exchange (BEP-11 / BEP-11.1) — facade over the wire codec
+//! ([`crate::wire::PexMsg`]): adds swarm-level helpers for compact peer
+//! list encoding with flags.
 
 pub use crate::wire::PexMsg;
 

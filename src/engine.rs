@@ -1,11 +1,6 @@
 //! The top-level engine: owns the host, all torrent sessions, the shared
-//! disk cache and the DHT, and drives the non-blocking event loop.
-//!
-//! The host (std desktop, Android/Kotlin, iOS/Swift, embedded) calls
-//! [`Engine::tick`] on a fixed cadence (e.g. 50–100 ms) and drains
-//! [`Engine::take_events`]. Inbound TCP connections are handed in via
-//! [`Engine::on_inbound_connection`] and inbound datagrams are handled
-//! internally by the UDP receive path.
+//! disk cache and the DHT, and drives the non-blocking event loop. The host
+//! calls [`Engine::tick`] on a fixed cadence and drains [`Engine::take_events`].
 
 use crate::consts::DEFAULT_PORT;
 use crate::crypto::Rng;
@@ -74,6 +69,11 @@ struct InboundPeer {
 }
 
 impl<H: Host> Engine<H> {
+    /// Cap on unhandshaken inbound connections (flood bound).
+    const MAX_INBOUND: usize = 1024;
+    /// Cap on buffered bytes per unhandshaken inbound connection.
+    const MAX_INBOUND_BUF: usize = 64 * 1024;
+
     /// Create the engine; seeds entropy from the host.
     pub fn new(host: H, cfg: EngineConfig) -> Self {
         let mut seed = [0u8; 32];
@@ -278,6 +278,10 @@ impl<H: Host> Engine<H> {
 
     /// Feed a completed inbound TCP connection.
     pub fn on_inbound_connection(&mut self, conn: ConnId, addr: NetAddr) {
+        if self.inbound.len() >= Self::MAX_INBOUND {
+            self.host.tcp_close(conn);
+            return;
+        }
         self.inbound.insert(
             conn,
             InboundPeer {
@@ -568,6 +572,15 @@ impl<H: Host> Engine<H> {
             match self.host.tcp_recv(conn, &mut recv_buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let overflow = self
+                        .inbound
+                        .get(&conn)
+                        .is_some_and(|p| p.buf.len() + n > Self::MAX_INBOUND_BUF);
+                    if overflow {
+                        self.inbound.remove(&conn);
+                        self.host.tcp_close(conn);
+                        return;
+                    }
                     if let Some(p) = self.inbound.get_mut(&conn) {
                         p.buf.extend_from_slice(&recv_buf[..n]);
                     }

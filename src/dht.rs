@@ -1,10 +1,6 @@
 //! Kademlia DHT (BEP-5/42): pure `no_std` KRPC engine — routing table,
-//! transactions, announce tokens, iterative lookups. Datagrams flow through
-//! the host UDP primitives via [`Dht::handle_datagram`] / [`Dht::outgoing`].
-//! * BEP-5 token authentication for `announce_peer` (secret rotation)
-//! * iterative `get_peers` / `find_node` lookups with K-closest pruning
-//! * tokens are bound to the responding node (correct announce routing)
-//! * compact node info (26/38 bytes) and compact peer lists
+//! transactions, announce tokens, iterative lookups. BEP-5 token auth for
+//! `announce_peer`; iterative `get_peers`/`find_node` with K-closest pruning.
 
 use crate::crypto::{hmac_sha256, Rng};
 use crate::error::{Error, Result};
@@ -750,6 +746,17 @@ impl Dht {
         stored
     }
 
+    /// Cap on tracked in-flight transactions (bounds memory under flood).
+    const MAX_PENDING: usize = 4096;
+
+    fn push_pending(&mut self, tx: u32, p: Pending) -> bool {
+        if self.pending.len() >= Self::MAX_PENDING {
+            return false;
+        }
+        self.pending.insert(tx, p);
+        true
+    }
+
     fn next_tx(&mut self) -> u32 {
         self.tx_counter = self.tx_counter.wrapping_add(1);
         self.tx_counter
@@ -787,7 +794,7 @@ impl Dht {
                 },
             },
         };
-        self.pending.insert(
+        if !self.push_pending(
             tx,
             Pending {
                 node: node.clone(),
@@ -797,7 +804,9 @@ impl Dht {
                 kind: PendingKind::Ping,
                 lookup_target: None,
             },
-        );
+        ) {
+            return 0;
+        }
         tx
     }
 
@@ -935,7 +944,7 @@ impl Dht {
                 body: KrpcBody::Query { q, args },
             };
             self.lookups[idx].queried.push(node.id);
-            self.pending.insert(
+            if !self.push_pending(
                 tx,
                 Pending {
                     node,
@@ -945,7 +954,9 @@ impl Dht {
                     kind: PendingKind::Lookup,
                     lookup_target: Some(target),
                 },
-            );
+            ) {
+                return false;
+            }
         }
         false
     }
@@ -1149,7 +1160,7 @@ impl Dht {
                     args,
                 },
             };
-            self.pending.insert(
+            self.push_pending(
                 tx,
                 Pending {
                     node: NodeEntry {

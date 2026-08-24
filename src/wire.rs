@@ -1,10 +1,6 @@
-//! Peer wire protocol (BEP-3) with extensions:
-//! - BEP-6 fast extension (`have_all`/`have_none`/`suggest`/`reject`/`allowed_fast`)
-//! - BEP-10 extended handshake
-//! - BEP-9 metadata exchange (`ut_metadata`)
-//! - BEP-11 peer exchange (`ut_pex`)
-//! - BEP-52 v2 reserved bit
-//!
+//! Peer wire protocol (BEP-3) with extensions: BEP-6 fast (`have_all`/
+//! `have_none`/`suggest`/`reject`/`allowed_fast`), BEP-10 extended handshake,
+//! BEP-9 metadata (`ut_metadata`), BEP-11 PEX (`ut_pex`), BEP-52 v2 bit.
 //! All codecs are allocation-bounded and reject malformed frames.
 
 use crate::bencode::{dict, BVal};

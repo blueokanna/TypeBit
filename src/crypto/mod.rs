@@ -9,7 +9,7 @@
 //! - [`sha512`] — FIPS 180-4 (Ed25519)
 //! - [`ed25519`] — RFC 8032 signatures (provable receipts)
 //! - [`chacha20`] / [`rng`] — ChaCha20 CSPRNG (peer ids, DHT ids, nonces)
-//! - [`hmac`] — HMAC-SHA256 (DHT announce tokens, keyed receipts)
+//! - [`hmac_sha256`] — HMAC-SHA256 (DHT announce tokens, keyed receipts)
 
 pub mod base32;
 pub mod base58;

@@ -1,9 +1,6 @@
-//! RFC 4648 Base64 codec (`no_std`, alloc-only).
-//!
-//! Standard alphabet with `=` padding, plus a URL-safe variant that swaps
-//! `+`/`/` for `-`/`_`. Used by the unified download-link layer to unwrap
-//! Thunder (`thunder://`), QQ-Xuanfeng (`qqdl://`) and FlashGet
-//! (`flashget://`) URLs, which are all Base64-wrapped.
+//! RFC 4648 Base64 codec (`no_std`, alloc-only): standard alphabet with `=`
+//! padding plus a URL-safe `-`/`_` variant. Unwraps Base64-wrapped Thunder
+//! (`thunder://`), QQ-Xuanfeng (`qqdl://`) and FlashGet (`flashget://`) URLs.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -63,7 +60,6 @@ pub fn decode(s: &str, v: Variant) -> Option<Vec<u8>> {
         Variant::UrlSafe => (URLSAFE, inv_urlsafe()),
     };
     let _ = alpha;
-    // strip padding
     let body: Vec<u8> = s
         .bytes()
         .filter(|&b| b != b'=')

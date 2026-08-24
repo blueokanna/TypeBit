@@ -97,4 +97,6 @@ pub mod consts {
     pub const REQUEST_PIPELINE: u32 = 256;
     /// Recommended write-back cache budget (bytes).
     pub const DEFAULT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+    /// Upper bound on magnet metadata size (a .torrent info dict is small).
+    pub const MAX_METADATA_SIZE: u32 = 64 * 1024 * 1024;
 }

@@ -1,10 +1,6 @@
-//! Session persistence with the ecosystem codecs.
-//!
-//! * binary: `rustbinary` (compact, schema-typed)
-//! * human:  `nextjson` (JSON)
-//! * time:   `tzcraft::Ticks` for wall-clock fields
-//!
-//! The host stores the produced bytes (file, KV store, mobile keychain).
+//! Session persistence with the ecosystem codecs: binary via `rustbinary`,
+//! human via `nextjson`, wall-clock via `tzcraft::Ticks`. The host stores
+//! the produced bytes (file, KV store, mobile keychain).
 
 use crate::error::{Error, Result};
 use alloc::string::String;

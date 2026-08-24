@@ -1,18 +1,8 @@
-//! The platform abstraction seam.
-//!
-//! The entire engine is written against [`Host`]; a concrete implementation
-//! (std sockets/files, Android/Kotlin, iOS/Swift, embedded) only has to
-//! provide these ~15 primitive operations. Everything else — protocol,
-//! scheduling, disk caching, receipts — lives in this crate.
-//!
-//! All transport primitives are **non-blocking**:
-//! - [`Host::tcp_recv`] returns [`Error::WouldBlock`] when no data is ready.
-//! - [`Host::tcp_send`] may accept a partial prefix and returns the byte count.
-//! - [`Host::tcp_connect`] initiates a non-blocking connect; the engine polls
-//!   [`Host::tcp_connect_done`] until it reports success or failure.
-//!
-//! This lets one engine instance drive hundreds of peer connections from a
-//! single thread (or an event loop) without per-connection threads.
+//! The platform abstraction seam: the engine is written against [`Host`]; a
+//! concrete implementation (std, Android/Kotlin, iOS/Swift, embedded) only
+//! provides ~15 primitives. Transports are **non-blocking** ([`Host::tcp_recv`]
+//! returns [`Error::WouldBlock`], `tcp_send` may take a partial prefix), so
+//! one engine drives hundreds of peers from a single thread.
 
 use crate::error::{Error, Result};
 

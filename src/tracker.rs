@@ -28,7 +28,7 @@ pub fn validate_http_tracker(url: &str) -> bool {
 }
 
 /// Parse a plain-text tracker list (one URL per line, `#` comments allowed)
-/// — the format served by https://cf.trackerslist.com/best.txt.
+/// — the format served by <https://cf.trackerslist.com/best.txt>.
 pub fn parse_tracker_list(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)

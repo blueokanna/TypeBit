@@ -1,16 +1,8 @@
-//! Swarm availability monitoring ("the downloader as a measurement probe").
-//!
-//! Treats the torrent as a time-varying replication graph and continuously
-//! estimates content recoverability:
-//!
-//! ```text
-//! A(t, B) = Pr[ obtain and verify all required pieces within budget B ]
-//! ```
-//!
-//! The monitor tracks per-peer coverage, discovery-source effectiveness,
-//! failure taxonomy and produces an evidence-backed [`SwarmReport`]
-//! (JSON via `nextjson`). This powers early-warning for content that is
-//! drifting from "healthy" to "unrecoverable".
+//! Swarm availability monitoring ("the downloader as a measurement probe"):
+//! treats the torrent as a time-varying replication graph and estimates
+//! content recoverability `A(t, B) = Pr[obtain and verify all required
+//! pieces within budget B]`, producing an evidence-backed [`SwarmReport`]
+//! (JSON via `nextjson`) as early-warning for drifting content.
 
 use crate::platform::NetAddr;
 use alloc::collections::BTreeMap;

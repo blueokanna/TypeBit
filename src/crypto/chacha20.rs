@@ -1,8 +1,6 @@
-//! ChaCha20 stream cipher (RFC 8439, IETF 12-byte nonce variant).
-//!
-//! Used as the deterministic PRNG core for peer ids, DHT node ids, tokens,
-//! and transaction ids. Pure `no_std`, zero `unsafe`, constant-time-free
-//! (not used for secrets).
+//! ChaCha20 stream cipher (RFC 8439, IETF 12-byte nonce variant), the
+//! deterministic PRNG core for peer ids, DHT node ids, tokens and
+//! transaction ids. Pure `no_std`, zero `unsafe` (not used for secrets).
 
 const CONSTANTS: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
 

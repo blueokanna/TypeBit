@@ -1,8 +1,7 @@
-//! Unified download-link parsing. [`parse_link`] turns every mainstream
-//! URL format into a typed [`DownloadLink`]: magnet, eD2k, Xunlei, QQDL,
-//! FlashGet, IPFS/IPNS, Kad, HTTP(S)/FTP, Baidu & Xunlei Netdisk (the two
-//! Netdisks require host credentials). [`ContentId`] gives cross-format
-//! content addressing so receipts can attest any source.
+//! Unified download-link parsing. [`parse_link`] turns every mainstream URL
+//! format into a typed [`DownloadLink`] (magnet, eD2k, Xunlei, QQDL, FlashGet,
+//! IPFS/IPNS, Kad, HTTP(S)/FTP, Baidu/Xunlei Netdisk — Netdisks need host
+//! credentials). [`ContentId`] gives cross-format content addressing.
 
 use crate::crypto::base32;
 use crate::crypto::base58;
@@ -437,7 +436,6 @@ fn url_host(url: &str) -> Option<&str> {
         .find(|c| ['/', '?', '#'].contains(&c))
         .unwrap_or(rest.len());
     let hostport = &rest[..end];
-    // strip :port
     let host = hostport.split(':').next().unwrap_or(hostport);
     if host.is_empty() {
         None
