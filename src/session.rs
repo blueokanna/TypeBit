@@ -1524,12 +1524,12 @@ impl TorrentSession {
 
     fn on_pex<H: Host>(&mut self, conn: ConnId, msg: PexMsg, ctx: &'_ mut SessionCtx<'_, H>) {
         let mut added = Vec::new();
-        for c in msg.added.chunks_exact(6) {
+        for c in msg.added.as_chunks::<6>().0 {
             if let Some(a) = NetAddr::from_compact6(c) {
                 added.push(a);
             }
         }
-        for c in msg.added6.chunks_exact(18) {
+        for c in msg.added6.as_chunks::<18>().0 {
             if let Some(a) = NetAddr::from_compact18(c) {
                 added.push(a);
             }
@@ -1545,7 +1545,7 @@ impl TorrentSession {
             self.enqueue_peer(a, DiscoverySource::Pex, ctx.now);
         }
         // dropped: remove from pex_known
-        for c in msg.dropped.chunks_exact(6) {
+        for c in msg.dropped.as_chunks::<6>().0 {
             if let Some(a) = NetAddr::from_compact6(c) {
                 if let Some(pos) = self.pex_known.iter().position(|x| *x == a) {
                     self.pex_known.remove(pos);

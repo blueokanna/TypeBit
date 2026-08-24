@@ -569,7 +569,7 @@ fn read20(b: &[u8]) -> Result<[u8; 20]> {
 fn parse_compact_nodes(v: Option<&crate::bencode::BVal>) -> Vec<NodeEntry> {
     let mut out = Vec::new();
     if let Some(b) = v.and_then(|x| x.as_bytes()) {
-        for c in b.chunks_exact(26) {
+        for c in b.as_chunks::<26>().0 {
             let mut id = [0u8; 20];
             id.copy_from_slice(&c[..20]);
             if let Some(addr) = NetAddr::from_compact6(&c[20..]) {
@@ -588,7 +588,7 @@ fn parse_compact_nodes(v: Option<&crate::bencode::BVal>) -> Vec<NodeEntry> {
 fn parse_compact_nodes6(v: Option<&crate::bencode::BVal>) -> Vec<NodeEntry> {
     let mut out = Vec::new();
     if let Some(b) = v.and_then(|x| x.as_bytes()) {
-        for c in b.chunks_exact(38) {
+        for c in b.as_chunks::<38>().0 {
             let mut id = [0u8; 20];
             id.copy_from_slice(&c[..20]);
             if let Some(addr) = NetAddr::from_compact18(&c[20..]) {
@@ -607,7 +607,7 @@ fn parse_compact_nodes6(v: Option<&crate::bencode::BVal>) -> Vec<NodeEntry> {
 fn parse_compact_peers(v: Option<&crate::bencode::BVal>) -> Vec<NetAddr> {
     let mut out = Vec::new();
     if let Some(b) = v.and_then(|x| x.as_bytes()) {
-        for c in b.chunks_exact(6) {
+        for c in b.as_chunks::<6>().0 {
             if let Some(a) = NetAddr::from_compact6(c) {
                 out.push(a);
             }
@@ -619,7 +619,7 @@ fn parse_compact_peers(v: Option<&crate::bencode::BVal>) -> Vec<NetAddr> {
 fn parse_compact_peers6(v: Option<&crate::bencode::BVal>) -> Vec<NetAddr> {
     let mut out = Vec::new();
     if let Some(b) = v.and_then(|x| x.as_bytes()) {
-        for c in b.chunks_exact(18) {
+        for c in b.as_chunks::<18>().0 {
             if let Some(a) = NetAddr::from_compact18(c) {
                 out.push(a);
             }

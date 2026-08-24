@@ -199,7 +199,7 @@ pub fn parse_tracker_response(bytes: &[u8]) -> Result<TrackerResponse> {
     match d.get(&b"peers"[..]) {
         Some(BVal::Bytes(b)) => {
             if b.len() % 6 == 0 {
-                for c in b.chunks_exact(6) {
+                for c in b.as_chunks::<6>().0 {
                     if let Some(a) = NetAddr::from_compact6(c) {
                         out.peers.push(a);
                     }
@@ -224,7 +224,7 @@ pub fn parse_tracker_response(bytes: &[u8]) -> Result<TrackerResponse> {
     // IPv6 peers
     if let Some(BVal::Bytes(b)) = d.get(&b"peers6"[..]) {
         if b.len() % 18 == 0 {
-            for c in b.chunks_exact(18) {
+            for c in b.as_chunks::<18>().0 {
                 if let Some(a) = NetAddr::from_compact18(c) {
                     out.peers.push(a);
                 }
@@ -395,7 +395,7 @@ pub mod udp {
         };
         let rest = &buf[20..];
         if rest.len().is_multiple_of(6) {
-            for c in rest.chunks_exact(6) {
+            for c in rest.as_chunks::<6>().0 {
                 if let Some(a) = NetAddr::from_compact6(c) {
                     out.peers.push(a);
                 }
@@ -433,7 +433,7 @@ pub mod udp {
             return Err(Error::Tracker);
         }
         let mut out = Vec::with_capacity(count);
-        for c in rest[..count * 12].chunks_exact(12) {
+        for c in rest[..count * 12].as_chunks::<12>().0 {
             out.push((be32(&c[0..4]), be32(&c[4..8]), be32(&c[8..12])));
         }
         Ok(out)

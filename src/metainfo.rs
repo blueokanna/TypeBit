@@ -312,7 +312,7 @@ impl Torrent {
                 return Err(Error::MetaInfo);
             }
             let mut hashes = Vec::with_capacity(pieces.len() / 20);
-            for c in pieces.chunks_exact(20) {
+            for c in pieces.as_chunks::<20>().0 {
                 let mut h = [0u8; 20];
                 h.copy_from_slice(c);
                 hashes.push(h);
@@ -351,7 +351,7 @@ impl Torrent {
                         return Err(Error::MetaInfo);
                     }
                     let mut hs = Vec::with_capacity(hb.len() / 32);
-                    for c in hb.chunks_exact(32) {
+                    for c in hb.as_chunks::<32>().0 {
                         let mut h = [0u8; 32];
                         h.copy_from_slice(c);
                         hs.push(h);
@@ -368,7 +368,7 @@ impl Torrent {
                         return Err(Error::MetaInfo);
                     }
                     let mut hs = Vec::with_capacity(pieces.len() / 20);
-                    for c in pieces.chunks_exact(20) {
+                    for c in pieces.as_chunks::<20>().0 {
                         let mut h = [0u8; 20];
                         h.copy_from_slice(c);
                         hs.push(h);
@@ -746,7 +746,7 @@ pub fn compute_v1_hashes(pieces: &[u8]) -> Result<Vec<[u8; 20]>> {
         return Err(Error::MetaInfo);
     }
     let mut out = Vec::with_capacity(pieces.len() / 20);
-    for c in pieces.chunks_exact(20) {
+    for c in pieces.as_chunks::<20>().0 {
         let mut h = [0u8; 20];
         h.copy_from_slice(c);
         out.push(h);

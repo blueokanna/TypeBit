@@ -79,7 +79,7 @@ impl Md4 {
             tail.push(0);
         }
         tail.extend_from_slice(&bit_len.to_le_bytes());
-        for chunk in tail.chunks_exact(64) {
+        for chunk in tail.as_chunks::<64>().0 {
             let mut block = [0u8; 64];
             block.copy_from_slice(chunk);
             self.compress(&block);
