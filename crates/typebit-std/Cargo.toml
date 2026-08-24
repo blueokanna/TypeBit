@@ -1,0 +1,20 @@
+[package]
+name = "typebit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Std host backend for the TypeBit engine (courierust HTTP, TCP/UDP, files)."
+homepage = "https://github.com/blueokanna/TypeBit"
+repository = "https://github.com/blueokanna/TypeBit"
+
+
+[dependencies]
+typebit-core = { path = "../typebit-core", features = ["std"] }
+nextjson = { workspace = true }
+rustbinary = { workspace = true }
+tzcraft = { workspace = true }
+courierust = { workspace = true, features = ["std"] }
+
+[dev-dependencies]

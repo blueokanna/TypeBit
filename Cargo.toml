@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/typebit-core", "crates/typebit-std", "crates/typebit-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "Apache-2.0"
+authors = ["TypeBit Contributors"]
+description = "TypeBit: a no_std BitTorrent engine core (v1/v2, DHT, PEX, receipt-provable download, disk cache)."
+
+[workspace.dependencies]
+nextjson = { version = "0.1", default-features = false, features = ["derive"] }
+rustbinary = { version = "0.1.7", default-features = false, features = [
+    "alloc",
+] }
+tzcraft = { version = "0.1", default-features = false }
+courierust = { version = "1.0", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
