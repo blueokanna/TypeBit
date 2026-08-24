@@ -2,7 +2,8 @@
 name = "typebit"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+# `courierust` 1.0 uses `is_multiple_of` (stabilized 1.87).
+rust-version = "1.87"
 license = "AGPL-3.0-or-later"
 authors = ["blueokanna HyphenTeam"]
 description = "TypeBit: a no_std universal download engine for torrent (v1/v2, DHT, PEX, web seeds), eD2k/eMule, Xunlei, FlashGet, QQDL, IPFS, Kad and direct HTTP(S)/FTP, with provable-download receipts and a semantic utility scheduler."
@@ -32,9 +33,10 @@ courierust = { version = "1.0", default-features = false }
 [features]
 default = []
 std = ["nextjson/std", "tzcraft/std", "courierust/std"]
-# C ABI bridge (Kotlin JNI / Swift CInterop / C# / Go).
+# C ABI bridge (Kotlin JNI / Swift CInterop / C# / Go). A cdylib needs a
+# global allocator + panic handler, so `ffi` pulls in `std`.
 # Build a cdylib with:  cargo rustc --release --features ffi -- --crate-type cdylib
-ffi = []
+ffi = ["std"]
 
 [[example]]
 name = "ffi_demo"
@@ -44,4 +46,3 @@ required-features = ["ffi"]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
-panic = "abort"

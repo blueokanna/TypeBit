@@ -394,7 +394,7 @@ pub mod udp {
             ..Default::default()
         };
         let rest = &buf[20..];
-        if rest.len() % 6 == 0 {
+        if rest.len().is_multiple_of(6) {
             for c in rest.chunks_exact(6) {
                 if let Some(a) = NetAddr::from_compact6(c) {
                     out.peers.push(a);

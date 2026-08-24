@@ -37,38 +37,35 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
-
-  # True no_std build on a bare-metal target with no allocator/OS.
   no_std:
-    name: no_std (thumbv7em)
+    name: no_std (aarch64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable) + thumb target
+      - name: Install Rust (stable) + aarch64 target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: thumbv7em-none-eabihf
+          targets: aarch64-unknown-none
 
       - name: Check bare-metal no_std build
-        run: cargo check --target thumbv7em-none-eabihf --no-default-features
+        run: cargo check --target aarch64-unknown-none --no-default-features
 
-  # MSRV as declared in Cargo.toml.
+  # MSRV as declared in Cargo.toml (1.87, required by courierust).
   msrv:
-    name: MSRV 1.81
+    name: MSRV 1.87
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.81
-        uses: dtolnay/rust-toolchain@1.81.0
+      - name: Install Rust 1.87
+        uses: dtolnay/rust-toolchain@1.87.0
 
       - name: Check on MSRV
         run: cargo check --features std
 
-  # FFI cdylib/staticlib builds (the Kotlin/Swift bridge).
   ffi:
-    name: ffi cdylib
+    name: ffi bridge
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +73,8 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build cdylib
-        run: cargo rustc --release --features ffi -- --crate-type cdylib
+      - name: Build with ffi
+        run: cargo build --features ffi
 
-      - name: Build staticlib
-        run: cargo rustc --release --features ffi -- --crate-type staticlib
+      - name: FFI integration (extern C calls the exported symbols)
+        run: cargo run --example ffi_demo --features ffi

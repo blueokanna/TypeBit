@@ -1634,7 +1634,7 @@ impl TorrentSession {
         let pi = t.piece_info(index)?;
         let total_blocks = block_count_for(pi.len);
         let block = begin / BLOCK_LEN;
-        if (block as u16) >= total_blocks || begin % BLOCK_LEN != 0 {
+        if (block as u16) >= total_blocks || !begin.is_multiple_of(BLOCK_LEN) {
             return Err(Error::Protocol);
         }
         if data.len() as u32 != core::cmp::min(BLOCK_LEN, pi.len - begin) {

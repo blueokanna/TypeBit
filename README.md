@@ -146,6 +146,4 @@ src/
 
 ## License
 
-AGPL-3.0-or-later. If you run a modified TypeBit as a network service, you
-must make your modified source available to that network's users — that's the
-point of the license.
+AGPL-3.0-or-later

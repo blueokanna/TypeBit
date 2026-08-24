@@ -79,7 +79,7 @@ impl Bitfield {
     pub fn set_all(&mut self) {
         self.words.iter_mut().for_each(|w| *w = u64::MAX);
         // mask trailing bits beyond len
-        if self.len % 64 != 0 {
+        if !self.len.is_multiple_of(64) {
             let last = self.words.len() - 1;
             self.words[last] &= (1u64 << (self.len % 64)) - 1;
         }
@@ -190,7 +190,7 @@ impl Bitfield {
             return Err(Error::Protocol);
         }
         // validate padding bits
-        if count % 8 != 0 {
+        if !count.is_multiple_of(8) {
             let pad = 8 - (count % 8);
             let last = bytes[bytes.len() - 1];
             if last & ((1u8 << pad) - 1) != 0 {

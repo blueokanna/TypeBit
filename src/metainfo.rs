@@ -742,7 +742,7 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 
 /// Build a torrent from a metainfo-like info dict (used by tests/tools).
 pub fn compute_v1_hashes(pieces: &[u8]) -> Result<Vec<[u8; 20]>> {
-    if pieces.len() % 20 != 0 {
+    if !pieces.len().is_multiple_of(20) {
         return Err(Error::MetaInfo);
     }
     let mut out = Vec::with_capacity(pieces.len() / 20);
