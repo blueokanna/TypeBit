@@ -48,6 +48,12 @@ pub struct SessionConfig {
     pub scheduler: SchedulerConfig,
     /// Wall-clock seed for receipts.
     pub node_secret: [u8; 32],
+    /// Extra tracker URLs merged into every session (e.g. refreshed from
+    /// [`crate::consts::TRACKERS_LIST_URL`]).
+    pub trackers: Vec<String>,
+    /// Fall back to the built-in [`crate::consts::DEFAULT_TRACKERS`] when a
+    /// torrent carries no announce URLs.
+    pub use_default_trackers: bool,
 }
 
 impl Default for SessionConfig {
@@ -61,6 +67,8 @@ impl Default for SessionConfig {
             choke: ChokeConfig::default(),
             scheduler: SchedulerConfig::default(),
             node_secret: [0u8; 32],
+            trackers: Vec::new(),
+            use_default_trackers: true,
         }
     }
 }
@@ -112,6 +120,8 @@ pub struct TrackerState {
     pub next_announce: u64,
     /// Last failure reason.
     pub failure: Option<String>,
+    /// Consecutive failures (>= 3 pauses this tracker until one succeeds).
+    pub fails: u32,
     /// UDP state.
     pub udp: UdpTrackerState,
 }
@@ -248,29 +258,15 @@ impl TorrentSession {
         } else {
             Scheduler::with_goal(&torrent, ContentGoal::Generic, cfg.scheduler)
         };
-        let mut trackers: Vec<TrackerState> = Vec::new();
-        for tier in torrent.announce_list.iter().chain(core::iter::once(
+        let trackers = seed_trackers(
             torrent
-                .announce
-                .as_ref()
-                .map(|a| alloc::vec![a.clone()])
-                .as_ref()
-                .unwrap_or(&Vec::new()),
-        )) {
-            for url in tier {
-                trackers.push(TrackerState {
-                    url: url.clone(),
-                    kind: detect_tracker_kind(url),
-                    interval: 1800,
-                    next_announce: 0,
-                    failure: None,
-                    udp: UdpTrackerState::default(),
-                });
-            }
-        }
-        // de-duplicate
-        trackers.sort_by(|a, b| a.url.cmp(&b.url));
-        trackers.dedup_by(|a, b| a.url == b.url);
+                .announce_list
+                .iter()
+                .flatten()
+                .cloned()
+                .chain(torrent.announce.iter().cloned()),
+            &cfg,
+        );
 
         let monitor = SwarmMonitor::new(
             info_hash.to_hex(),
@@ -321,19 +317,7 @@ impl TorrentSession {
     pub fn from_magnet(magnet: &Magnet, cfg: SessionConfig, now: u64) -> Result<TorrentSession> {
         let info_hash = magnet.info_hash.ok_or(Error::Magnet)?;
         let tracker_hash = tracker_hash_of(&info_hash);
-        let mut trackers: Vec<TrackerState> = Vec::new();
-        for url in &magnet.trackers {
-            let url = url.as_bytes().to_vec();
-            let kind = detect_tracker_kind(&url);
-            trackers.push(TrackerState {
-                url,
-                kind,
-                interval: 1800,
-                next_announce: 0,
-                failure: None,
-                udp: UdpTrackerState::default(),
-            });
-        }
+        let trackers = seed_trackers(magnet.trackers.iter().map(|s| s.as_bytes().to_vec()), &cfg);
         let pieces = PieceTracker::new(0, 0);
         let scheduler = Scheduler::with_goal(
             &Torrent::empty_placeholder(),
@@ -1277,10 +1261,16 @@ impl TorrentSession {
             numwant: 200,
             key: 0x54594254, // "TYBT"
         };
-        // try trackers in round-robin
+        // try trackers in round-robin, skipping ones on a failure penalty
         let mut attempt = 0;
-        while attempt < self.trackers.len() {
-            let idx = self.tracker_cursor % self.trackers.len();
+        let total = self.trackers.len();
+        while attempt < total {
+            let idx = self.tracker_cursor % total;
+            if self.trackers[idx].fails >= 3 {
+                self.tracker_cursor = (self.tracker_cursor + 1) % total;
+                attempt += 1;
+                continue;
+            }
             let kind = self.trackers[idx].kind;
             match kind {
                 TrackerKind::Http => {
@@ -1294,14 +1284,17 @@ impl TorrentSession {
                             Ok(resp) => {
                                 if let Some(f) = resp.failure {
                                     self.trackers[idx].failure = Some(f);
+                                    self.trackers[idx].fails =
+                                        self.trackers[idx].fails.saturating_add(1);
                                 } else {
                                     let interval = resp.interval.max(30);
                                     let peer_count = resp.peers.len();
                                     self.trackers[idx].interval = interval;
                                     self.trackers[idx].next_announce = ctx.now + interval * 1000;
                                     self.trackers[idx].failure = None;
+                                    self.trackers[idx].fails = 0;
                                     self.on_tracker_peers(resp, ctx);
-                                    self.tracker_cursor = (idx + 1) % self.trackers.len();
+                                    self.tracker_cursor = (idx + 1) % total;
                                     self.announce_at = ctx.now + interval * 1000;
                                     self.monitor.record_discovery(DiscoverySource::Tracker);
                                     ctx.events.push(EngineEvent::TrackerAnnounced {
@@ -1313,10 +1306,13 @@ impl TorrentSession {
                             }
                             Err(_) => {
                                 self.trackers[idx].failure = Some(String::from("bad response"));
+                                self.trackers[idx].fails =
+                                    self.trackers[idx].fails.saturating_add(1);
                             }
                         },
                         Err(_) => {
                             self.trackers[idx].failure = Some(String::from("http error"));
+                            self.trackers[idx].fails = self.trackers[idx].fails.saturating_add(1);
                         }
                     }
                 }
@@ -1333,13 +1329,13 @@ impl TorrentSession {
                             st.udp.phase = UdpPhase::ConnectSent;
                         }
                     }
-                    self.tracker_cursor = (idx + 1) % self.trackers.len();
+                    self.tracker_cursor = (idx + 1) % total;
                     self.announce_at = ctx.now + 15_000;
                     return;
                 }
             }
             attempt += 1;
-            self.tracker_cursor = (self.tracker_cursor + 1) % self.trackers.len();
+            self.tracker_cursor = (self.tracker_cursor + 1) % total;
         }
         // all failed: back off
         self.announce_at = ctx.now + 30 * 1000;
@@ -1940,6 +1936,45 @@ fn parse_udp_tracker_addr(url: &[u8]) -> Option<NetAddr> {
         return None;
     }
     Some(NetAddr::V4([a, b, c, d], port))
+}
+
+/// Build the per-session tracker list: torrent-declared URLs first, then
+/// config extras, deduped; when nothing was declared and
+/// `cfg.use_default_trackers` is set, fall back to the built-in public
+/// list (qBittorrent/BitComet compatible).
+fn seed_trackers<I: IntoIterator<Item = Vec<u8>>>(
+    from: I,
+    cfg: &SessionConfig,
+) -> Vec<TrackerState> {
+    let mut out: Vec<TrackerState> = Vec::new();
+    for url in from {
+        push_tracker(&mut out, url);
+    }
+    for url in &cfg.trackers {
+        push_tracker(&mut out, url.as_bytes().to_vec());
+    }
+    if out.is_empty() && cfg.use_default_trackers {
+        for url in crate::consts::DEFAULT_TRACKERS {
+            push_tracker(&mut out, url.as_bytes().to_vec());
+        }
+    }
+    out
+}
+
+fn push_tracker(out: &mut Vec<TrackerState>, url: Vec<u8>) {
+    if out.iter().any(|t| t.url == url) {
+        return;
+    }
+    let kind = detect_tracker_kind(&url);
+    out.push(TrackerState {
+        url,
+        kind,
+        interval: 1800,
+        next_announce: 0,
+        failure: None,
+        fails: 0,
+        udp: UdpTrackerState::default(),
+    });
 }
 
 fn with_port(a: NetAddr, port: u16) -> NetAddr {

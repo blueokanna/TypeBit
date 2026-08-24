@@ -1,34 +1,75 @@
 //! OS-backed [`Host`] for desktop/server builds (feature `std`).
 //!
-//! Implements non-blocking TCP/UDP, file I/O, wall clock and HTTP via
-//! `courierust`. The skeleton below keeps `feature = "std"` compiling with a
-//! default host type; applications typically implement [`Host`] directly or
-//! route through the FFI bridge.
+//! HTTP is served by `courierust` (HTTP/1.1 · HTTP/2 client); sockets and
+//! files remain application-owned — this type wires the engine to a real
+//! `courierust` client and leaves transports to the embedding app.
 
 use crate::platform::{ConnId, DiskId};
 use crate::{Host, LogLevel, NetAddr};
 
-/// A std host placeholder.
-///
-/// Real implementations should fill in [`Host`] using `std::net`,
-/// `std::fs` and `std::time`. The type exists so `feature = "std"`
-/// compiles with a default host type available.
-pub struct StdHost;
+/// A minimal std host with a real `courierust` HTTP client.
+pub struct StdHost {
+    http: courierust::courierust_client::Client,
+}
+
+impl StdHost {
+    /// Create a host with a default `courierust` client.
+    pub fn new() -> Self {
+        StdHost {
+            http: courierust::courierust_client::Client::new(),
+        }
+    }
+}
+
+impl Default for StdHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Host for StdHost {
     fn now_ms(&self) -> u64 {
-        0
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
-    fn fill_random(&mut self, _buf: &mut [u8]) {}
+
+    fn fill_random(&mut self, buf: &mut [u8]) {
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                if f.read_exact(buf).is_ok() {
+                    return;
+                }
+            }
+        }
+        // Fallback (not CSPRNG-grade): derived from the clock. Embedders
+        // that need real entropy should override this method.
+        let t = self.now_ms();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (t >> (i % 64)) as u8 ^ (i as u8).wrapping_mul(31);
+        }
+    }
+
     fn log(&mut self, _level: LogLevel, _msg: &str) {}
+
     fn http_get(
         &mut self,
-        _url: &str,
+        url: &str,
         _timeout_ms: u64,
-        _out: &mut alloc::vec::Vec<u8>,
+        out: &mut alloc::vec::Vec<u8>,
     ) -> crate::Result<()> {
-        Err(crate::Error::NotSupported)
+        let resp = self.http.get(url).map_err(|_| crate::Error::Io)?;
+        if resp.status.as_u16() != 200 {
+            return Err(crate::Error::Tracker);
+        }
+        let body = resp.body.collect().map_err(|_| crate::Error::Io)?;
+        out.extend_from_slice(&body);
+        Ok(())
     }
+
     fn tcp_connect(&mut self, _addr: &NetAddr) -> crate::Result<ConnId> {
         Err(crate::Error::NotSupported)
     }

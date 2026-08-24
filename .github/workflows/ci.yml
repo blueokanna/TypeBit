@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Native: formatting, clippy (all features, all targets), tests.
+  check:
+    name: check (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (no_std)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Clippy (std)
+        run: cargo clippy --all-targets --features std -- -D warnings
+
+      - name: Clippy (std + ffi)
+        run: cargo clippy --all-targets --features std,ffi -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+  # True no_std build on a bare-metal target with no allocator/OS.
+  no_std:
+    name: no_std (thumbv7em)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + thumb target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+
+      - name: Check bare-metal no_std build
+        run: cargo check --target thumbv7em-none-eabihf --no-default-features
+
+  # MSRV as declared in Cargo.toml.
+  msrv:
+    name: MSRV 1.81
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.81
+        uses: dtolnay/rust-toolchain@1.81.0
+
+      - name: Check on MSRV
+        run: cargo check --features std
+
+  # FFI cdylib/staticlib builds (the Kotlin/Swift bridge).
+  ffi:
+    name: ffi cdylib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build cdylib
+        run: cargo rustc --release --features ffi -- --crate-type cdylib
+
+      - name: Build staticlib
+        run: cargo rustc --release --features ffi -- --crate-type staticlib

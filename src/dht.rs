@@ -1,11 +1,6 @@
-//! Kademlia DHT (BEP-5, BEP-42) — decentralized peer discovery.
-//!
-//! This module is a pure `no_std` KRPC engine: it owns the routing table,
-//! transaction bookkeeping, announce tokens and iterative lookups, and
-//! exchanges datagrams through the host's UDP primitives (the engine wires
-//! [`Dht::handle_datagram`] and [`Dht::outgoing`] into the host event loop).
-//!
-//! * 160 k-buckets, K=8 nodes each
+//! Kademlia DHT (BEP-5/42): pure `no_std` KRPC engine — routing table,
+//! transactions, announce tokens, iterative lookups. Datagrams flow through
+//! the host UDP primitives via [`Dht::handle_datagram`] / [`Dht::outgoing`].
 //! * BEP-5 token authentication for `announce_peer` (secret rotation)
 //! * iterative `get_peers` / `find_node` lookups with K-closest pruning
 //! * tokens are bound to the responding node (correct announce routing)

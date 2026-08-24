@@ -1,25 +1,8 @@
-//! Unified download-link parsing.
-//!
-//! One entry point ([`parse_link`]) turns every mainstream download URL
-//! format into a single typed [`DownloadLink`]:
-//!
-//! * `magnet:?xt=urn:btih:…` — BitTorrent (delegates to [`crate::magnet`])
-//! * `ed2k://|file|name|size|md4|/` — eMule/eD2k
-//! * `thunder://` (Base64 `AA…ZZ` wrapper) — Xunlei
-//! * `qqdl://` (raw Base64) — QQ Xuanfeng
-//! * `flashget://[FLASHGET]…[/FLASHGET]` — FlashGet
-//! * `http(s)://`, `ftp://` — direct links (optionally content-addressed)
-//! * `pan.baidu.com` — Baidu Netdisk share (requires host-supplied
-//!   credentials; the core only models the link, it cannot authenticate)
-//! * `pan.xunlei.com` — Xunlei Netdisk share (same credential caveat)
-//! * `kad://` — eMule Kademlia node link
-//! * `ipfs://`, `ipns://` — IPFS/IPNS content, resolvable via HTTP gateways
-//!
-//! The layer also defines [`ContentId`], a cross-format **content
-//! addressing** value (SHA-1 / MD4 / SHA-256 + size) used to verify direct
-//! and eD2k downloads. Because every supported source can be reduced to a
-//! `ContentId`, the existing provable-download receipt layer can attest any
-//! download, not just BitTorrent transfers.
+//! Unified download-link parsing. [`parse_link`] turns every mainstream
+//! URL format into a typed [`DownloadLink`]: magnet, eD2k, Xunlei, QQDL,
+//! FlashGet, IPFS/IPNS, Kad, HTTP(S)/FTP, Baidu & Xunlei Netdisk (the two
+//! Netdisks require host credentials). [`ContentId`] gives cross-format
+//! content addressing so receipts can attest any source.
 
 use crate::crypto::base32;
 use crate::crypto::base58;

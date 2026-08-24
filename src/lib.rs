@@ -1,28 +1,14 @@
-//! # TypeBit Core
-//!
-//! A `no_std + alloc` BitTorrent engine core. This crate contains the entire
-//! protocol logic (v1/v2 metainfo, peer wire, DHT, PEX, tracker codecs),
-//! the transfer machinery (piece picker, utility scheduler, disk cache),
-//! and the research-grade **provable download / availability receipt** layer.
-//!
-//! The crate is transport- and storage-agnostic: every external effect goes
-//! through the [`platform::Host`] trait, so the same core binary can be
-//! embedded on desktop (via `typebit-std`), Android/Kotlin, iOS/Swift, or
-//! any embedded target (via `typebit-ffi`).
-//!
-//! The only third-party dependencies are the four crates of the TypeBit
-//! ecosystem: `nextjson` (data-contract engine), `rustbinary` (binary codec),
-//! `tzcraft` (128-bit time timeline) and `courierust` (no_std HTTP/gRPC
-//! protocol core used by the std host for tracker/web-seed transports).
-//! All cryptography (SHA-1/SHA-256/SHA-512/Ed25519/ChaCha20) is implemented
-//! in-tree under [`crypto`].
+//! `no_std + alloc` universal download engine: BitTorrent (v1/v2, DHT, PEX,
+//! web seeds), eD2k, Xunlei, IPFS, Kad, direct HTTP(S) — plus provable
+//! download receipts, a utility scheduler and a disk cache. Transport is
+//! injected via [`platform::Host`]; crypto is in-tree under [`crypto`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "ffi"), deny(unsafe_code))]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
-// Indexed loops in cryptographic / bit-twiddling hot paths are clearer and
-// match the reference implementations (SHA-1/256/512, Ed25519, bitfields).
+// Indexed loops in crypto / bit-twiddling hot paths read clearer (SHA,
+// Ed25519, bitfields) and match the reference implementations.
 #![allow(clippy::needless_range_loop)]
 
 #[macro_use]
@@ -76,12 +62,36 @@ pub mod consts {
     pub const DEFAULT_PIECE_LEN: u32 = 256 * 1024;
     /// Version tag embedded in the peer id.
     pub const VERSION_TAG: &str = "TB10";
-    /// DHT bootstrap nodes (BEP-5).
+    /// DHT bootstrap nodes (BEP-5) — the well-known, permanently online
+    /// routers used by the mainstream clients (uTorrent, qBittorrent,
+    /// Aria2, Transmission, BitComet).
     pub const DHT_BOOTSTRAP: &[(&str, u16)] = &[
         ("router.bittorrent.com", 6881),
         ("router.utorrent.com", 6881),
-        ("dht.transmissionbt.com", 6881),
+        ("router.transmissionbt.com", 6881),
+        ("dht.bitcomet.com", 6881),
         ("dht.libtorrent.org", 25401),
+    ];
+    /// Source for the community tracker list (qBittorrent/BitComet
+    /// compatible; the host refreshes it at runtime via `http_get`).
+    pub const TRACKERS_LIST_URL: &str = "https://cf.trackerslist.com/best.txt";
+    /// Built-in default trackers (stable public subset of the community
+    /// list). Session configs can override with `DEFAULT_TRACKERS`.
+    pub const DEFAULT_TRACKERS: &[&str] = &[
+        "udp://tracker.opentrackr.org:1337/announce",
+        "https://tracker.tamersunion.org:443/announce",
+        "udp://open.stealth.si:80/announce",
+        "udp://exodus.desync.com:6969/announce",
+        "udp://tracker.torrent.eu.org:451/announce",
+        "http://tracker.openbittorrent.com:80/announce",
+        "udp://tracker.moeking.me:6969/announce",
+        "udp://explodie.org:6969/announce",
+        "https://opentracker.i2p.rocks:443/announce",
+        "udp://tracker.tiny-vps.com:6969/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://tracker.openbittorrent.com:6969/announce",
+        "https://tracker.nanoha.org:443/announce",
+        "http://tracker.gbitt.info:80/announce",
     ];
     /// Maximum number of outstanding request blocks per peer connection.
     pub const REQUEST_PIPELINE: u32 = 256;

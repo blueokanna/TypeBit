@@ -109,7 +109,7 @@ impl Fe {
         for i in 0..5 {
             t[i] += 19u128 * t[i + 5];
         }
-        // propagate carries (limbs now < 2^110 → carry < 2^59)
+        // propagate carries
         let mut out = [0u64; 5];
         let mut carry = 0u128;
         for i in 0..5 {
@@ -117,7 +117,6 @@ impl Fe {
             out[i] = (cur & MASK51 as u128) as u64;
             carry = cur >> 51;
         }
-        // fold final carry (2^255 ≡ 19)
         let mut c = 19u128 * carry; // < 2^64
         let mut i = 0usize;
         while c > 0 {

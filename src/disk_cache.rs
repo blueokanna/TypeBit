@@ -1,13 +1,6 @@
-//! Write-back disk cache — the hard-drive protector.
-//!
-//! All incoming piece blocks are buffered in RAM and flushed in large,
-//! **coalesced, offset-ordered batches** instead of one syscall per 16 KiB
-//! block. Benefits:
-//!
-//! * **Fewer writes**: contiguous blocks merge into single large writes
-//!   (typically a whole 256 KiB–16 MiB piece per call).
-//! * **Fewer seeks**: flush order is offset-sorted per file.
-//! * **Verified persistence**: the engine flushes a piece right after its
+//! Write-back disk cache. Piece blocks are buffered and flushed in large,
+//! offset-ordered coalesced batches — fewer writes, fewer seeks, and a
+//! piece is flushed to stable storage before it is verified/published.
 //!   hash verifies, so only good data ever reaches the disk.
 //! * **Read-through**: serving while seeding reads coalesced pages too.
 //!

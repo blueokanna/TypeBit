@@ -4,21 +4,17 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
 license = "AGPL-3.0-or-later"
-authors = ["blueokanna <typebit@users.noreply.github.com>"]
-description = "TypeBit: a no_std universal download engine — BitTorrent (v1/v2, DHT, PEX, web seeds), eD2k/eMule, Xunlei, FlashGet, QQDL, IPFS, Kad and direct HTTP(S)/FTP, with provable-download receipts and a semantic utility scheduler."
+authors = ["blueokanna HyphenTeam"]
+description = "TypeBit: a no_std universal download engine for torrent (v1/v2, DHT, PEX, web seeds), eD2k/eMule, Xunlei, FlashGet, QQDL, IPFS, Kad and direct HTTP(S)/FTP, with provable-download receipts and a semantic utility scheduler."
 homepage = "https://github.com/blueokanna/TypeBit"
 repository = "https://github.com/blueokanna/TypeBit"
 readme = "README.md"
-keywords = [
-    "bittorrent",
-    "p2p",
-    "dht",
-    "ed2k",
-    "no_std",
-    "download",
-    "ipfs",
+keywords = ["bittorrent", "p2p", "dht", "ed2k", "no_std", "download", "ipfs"]
+categories = [
+    "network-programming",
+    "cryptography",
+    "web-programming::http-client",
 ]
-categories = ["network-programming", "cryptography", "web-programming::http-client"]
 include = ["src/**", "README.md", "LICENSE", "docs/**", "examples/**"]
 
 [lib]
@@ -27,18 +23,22 @@ path = "src/lib.rs"
 
 [dependencies]
 nextjson = { version = "0.1", default-features = false, features = ["derive"] }
-rustbinary = { version = "0.1.7", default-features = false, features = ["alloc"] }
+rustbinary = { version = "0.1.7", default-features = false, features = [
+    "alloc",
+] }
 tzcraft = { version = "0.1", default-features = false }
 courierust = { version = "1.0", default-features = false }
 
 [features]
 default = []
-# Enables the OS-backed host (blocking sockets in non-blocking mode, files,
-# wall clock) for desktop/server builds.
 std = ["nextjson/std", "tzcraft/std", "courierust/std"]
-# Enables the C ABI bridge (Kotlin JNI / Swift CInterop / C# / Go).
+# C ABI bridge (Kotlin JNI / Swift CInterop / C# / Go).
 # Build a cdylib with:  cargo rustc --release --features ffi -- --crate-type cdylib
 ffi = []
+
+[[example]]
+name = "ffi_demo"
+required-features = ["ffi"]
 
 [profile.release]
 lto = "thin"

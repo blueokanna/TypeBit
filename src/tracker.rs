@@ -18,6 +18,25 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
+/// Validate an HTTP tracker endpoint with `courierust`'s URI parser
+/// (scheme must be http/https).
+pub fn validate_http_tracker(url: &str) -> bool {
+    match courierust::courierust_http::uri::Url::parse(url) {
+        Ok(u) => matches!(u.scheme.to_ascii_lowercase().as_str(), "http" | "https"),
+        Err(_) => false,
+    }
+}
+
+/// Parse a plain-text tracker list (one URL per line, `#` comments allowed)
+/// — the format served by https://cf.trackerslist.com/best.txt.
+pub fn parse_tracker_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
 /// Dict integer lookup helper (bencode keys are raw bytes).
 fn di(d: &BTreeMap<Vec<u8>, BVal>, k: &[u8]) -> Option<i64> {
     d.get(k).and_then(|x| x.as_int())
@@ -428,6 +447,39 @@ pub mod udp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_http_tracker_scheme() {
+        assert!(validate_http_tracker(
+            "http://tracker.example.com:80/announce"
+        ));
+        assert!(validate_http_tracker(
+            "https://tracker.tamersunion.org/announce"
+        ));
+        assert!(!validate_http_tracker(
+            "udp://tracker.example.com:6969/announce"
+        ));
+        assert!(!validate_http_tracker("not a url"));
+    }
+
+    #[test]
+    fn parse_tracker_list_text() {
+        let text = "# comment line\n\nudp://a.example:80/announce\nhttps://b.example/announce\n";
+        let list = parse_tracker_list(text);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], "udp://a.example:80/announce");
+        assert_eq!(list[1], "https://b.example/announce");
+    }
+
+    #[test]
+    fn default_trackers_are_valid() {
+        // every built-in tracker must have a parseable scheme + port
+        for t in crate::consts::DEFAULT_TRACKERS {
+            let ok =
+                t.starts_with("udp://") || t.starts_with("http://") || t.starts_with("https://");
+            assert!(ok, "bad default tracker: {t}");
+        }
+    }
 
     #[test]
     fn http_announce_url() {
