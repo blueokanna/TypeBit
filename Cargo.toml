@@ -9,7 +9,7 @@ description = "TypeBit: a no_std universal download engine for torrent (v1/v2, D
 homepage = "https://github.com/blueokanna/TypeBit"
 repository = "https://github.com/blueokanna/TypeBit"
 readme = "README.md"
-keywords = ["bittorrent", "p2p", "dht", "ed2k", "no_std", "download", "ipfs"]
+keywords = ["bittorrent", "p2p", "rust-core", "ed2k", "downloader"]
 categories = [
     "network-programming",
     "cryptography",
