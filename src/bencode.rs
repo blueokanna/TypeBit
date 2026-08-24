@@ -486,13 +486,9 @@ mod tests {
     #[test]
     fn depth_limit() {
         let mut s = Vec::new();
-        for _ in 0..70 {
-            s.push(b'l');
-        }
+        s.resize(70, b'l');
         s.push(b'e');
-        for _ in 0..70 {
-            s.push(b'e');
-        }
+        s.resize(70, b'e');
         assert!(BVal::parse(&s).is_err());
     }
 }

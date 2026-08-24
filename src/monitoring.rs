@@ -367,7 +367,7 @@ impl SwarmMonitor {
             .peers
             .iter()
             .map(|(addr, e)| PeerInfo {
-                addr: addr.to_string(),
+                addr: addr.to_alloc_string(),
                 source: e.source,
                 first_seen: e.first_seen,
                 last_seen: e.last_seen,

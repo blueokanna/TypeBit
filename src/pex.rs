@@ -45,32 +45,30 @@ pub fn encode_added(peers: &[(NetAddr, u8)]) -> Vec<u8> {
             }
         }
     }
-    let mut msg = PexMsg::default();
-    msg.added = v4;
-    msg.added_f = f4;
-    msg.added6 = v6;
-    msg.added6_f = f6;
-    msg.encode()
+    PexMsg {
+        added: v4,
+        added_f: f4,
+        added6: v6,
+        added6_f: f6,
+        ..PexMsg::default()
+    }
+    .encode()
 }
 
 /// Parse a PEX message into (peer, flags) pairs.
 pub fn decode_added(msg: &PexMsg) -> Vec<(NetAddr, u8)> {
     let mut out = Vec::new();
-    let mut i = 0;
-    for c in msg.added.chunks_exact(6) {
+    for (i, c) in msg.added.chunks_exact(6).enumerate() {
         let flags = msg.added_f.get(i).copied().unwrap_or(0);
         if let Some(a) = NetAddr::from_compact6(c) {
             out.push((a, flags));
         }
-        i += 1;
     }
-    let mut i = 0;
-    for c in msg.added6.chunks_exact(18) {
+    for (i, c) in msg.added6.chunks_exact(18).enumerate() {
         let flags = msg.added6_f.get(i).copied().unwrap_or(0);
         if let Some(a) = NetAddr::from_compact18(c) {
             out.push((a, flags));
         }
-        i += 1;
     }
     out
 }

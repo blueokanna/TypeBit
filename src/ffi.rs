@@ -14,6 +14,11 @@
 //! ```
 
 #![allow(clippy::missing_safety_doc)]
+#![allow(missing_docs)]
+
+// This module used to live in its own crate named `typebit_core`; the
+// merged single-crate layout keeps those paths working via a crate alias.
+use crate as typebit_core;
 
 extern crate alloc;
 
@@ -563,8 +568,6 @@ pub unsafe extern "C" fn typebit_engine_take_event(
             buf.push(8);
             buf.extend_from_slice(&(n as u32).to_be_bytes());
         }
-        // `EngineEvent` is `#[non_exhaustive]`: forward-compatible fallback.
-        _ => return 0,
     }
     let n = core::cmp::min(buf.len(), out_cap);
     core::ptr::copy_nonoverlapping(buf.as_ptr(), out, n);

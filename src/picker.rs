@@ -10,16 +10,10 @@ use crate::bitfield::Bitfield;
 use crate::piece::PieceTracker;
 
 /// Options for piece picking.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PickOptions {
     /// Enable endgame (allow re-requesting in-flight pieces).
     pub endgame: bool,
-}
-
-impl Default for PickOptions {
-    fn default() -> Self {
-        PickOptions { endgame: false }
-    }
 }
 
 /// The picker is stateless: everything it needs is passed in.

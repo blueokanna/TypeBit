@@ -133,10 +133,18 @@ impl NetAddr {
         Ok(w)
     }
     /// Allocate a `String` representation (requires `alloc`).
-    pub fn to_string(&self) -> alloc::string::String {
+    pub fn to_alloc_string(&self) -> alloc::string::String {
         let mut buf = [0u8; 64];
         let n = self.write_to(&mut buf).unwrap_or(0);
         alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+}
+
+impl core::fmt::Display for NetAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut buf = [0u8; 64];
+        let n = self.write_to(&mut buf).unwrap_or(0);
+        f.write_str(core::str::from_utf8(&buf[..n]).unwrap_or("<addr>"))
     }
 }
 

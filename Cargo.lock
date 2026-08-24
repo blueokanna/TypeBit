@@ -39,25 +39,7 @@ dependencies = [
  "courierust",
  "nextjson",
  "rustbinary",
- "typebit-core",
  "tzcraft",
-]
-
-[[package]]
-name = "typebit-core"
-version = "0.1.0"
-dependencies = [
- "courierust",
- "nextjson",
- "rustbinary",
- "tzcraft",
-]
-
-[[package]]
-name = "typebit-ffi"
-version = "0.1.0"
-dependencies = [
- "typebit-core",
 ]
 
 [[package]]

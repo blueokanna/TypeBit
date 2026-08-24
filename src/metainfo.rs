@@ -12,6 +12,17 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// Upper bound on the number of pieces in one torrent. Keeps the in-memory
+/// piece-hash table and the piece bitfield bounded against hostile
+/// metainfo (≈4M pieces ≈ 80 MiB of v1 hashes).
+pub const MAX_PIECES: u32 = 4_000_000;
+/// Upper bound on the total declared size of one torrent (1 TiB). Prevents
+/// absurd preallocation / disk-cache growth from hostile metainfo.
+pub const MAX_TOTAL_SIZE: u64 = 1 << 40;
+/// Upper bound on the number of files in one torrent (prevents a hostile
+/// file tree of countless empty files from exhausting memory).
+pub const MAX_FILES: usize = 100_000;
+
 /// A torrent identity: 20 bytes for v1, 32 bytes for v2/hybrid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InfoHash {
@@ -37,6 +48,10 @@ impl InfoHash {
     /// Byte length.
     pub fn len(&self) -> usize {
         self.len as usize
+    }
+    /// True when the hash is all-zero (unset placeholder).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
     /// True for v1 (20-byte) hashes.
     pub fn is_v1(&self) -> bool {
@@ -278,6 +293,9 @@ impl Torrent {
                     if comps.is_empty() {
                         return Err(Error::MetaInfo);
                     }
+                    if out.len() >= MAX_FILES {
+                        return Err(Error::TooLarge);
+                    }
                     out.push(FileEntry {
                         path: comps,
                         length: len as u64,
@@ -290,7 +308,7 @@ impl Torrent {
                 .get(&b"pieces"[..])
                 .and_then(|v| v.as_bytes())
                 .ok_or(Error::MetaInfo)?;
-            if pieces.len() % 20 != 0 {
+            if pieces.len() % 20 != 0 || pieces.len() / 20 > MAX_PIECES as usize {
                 return Err(Error::MetaInfo);
             }
             let mut hashes = Vec::with_capacity(pieces.len() / 20);
@@ -300,6 +318,9 @@ impl Torrent {
                 hashes.push(h);
             }
             let total: u64 = files.iter().map(|f| f.length).sum();
+            if total > MAX_TOTAL_SIZE {
+                return Err(Error::TooLarge);
+            }
             (files, Some(hashes), None, Vec::new(), total)
         } else {
             // v2 / hybrid
@@ -309,7 +330,13 @@ impl Torrent {
                 .ok_or(Error::MetaInfo)?;
             let mut files = Vec::new();
             parse_v2_tree(tree, &mut Vec::new(), &mut files)?;
+            if files.len() > MAX_FILES {
+                return Err(Error::TooLarge);
+            }
             let total: u64 = files.iter().map(|f| f.length).sum();
+            if total > MAX_TOTAL_SIZE {
+                return Err(Error::TooLarge);
+            }
             // piece layers
             let mut piece_layers = Vec::new();
             if let Some(pl) = dict.get(&b"piece layers"[..]).and_then(|v| v.as_dict()) {
@@ -320,7 +347,7 @@ impl Torrent {
                     }
                     root.copy_from_slice(root_bytes);
                     let hb = hashes.as_bytes().ok_or(Error::MetaInfo)?;
-                    if hb.len() % 32 != 0 {
+                    if hb.len() % 32 != 0 || hb.len() / 32 > MAX_PIECES as usize {
                         return Err(Error::MetaInfo);
                     }
                     let mut hs = Vec::with_capacity(hb.len() / 32);
@@ -467,7 +494,7 @@ impl Torrent {
         let pl = self.piece_length as u64;
         match self.kind {
             TorrentKind::V1 => {
-                let n = self.total_size.div_ceil(pl) as u64;
+                let n = self.total_size.div_ceil(pl);
                 if (index as u64) >= n {
                     return Err(Error::Range);
                 }
@@ -563,7 +590,7 @@ impl Torrent {
             _ => {
                 let blocks: Vec<[u8; 32]> = data
                     .chunks(BLOCK_LEN as usize)
-                    .map(|c| Sha256::digest(c))
+                    .map(Sha256::digest)
                     .collect();
                 let root = merkle_root(&blocks);
                 let expect = self.piece_hash(index).ok_or(Error::Range)?;

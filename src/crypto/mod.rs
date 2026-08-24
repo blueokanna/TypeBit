@@ -11,13 +11,21 @@
 //! - [`chacha20`] / [`rng`] — ChaCha20 CSPRNG (peer ids, DHT ids, nonces)
 //! - [`hmac`] — HMAC-SHA256 (DHT announce tokens, keyed receipts)
 
+pub mod base32;
+pub mod base58;
+pub mod base64;
 pub mod chacha20;
 pub mod ed25519;
+pub mod md4;
 pub mod rng;
 pub mod sha1;
 pub mod sha256;
 pub mod sha512;
 
+pub use base32::{decode as base32_decode, encode as base32_encode};
+pub use base58::{decode as base58_decode, encode as base58_encode};
+pub use base64::{decode as base64_decode, encode as base64_encode, Variant};
+pub use md4::Md4;
 pub use rng::Rng;
 pub use sha1::Sha1;
 pub use sha256::Sha256;

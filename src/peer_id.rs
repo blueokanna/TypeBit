@@ -31,7 +31,7 @@ pub fn generate(rng: &mut Rng) -> [u8; 20] {
 
 /// A v2-style (BEP-52 hybrid) 26-byte key is out of scope; v1 20-byte id
 /// remains interoperable everywhere.
-
+///
 /// Try to identify a peer's client from its 20-byte peer id.
 /// Returns e.g. `("qB", "4300")` for `-qB4300-...`.
 pub fn identify(id: &[u8; 20]) -> Option<(String, String)> {

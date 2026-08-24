@@ -55,7 +55,7 @@ impl Fe {
     }
 
     /// Encode as 32 little-endian bytes (bit 255 = 0).
-    fn to_bytes(&self) -> [u8; 32] {
+    fn to_bytes(self) -> [u8; 32] {
         let [l0, l1, l2, l3, l4] = self.0;
         let mut o = [0u64; 4];
         o[0] = l0 | ((l1 & 0x1FFF) << 51);
@@ -127,7 +127,7 @@ impl Fe {
             i += 1;
             if i == 5 && c > 0 {
                 // residual c·2^255 ≡ 19·c — fold back into limb 0
-                c = 19u128 * c;
+                c *= 19u128;
                 i = 0;
             }
         }

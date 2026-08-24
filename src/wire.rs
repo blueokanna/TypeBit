@@ -406,7 +406,7 @@ impl MessageStream {
     }
 
     /// Pop the next message. `Ok(None)` = need more data.
-    pub fn next(&mut self) -> Result<Option<Message>> {
+    pub fn poll(&mut self) -> Result<Option<Message>> {
         if self.buf.len() < 4 {
             return Ok(None);
         }
@@ -786,9 +786,9 @@ mod tests {
             // decode via stream
             let mut s = MessageStream::new();
             s.feed(&enc);
-            let out = s.next().unwrap().unwrap();
+            let out = s.poll().unwrap().unwrap();
             assert_eq!(out, m);
-            assert!(s.next().unwrap().is_none());
+            assert!(s.poll().unwrap().is_none());
         }
     }
 
@@ -804,7 +804,7 @@ mod tests {
         for chunk in enc.chunks(7) {
             s.feed(chunk);
         }
-        assert_eq!(s.next().unwrap().unwrap(), m);
+        assert_eq!(s.poll().unwrap().unwrap(), m);
     }
 
     #[test]
@@ -837,10 +837,12 @@ mod tests {
 
     #[test]
     fn pex_roundtrip() {
-        let mut p = PexMsg::default();
-        p.added = vec![192, 168, 1, 1, 0x1A, 0xE1, 10, 0, 0, 2, 0x1A, 0xE1];
-        p.added_f = vec![1, 0];
-        p.dropped = vec![192, 168, 1, 2, 0x1A, 0xE1];
+        let p = PexMsg {
+            added: vec![192, 168, 1, 1, 0x1A, 0xE1, 10, 0, 0, 2, 0x1A, 0xE1],
+            added_f: vec![1, 0],
+            dropped: vec![192, 168, 1, 2, 0x1A, 0xE1],
+            ..Default::default()
+        };
         let enc = p.encode();
         let dec = PexMsg::parse(&enc).unwrap();
         assert_eq!(dec, p);

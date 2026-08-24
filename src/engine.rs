@@ -352,24 +352,21 @@ impl<H: Host> Engine<H> {
             .map(|s| s.take_connect_queue())
             .unwrap_or_default();
         for (addr, source) in queued {
-            match self.host.tcp_connect(&addr) {
-                Ok(conn) => {
-                    self.conn_owner.insert(conn, hash);
-                    self.connecting.push(conn);
-                    let mut ctx = SessionCtx {
-                        host: &mut self.host,
-                        cache: &mut self.cache,
-                        peer_id: self.peer_id,
-                        port: self.cfg.listen_port,
-                        now,
-                        dht: self.dht.as_mut(),
-                        events: &mut self.events,
-                    };
-                    if let Some(s) = self.sessions.get_mut(&hash) {
-                        s.attach_peer(conn, addr, true, source, &mut ctx);
-                    }
+            if let Ok(conn) = self.host.tcp_connect(&addr) {
+                self.conn_owner.insert(conn, hash);
+                self.connecting.push(conn);
+                let mut ctx = SessionCtx {
+                    host: &mut self.host,
+                    cache: &mut self.cache,
+                    peer_id: self.peer_id,
+                    port: self.cfg.listen_port,
+                    now,
+                    dht: self.dht.as_mut(),
+                    events: &mut self.events,
+                };
+                if let Some(s) = self.sessions.get_mut(&hash) {
+                    s.attach_peer(conn, addr, true, source, &mut ctx);
                 }
-                Err(_) => {}
             }
         }
     }
@@ -666,10 +663,10 @@ impl<H: Host> Engine<H> {
                     // DHT messages are bencoded dicts ('d' prefix)
                     if payload.first() == Some(&b'd') {
                         if let Some(dht) = self.dht.as_mut() {
-                            if let Ok(outcome) = dht.handle_datagram(addr, payload, now) {
-                                if let DatagramOutcome::Reply(reply) = outcome {
-                                    let _ = self.host.udp_send(&addr, &reply);
-                                }
+                            if let Ok(DatagramOutcome::Reply(reply)) =
+                                dht.handle_datagram(addr, payload, now)
+                            {
+                                let _ = self.host.udp_send(&addr, &reply);
                             }
                         }
                     } else {
@@ -701,8 +698,10 @@ impl<H: Host> Engine<H> {
 
     /// Save session state for persistence (returns binary bytes).
     pub fn save_state(&self) -> crate::state::SessionState {
-        let mut st = crate::state::SessionState::default();
-        st.version = 1;
+        let mut st = crate::state::SessionState {
+            version: 1,
+            ..Default::default()
+        };
         for (h, s) in &self.sessions {
             let (have, partial) = s.pieces.snapshot();
             st.torrents.push(crate::state::TorrentState {
@@ -714,19 +713,19 @@ impl<H: Host> Engine<H> {
                 paused: s.status == crate::session::SessionStatus::Paused,
             });
         }
-        if let Some(_dht) = &self.dht {
-            // export up to 64 known nodes as compact 26-byte entries
-            let seen = 0u32;
-            for b in 0..160 {
-                for _ in 0..64 {
-                    // (routing table internals are private; use closest to our id)
-                    break;
-                }
-                let _ = b;
-                let _ = seen;
-            }
+        if let Some(d) = &self.dht {
+            st.dht_nodes = d.export_nodes(64);
         }
         st
+    }
+
+    /// Restore persisted state. Torrents are not reconstructed here (the
+    /// host re-adds them via `add_torrent`); this restores the DHT routing
+    /// table so the next session boots with known peers.
+    pub fn load_state(&mut self, st: &crate::state::SessionState, now: u64) {
+        if let Some(d) = self.dht.as_mut() {
+            d.import_nodes(&st.dht_nodes, now);
+        }
     }
 }
 

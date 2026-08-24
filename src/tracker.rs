@@ -150,7 +150,6 @@ pub fn build_http_announce_url(base: &str, p: &AnnounceParams) -> String {
 /// Build an HTTP scrape URL (one or more hashes).
 pub fn build_http_scrape_url(base: &str, hashes: &[&[u8]]) -> String {
     let mut url = String::from(base);
-    if base.contains("scrape") {}
     let sep = if url.contains('?') { '&' } else { '?' };
     for h in hashes {
         url.push(sep);
@@ -369,10 +368,12 @@ pub mod udp {
         if action != ACTION_ANNOUNCE {
             return Err(Error::Tracker);
         }
-        let mut out = TrackerResponse::default();
-        out.interval = be32(&buf[8..12]) as u64;
-        out.incomplete = Some(be32(&buf[12..16]));
-        out.complete = Some(be32(&buf[16..20]));
+        let mut out = TrackerResponse {
+            interval: be32(&buf[8..12]) as u64,
+            incomplete: Some(be32(&buf[12..16])),
+            complete: Some(be32(&buf[16..20])),
+            ..Default::default()
+        };
         let rest = &buf[20..];
         if rest.len() % 6 == 0 {
             for c in rest.chunks_exact(6) {

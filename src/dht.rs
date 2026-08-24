@@ -35,9 +35,9 @@ impl NodeId {
     pub fn random(rng: &mut Rng) -> Self {
         NodeId(rng.bytes20())
     }
-    /// All-zero (placeholder for unknown bootstrap nodes).
+    /// The all-zero node id (placeholder / unset).
     pub const ZERO: NodeId = NodeId([0u8; 20]);
-    /// XOR distance to another id.
+    /// XOR distance to another id (used by the routing table).
     pub fn distance(&self, other: &NodeId) -> [u8; 20] {
         let mut d = [0u8; 20];
         for i in 0..20 {
@@ -202,7 +202,7 @@ impl RoutingTable {
         for b in &self.buckets {
             all.extend(b.nodes.iter().cloned());
         }
-        all.sort_by(|a, b| a.id.distance(target).cmp(&b.id.distance(target)));
+        all.sort_by_key(|a| a.id.distance(target));
         all.truncate(n);
         all
     }
@@ -210,6 +210,21 @@ impl RoutingTable {
     /// Number of known nodes.
     pub fn size(&self) -> usize {
         self.buckets.iter().map(|b| b.nodes.len()).sum()
+    }
+
+    /// Collect up to `limit` known nodes spread across buckets — one per
+    /// bucket — for persistence / bootstrap (good geographic coverage).
+    pub fn export(&self, limit: usize) -> Vec<NodeEntry> {
+        let mut out = Vec::new();
+        for b in &self.buckets {
+            if let Some(n) = b.nodes.first() {
+                out.push(n.clone());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -705,6 +720,41 @@ impl Dht {
         &self.table
     }
 
+    /// Export up to `limit` known nodes as compact 26-byte entries
+    /// (20-byte id + 6-byte IPv4 endpoint) for persistence/bootstrap.
+    pub fn export_nodes(&self, limit: usize) -> Vec<Vec<u8>> {
+        self.table
+            .export(limit)
+            .iter()
+            .map(|n| node_to_compact4(n).to_vec())
+            .collect()
+    }
+
+    /// Import compact 26-byte node entries (as produced by
+    /// [`Dht::export_nodes`]). Returns the number of nodes actually stored.
+    pub fn import_nodes(&mut self, entries: &[Vec<u8>], now: u64) -> usize {
+        let mut stored = 0usize;
+        for e in entries {
+            if e.len() != 26 {
+                continue;
+            }
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&e[..20]);
+            if let Some(addr) = NetAddr::from_compact6(&e[20..]) {
+                let entry = NodeEntry {
+                    id: NodeId(id),
+                    addr,
+                    last_seen: now,
+                    failed: 0,
+                };
+                if self.table.insert(entry, now) {
+                    stored += 1;
+                }
+            }
+        }
+        stored
+    }
+
     fn next_tx(&mut self) -> u32 {
         self.tx_counter = self.tx_counter.wrapping_add(1);
         self.tx_counter
@@ -853,8 +903,7 @@ impl Dht {
                     lk.closest.push(n);
                 }
             }
-            lk.closest
-                .sort_by(|a, b| a.id.distance(&target_id).cmp(&b.id.distance(&target_id)));
+            lk.closest.sort_by_key(|a| a.id.distance(&target_id));
             lk.closest.truncate(K);
         }
         if now.saturating_sub(self.lookups[idx].started) > LOOKUP_TIMEOUT_MS {

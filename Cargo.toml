@@ -1,24 +1,47 @@
-[workspace]
-resolver = "2"
-members = ["crates/typebit-core", "crates/typebit-std", "crates/typebit-ffi"]
-
-[workspace.package]
+[package]
+name = "typebit"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
-license = "Apache-2.0"
-authors = ["TypeBit Contributors"]
-description = "TypeBit: a no_std BitTorrent engine core (v1/v2, DHT, PEX, receipt-provable download, disk cache)."
+license = "AGPL-3.0-or-later"
+authors = ["blueokanna <typebit@users.noreply.github.com>"]
+description = "TypeBit: a no_std universal download engine — BitTorrent (v1/v2, DHT, PEX, web seeds), eD2k/eMule, Xunlei, FlashGet, QQDL, IPFS, Kad and direct HTTP(S)/FTP, with provable-download receipts and a semantic utility scheduler."
+homepage = "https://github.com/blueokanna/TypeBit"
+repository = "https://github.com/blueokanna/TypeBit"
+readme = "README.md"
+keywords = [
+    "bittorrent",
+    "p2p",
+    "dht",
+    "ed2k",
+    "no_std",
+    "download",
+    "ipfs",
+]
+categories = ["network-programming", "cryptography", "web-programming::http-client"]
+include = ["src/**", "README.md", "LICENSE", "docs/**", "examples/**"]
 
-[workspace.dependencies]
+[lib]
+name = "typebit"
+path = "src/lib.rs"
+
+[dependencies]
 nextjson = { version = "0.1", default-features = false, features = ["derive"] }
-rustbinary = { version = "0.1.7", default-features = false, features = [
-    "alloc",
-] }
+rustbinary = { version = "0.1.7", default-features = false, features = ["alloc"] }
 tzcraft = { version = "0.1", default-features = false }
 courierust = { version = "1.0", default-features = false }
+
+[features]
+default = []
+# Enables the OS-backed host (blocking sockets in non-blocking mode, files,
+# wall clock) for desktop/server builds.
+std = ["nextjson/std", "tzcraft/std", "courierust/std"]
+# Enables the C ABI bridge (Kotlin JNI / Swift CInterop / C# / Go).
+# Build a cdylib with:  cargo rustc --release --features ffi -- --crate-type cdylib
+ffi = []
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+panic = "abort"

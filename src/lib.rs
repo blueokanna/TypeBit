@@ -18,9 +18,12 @@
 //! in-tree under [`crypto`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![deny(unsafe_code)]
+#![cfg_attr(not(feature = "ffi"), deny(unsafe_code))]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
+// Indexed loops in cryptographic / bit-twiddling hot paths are clearer and
+// match the reference implementations (SHA-1/256/512, Ed25519, bitfields).
+#![allow(clippy::needless_range_loop)]
 
 #[macro_use]
 extern crate alloc;
@@ -32,6 +35,7 @@ pub mod dht;
 pub mod disk_cache;
 pub mod engine;
 pub mod error;
+pub mod links;
 pub mod magnet;
 pub mod metainfo;
 pub mod monitoring;
@@ -47,6 +51,13 @@ pub mod state;
 pub mod swarm;
 pub mod tracker;
 pub mod wire;
+
+// OS-backed host (feature "std") and C ABI bridge (feature "ffi") are
+// compiled into the same crate so the whole engine ships as one package.
+#[cfg(feature = "ffi")]
+pub mod ffi;
+#[cfg(feature = "std")]
+pub mod host_std;
 
 pub use engine::{Engine, EngineConfig, EngineEvent};
 pub use error::{Error, Result};

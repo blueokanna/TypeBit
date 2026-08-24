@@ -194,8 +194,8 @@ impl Peer {
     /// Reset the rate window (called on a fixed cadence).
     pub fn roll_window(&mut self, now: u64) {
         let span_ms = now.saturating_sub(self.window_started).max(1);
-        self.down_rate = ((self.window_down as u64) * 1000 / span_ms) as u32;
-        self.up_rate = ((self.window_up as u64) * 1000 / span_ms) as u32;
+        self.down_rate = ((self.window_down * 1000) / span_ms) as u32;
+        self.up_rate = ((self.window_up * 1000) / span_ms) as u32;
         self.window_down = 0;
         self.window_up = 0;
         self.window_started = now;
@@ -313,10 +313,12 @@ pub fn update_snubs<'a>(
     cfg: &ChokeConfig,
 ) {
     for p in peers {
-        if p.phase == PeerPhase::Ready && !p.peer_choking && p.requests_in_flight > 0 {
-            if now.saturating_sub(p.last_data_in) > cfg.snub_timeout_ms {
-                p.snubbed = true;
-            }
+        if p.phase == PeerPhase::Ready
+            && !p.peer_choking
+            && p.requests_in_flight > 0
+            && now.saturating_sub(p.last_data_in) > cfg.snub_timeout_ms
+        {
+            p.snubbed = true;
         }
     }
 }
@@ -346,8 +348,10 @@ mod tests {
             peer(3, 5000, false),
         ];
         let refs: Vec<&Peer> = peers.iter().collect();
-        let mut cfg = ChokeConfig::default();
-        cfg.leeching_slots = 2;
+        let cfg = ChokeConfig {
+            leeching_slots: 2,
+            ..Default::default()
+        };
         let set = compute_unchoke_set(&refs, false, &cfg, |_| false);
         assert_eq!(set.len(), 2);
         assert!(set.contains(&2));

@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// A parsed magnet link.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Magnet {
     /// Info hash (either v1 or v2).
     pub info_hash: Option<InfoHash>,
@@ -119,15 +119,13 @@ pub fn percent_decode(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() + 1 && i + 2 <= b.len() - 1 + 1 {
-            if i + 2 < b.len() + 1 && i + 2 <= b.len() {
-                let hi = hexv(b[i + 1]);
-                let lo = hexv(b[i + 2]);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                    continue;
-                }
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = hexv(b[i + 1]);
+            let lo = hexv(b[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
             }
         }
         out.push(b[i]);
