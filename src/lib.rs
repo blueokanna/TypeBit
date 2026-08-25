@@ -21,6 +21,7 @@ pub mod engine;
 pub mod error;
 pub mod leech;
 pub mod links;
+pub mod lsd;
 pub mod magnet;
 pub mod metainfo;
 pub mod monitoring;
@@ -70,6 +71,7 @@ pub mod consts {
     /// routers used by the mainstream clients (uTorrent, qBittorrent,
     /// Aria2, Transmission, BitComet).
     pub const DHT_BOOTSTRAP: &[(&str, u16)] = &[
+        ("dht.transmissionbt.com", 6881),
         ("router.bittorrent.com", 6881),
         ("router.utorrent.com", 6881),
         ("router.transmissionbt.com", 6881),
@@ -82,7 +84,7 @@ pub mod consts {
     /// Maximum number of outstanding request blocks per peer connection.
     pub const REQUEST_PIPELINE: u32 = 256;
     /// Recommended write-back cache budget (bytes).
-    pub const DEFAULT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+    pub const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
     /// Upper bound on magnet metadata size (a .torrent info dict is small).
     pub const MAX_METADATA_SIZE: u32 = 64 * 1024 * 1024;
 }

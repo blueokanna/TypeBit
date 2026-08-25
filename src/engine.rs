@@ -80,8 +80,8 @@ impl Default for EngineConfig {
 
 /// How often the engine retries DHT bootstrap while the routing table is
 /// still empty (the construction-time seeds may have been sent before any
-/// network was up).
-const BOOTSTRAP_RETRY_MS: u64 = 30_000;
+/// network was up). Fast retry keeps the DHT searching from app launch.
+const BOOTSTRAP_RETRY_MS: u64 = 10_000;
 
 /// The engine. Generic over the host.
 pub struct Engine<H: Host> {
@@ -100,6 +100,9 @@ pub struct Engine<H: Host> {
     udp_failed: bool,
     /// Last time a (re-)bootstrap of the DHT was attempted (ms).
     last_bootstrap_at: u64,
+    /// Resolved DHT bootstrap seed endpoints (cached — DNS is never repeated
+    /// once it succeeds, so a slow resolver cannot stall the engine loop).
+    dht_seeds: Vec<NetAddr>,
     /// Whether the "no DHT router resolvable" notice was already emitted.
     dht_no_seed_emitted: bool,
     /// Connections still establishing (outbound).
@@ -122,6 +125,12 @@ pub struct Engine<H: Host> {
     portmap: Option<PortMapManager>,
     /// Last reported port-map phase (for change events).
     last_pm_phase: PortMapPhase,
+    /// Local Service Discovery (BEP-14) announce scheduler.
+    lsd: crate::lsd::LsdScheduler,
+    /// Last time a spontaneous `find_node` (bucket refresh) was started.
+    last_dht_find_node: u64,
+    /// Counter for deriving refresh targets (cheap deterministic random).
+    dht_refresh_serial: u64,
     /// Piece-verification worker pool (real threads under `std`; `None`
     /// means inline verification).
     verify_pool: Option<VerifyPool>,
@@ -157,23 +166,15 @@ impl<H: Host> Engine<H> {
         h.fill_random(&mut seed);
         let mut rng = Rng::from_seed(seed);
         let peer_id = crate::peer_id::generate(&mut rng);
+        let mut lsd_cookie = [0u8; 8];
+        rng.fill(&mut lsd_cookie);
         let dht = if cfg.dht_enabled {
             let id = NodeId::random(&mut rng);
-            let mut d = Dht::new(id, cfg.listen_port, &mut rng);
-            // Bootstrap from the well-known BEP-5 routers. Their names are
-            // resolved through the host (never hardcoded IPs, which rot);
-            // a host without a resolver simply yields no seeds and the DHT
-            // stays dormant (HTTP/UDP trackers still work).
-            let mut seeds: Vec<NetAddr> = Vec::new();
-            for (host, port) in crate::consts::DHT_BOOTSTRAP {
-                if let Some(a) = h.resolve_host(host, *port) {
-                    seeds.push(a);
-                }
-            }
-            if !seeds.is_empty() {
-                d.bootstrap(&seeds, now);
-            }
-            Some(d)
+            // DHT starts empty; the first tick bootstraps it from the BEP-5
+            // routers (see [`Self::ensure_dht_seeds`]). Resolving the router
+            // hostnames here would block the whole engine thread on DNS
+            // before the loop even starts.
+            Some(Dht::new(id, cfg.listen_port, &mut rng))
         } else {
             None
         };
@@ -223,7 +224,9 @@ impl<H: Host> Engine<H> {
             events: Vec::new(),
             udp_open: false,
             udp_failed: false,
-            last_bootstrap_at: now,
+            // 0 → the very first tick bootstraps the DHT (fast startup).
+            last_bootstrap_at: 0,
+            dht_seeds: Vec::new(),
             dht_no_seed_emitted: false,
             connecting: Vec::new(),
             inbound: BTreeMap::new(),
@@ -235,6 +238,9 @@ impl<H: Host> Engine<H> {
             global_down,
             portmap,
             last_pm_phase: PortMapPhase::Idle,
+            lsd: crate::lsd::LsdScheduler::new(lsd_cookie, now),
+            last_dht_find_node: now,
+            dht_refresh_serial: 0,
             verify_pool,
         }
     }
@@ -247,6 +253,13 @@ impl<H: Host> Engine<H> {
     /// The DHT (for inspection).
     pub fn dht(&self) -> Option<&Dht> {
         self.dht.as_ref()
+    }
+
+    /// The externally-confirmed DHT address (BEP-42): `(ip16, udp_port)`; port is 0 until confirmed.
+    pub fn dht_external(&self) -> Option<([u8; 16], u16)> {
+        let d = self.dht.as_ref()?;
+        let ip = d.confirmed_external_ip()?;
+        Some((ip, d.confirmed_external_port().unwrap_or(0)))
     }
 
     /// Number of active torrents.
@@ -269,6 +282,7 @@ impl<H: Host> Engine<H> {
         let mut cfg = self.cfg.session.clone();
         cfg.save_dir = String::from(save_dir);
         cfg.proxy = self.cfg.proxy.clone();
+        cfg.listen_port = self.cfg.listen_port;
         let session = TorrentSession::from_torrent(torrent, cfg, self.host.now_ms())?;
         self.sessions.insert(hash, session);
         Ok(hash)
@@ -284,6 +298,7 @@ impl<H: Host> Engine<H> {
         let mut cfg = self.cfg.session.clone();
         cfg.save_dir = String::from(save_dir);
         cfg.proxy = self.cfg.proxy.clone();
+        cfg.listen_port = self.cfg.listen_port;
         let session = TorrentSession::from_magnet(&magnet, cfg, self.host.now_ms())?;
         self.sessions.insert(hash, session);
         Ok(hash)
@@ -292,9 +307,6 @@ impl<H: Host> Engine<H> {
     /// Start a torrent.
     pub fn start(&mut self, hash: &InfoHash) -> Result<()> {
         let now = self.host.now_ms();
-        // Open UDP only when it is actually needed (DHT / UDP trackers /
-        // port mapping). A failure here is non-fatal: the engine degrades
-        // to HTTP-tracker-only and the torrent still starts.
         self.start_udp_if_needed(now);
         let mut ctx = SessionCtx {
             host: &mut self.host,
@@ -307,24 +319,53 @@ impl<H: Host> Engine<H> {
         };
         let s = self.sessions.get_mut(hash).ok_or(Error::NotFound)?;
         s.start(&mut ctx)?;
-        // Re-kick DHT bootstrap when the routing table is still empty (the
-        // construction-time seeds may have failed, e.g. no connectivity yet).
-        // `bootstrap` is idempotent — it only pings, and an existing table
-        // is left untouched.
-        if let Some(dht) = self.dht.as_mut() {
-            if dht.table().size() == 0 {
-                let mut seeds: Vec<NetAddr> = Vec::new();
-                for (host, port) in crate::consts::DHT_BOOTSTRAP {
-                    if let Some(a) = self.host.resolve_host(host, *port) {
-                        seeds.push(a);
-                    }
-                }
-                if !seeds.is_empty() {
-                    dht.bootstrap(&seeds, now);
+        // LSD (BEP-14): announce this torrent to the LAN right away so
+        // local peers find it without waiting for the minute tick.
+        if !self.cfg.proxy.is_some() && self.udp_open {
+            let b = s.info_hash.as_bytes();
+            if b.len() == 20 {
+                let mut ih20 = [0u8; 20];
+                ih20.copy_from_slice(b);
+                let msg =
+                    crate::lsd::build_announce(&ih20, self.cfg.listen_port, Some(&self.lsd.cookie));
+                let _ = self
+                    .host
+                    .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg);
+            }
+        }
+        if self.dht.as_ref().map(|d| d.table().size()).unwrap_or(1) == 0 {
+            self.bootstrap_dht(now);
+        }
+        Ok(())
+    }
+
+    /// Resolve (once) and cache the DHT bootstrap seed endpoints, then ping
+    /// them. Never blocks the engine loop repeatedly: DNS runs at most once
+    /// per seed set, and the seeds stay cached in the routing table.
+    fn bootstrap_dht(&mut self, now: u64) {
+        let Some(dht) = self.dht.as_mut() else {
+            return;
+        };
+        self.last_bootstrap_at = now;
+        if self.dht_seeds.is_empty() {
+            for (host, port) in crate::consts::DHT_BOOTSTRAP {
+                if let Some(a) = self.host.resolve_host(host, *port) {
+                    self.dht_seeds.push(a);
                 }
             }
         }
-        Ok(())
+        if !self.dht_seeds.is_empty() {
+            dht.bootstrap(&self.dht_seeds, now);
+            self.dht_no_seed_emitted = false;
+        } else if !self.dht_no_seed_emitted {
+            self.dht_no_seed_emitted = true;
+            self.host
+                .log(LogLevel::Warn, "DHT bootstrap: no router hostname resolvable");
+            self.events.push(EngineEvent::Error {
+                code: 1,
+                detail: "dht_no_seeds",
+            });
+        }
     }
 
     /// Pause a torrent.
@@ -603,19 +644,27 @@ impl<H: Host> Engine<H> {
         if !self.udp_open {
             self.host.udp_open(self.cfg.listen_port)?;
             self.udp_open = true;
+            // LSD (BEP-14) needs multicast membership so LAN announces
+            // reach us; failure to join is best-effort (still announce out).
+            let _ = self.host.udp_join_multicast(crate::lsd::LSD_GROUP_V4);
+            let _ = self.host.udp_join_multicast(crate::lsd::LSD_GROUP_V6);
         }
         let _ = now;
         Ok(())
     }
 
     /// Whether the engine currently needs a UDP socket: DHT enabled, port
-    /// mapping, or any live UDP tracker across the sessions. In proxy mode
+    /// mapping, any live UDP tracker across the sessions, or active torrents
+    /// (LSD needs the socket to announce/receive on the LAN). In proxy mode
     /// the socket is never opened (outbound-only).
     fn wants_udp(&self) -> bool {
         if self.cfg.proxy.is_some() {
             return false;
         }
         if self.cfg.dht_enabled || self.cfg.port_mapping {
+            return true;
+        }
+        if self.sessions.values().any(|s| s.is_active()) {
             return true;
         }
         self.sessions.values().any(|s| {
@@ -640,10 +689,6 @@ impl<H: Host> Engine<H> {
         }
         if self.ensure_udp(now).is_err() {
             self.udp_failed = true;
-            // DHT and UDP trackers cannot work without the socket. Drop the
-            // DHT and park UDP trackers so the engine stays in a consistent,
-            // observable state; HTTP trackers and peer transport are
-            // unaffected.
             self.dht = None;
             self.cfg.dht_enabled = false;
             for s in self.sessions.values_mut() {
@@ -672,13 +717,7 @@ impl<H: Host> Engine<H> {
     /// Advance the whole engine. Call on a fixed cadence.
     pub fn tick(&mut self) -> Result<()> {
         let now = self.host.now_ms();
-        // Open the UDP socket lazily (only when needed); a failure degrades
-        // the engine instead of failing the whole tick.
         self.start_udp_if_needed(now);
-        // Sweep dead connection bookkeeping: a peer dropped by its session
-        // (timeout, ban, eviction, SOCKS failure…) must also leave
-        // `conn_owner`/`socks`/`socks_target`, otherwise dead entries inflate
-        // the global connection budget forever and the maps grow unbounded.
         let stale: Vec<ConnId> = self
             .conn_owner
             .iter()
@@ -697,8 +736,6 @@ impl<H: Host> Engine<H> {
             self.conn_owner.remove(&c);
             self.host.tcp_close(c);
         }
-        // Port mapping (NAT-PMP / UPnP IGD): start once the socket is up,
-        // then pump the state machine.
         if let Some(pm) = self.portmap.as_mut() {
             if pm.status().phase == PortMapPhase::Idle {
                 pm.start(now);
@@ -714,9 +751,6 @@ impl<H: Host> Engine<H> {
                 });
             }
         }
-        // Per-tick rate budgets: slice the global buckets fairly among the
-        // active sessions *before* any I/O is driven, so upload draining and
-        // download request generation both respect the global caps.
         let active = self
             .sessions
             .values()
@@ -736,54 +770,63 @@ impl<H: Host> Engine<H> {
                 s.tick_down_remaining = 0;
             }
         }
-        // 1) drive all TCP I/O
         self.drive_tcp(now);
-        // 2) UDP: DHT + UDP trackers
         self.drive_udp(now);
-        // 3) DHT maintenance
+        // Compute the spontaneous-refresh target BEFORE borrowing `dht` mutably (borrow rules).
+        // Snowball diffusion: a small table refreshes 4x as often, so a few bootstrap nodes
+        // snowball into the wider network quickly even with zero active torrents.
+        let dht_refresh_ready = self
+            .dht
+            .as_ref()
+            .map(|d| {
+                let interval = if d.table().size() < crate::dht::K {
+                    15_000
+                } else {
+                    60_000
+                };
+                d.table().size() > 0 && now.saturating_sub(self.last_dht_find_node) >= interval
+            })
+            .unwrap_or(false);
+        let dht_refresh_target = if dht_refresh_ready {
+            self.dht_refresh_serial = self.dht_refresh_serial.wrapping_add(1);
+            Some(crate::dht::NodeId(self.dht_refresh_target(now)))
+        } else {
+            None
+        };
         if let Some(dht) = self.dht.as_mut() {
             dht.tick(now);
             for (addr, payload) in dht.outgoing() {
                 if let Err(e) = self.host.udp_send(&addr, &payload) {
-                    // Never fatal, but a dead UDP path must be visible in
-                    // the host log instead of failing silently.
                     self.host.log(
                         LogLevel::Debug,
                         &alloc::format!("dht udp_send to {} failed: {}", addr, e),
                     );
                 }
             }
-            // Re-bootstrap on a cadence while the routing table is empty:
-            // the construction-time seeds may have failed (no connectivity
-            // yet, DNS temporarily down…). `bootstrap` is idempotent — it
-            // only pings and leaves an existing table untouched.
-            if dht.table().size() == 0
-                && now.saturating_sub(self.last_bootstrap_at) >= BOOTSTRAP_RETRY_MS
-            {
-                self.last_bootstrap_at = now;
-                let mut seeds: Vec<NetAddr> = Vec::new();
-                for (host, port) in crate::consts::DHT_BOOTSTRAP {
-                    if let Some(a) = self.host.resolve_host(host, *port) {
-                        seeds.push(a);
-                    }
-                }
-                if !seeds.is_empty() {
-                    dht.bootstrap(&seeds, now);
-                    self.dht_no_seed_emitted = false;
-                } else if !self.dht_no_seed_emitted {
-                    self.dht_no_seed_emitted = true;
-                    self.host.log(
-                        LogLevel::Warn,
-                        "DHT bootstrap: no router hostname resolvable",
-                    );
-                    self.events.push(EngineEvent::Error {
-                        code: 1,
-                        detail: "dht_no_seeds",
-                    });
-                }
+            // Spontaneous node discovery (Kademlia bucket refresh): even with no active torrents,
+            // keep the table warm by starting a `find_node` lookup for a random target — this is
+            // how the DHT discovers the wider network on its own (iterative lookups + cache).
+            if let Some(target) = dht_refresh_target {
+                self.last_dht_find_node = now;
+                dht.find_node(target, now);
             }
         }
-        // 4) session logic
+        // Retry bootstrap when the table is empty (cached seeds; DNS at most once).
+        let needs_bootstrap = self
+            .dht
+            .as_ref()
+            .map(|d| {
+                d.table().size() == 0
+                    && now.saturating_sub(self.last_bootstrap_at) >= BOOTSTRAP_RETRY_MS
+            })
+            .unwrap_or(false);
+        if needs_bootstrap {
+            self.bootstrap_dht(now);
+        }
+        // Route completed async HTTP jobs (tracker announces + web-seed
+        // block fetches) to their sessions. The host's worker performs the
+        // requests on its own thread, so the engine never blocks on HTTP.
+        self.pump_http_jobs(now);
         let hashes: Vec<InfoHash> = self.sessions.keys().copied().collect();
         for h in hashes {
             self.drive_connect_queue(h, now);
@@ -800,9 +843,6 @@ impl<H: Host> Engine<H> {
                 s.tick(&mut ctx);
             }
         }
-        // 4.5) piece verification: drain assembled pieces and verify them —
-        //      async via the worker pool when available, inline otherwise.
-        //      Either way the event loop never blocks on hashing.
         let pending: Vec<(InfoHash, u32, Vec<u8>)> = self
             .sessions
             .iter_mut()
@@ -841,7 +881,6 @@ impl<H: Host> Engine<H> {
                 }
             }
         }
-        // 4.6) async verification results
         if let Some(pool) = self.verify_pool.as_ref() {
             while let Some(res) = pool.poll() {
                 let mut ctx = SessionCtx {
@@ -858,12 +897,12 @@ impl<H: Host> Engine<H> {
                 }
             }
         }
-        // 5) cache flush on a slow cadence
         if now.saturating_sub(self.last_cache_flush) >= 5_000 {
             let _ = self.cache.flush(&mut self.host);
             self.last_cache_flush = now;
         }
-        // 6) periodic DHT node-count event
+        // LSD (BEP-14): announce one active torrent to the LAN per minute.
+        self.announce_lsd(now);
         if let Some(dht) = self.dht.as_ref() {
             self.events
                 .push(EngineEvent::DhtNodeCount(dht.table().size()));
@@ -912,6 +951,52 @@ impl<H: Host> Engine<H> {
                 };
                 if let Some(s) = self.sessions.get_mut(&hash) {
                     s.attach_peer(conn, addr, true, source, &mut ctx);
+                }
+            }
+        }
+    }
+
+    /// Route completed async HTTP jobs (tracker announces, web-seed range
+    /// fetches) to their owning sessions. The host's worker performs the
+    /// requests on its own thread — the engine thread never blocks on HTTP.
+    fn pump_http_jobs(&mut self, now: u64) {
+        let jobs = self.host.http_take_done();
+        if jobs.is_empty() {
+            return;
+        }
+        let hashes: Vec<InfoHash> = self.sessions.keys().copied().collect();
+        for h in hashes {
+            let owns: Vec<u64> = jobs
+                .iter()
+                .filter(|(id, _)| {
+                    self.sessions
+                        .get(&h)
+                        .map(|s| s.owns_http_job(*id))
+                        .unwrap_or(false)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if owns.is_empty() {
+                continue;
+            }
+            let mut ctx = SessionCtx {
+                host: &mut self.host,
+                cache: &mut self.cache,
+                peer_id: self.peer_id,
+                port: self.cfg.listen_port,
+                now,
+                dht: self.dht.as_mut(),
+                events: &mut self.events,
+            };
+            if let Some(s) = self.sessions.get_mut(&h) {
+                for id in &owns {
+                    if let Some((_, res)) = jobs.iter().find(|(j, _)| j == id) {
+                        // tracker announce result
+                        s.on_http_job_done(*id, res.clone(), &mut ctx);
+                        // web-seed range result (no-op when the session does
+                        // not own this job as a webseed fetch)
+                        s.on_range_job_done(*id, res.clone(), &mut ctx);
+                    }
                 }
             }
         }
@@ -1171,6 +1256,9 @@ impl<H: Host> Engine<H> {
                     }
                 }
                 Err(Error::WouldBlock) => break,
+                Err(Error::NotFound) => {
+                    break;
+                }
                 Err(_) => {
                     let mut ctx = SessionCtx {
                         host: &mut self.host,
@@ -1258,6 +1346,19 @@ impl<H: Host> Engine<H> {
                         if let Some(s) = self.sessions.get_mut(&hash) {
                             if let Some(p) = s.peers.get_mut(&conn) {
                                 let mut r = rest;
+                                r.append(&mut p.out);
+                                p.out = r;
+                            }
+                        }
+                        break;
+                    }
+                    Err(Error::NotFound) => {
+                        // Socket still Connecting: nothing can be sent yet.
+                        // Re-queue and wait for the connect to complete —
+                        // dropping here would kill every in-flight connect.
+                        if let Some(s) = self.sessions.get_mut(&hash) {
+                            if let Some(p) = s.peers.get_mut(&conn) {
+                                let mut r = chunk[..want].to_vec();
                                 r.append(&mut p.out);
                                 p.out = r;
                             }
@@ -1403,6 +1504,11 @@ impl<H: Host> Engine<H> {
                             continue;
                         }
                     }
+                    // LSD (BEP-14) announces start with "BT-SEARCH".
+                    if payload.starts_with(b"BT-SEARCH") {
+                        self.handle_lsd_datagram(addr, payload, now);
+                        continue;
+                    }
                     // DHT messages are bencoded dicts ('d' prefix)
                     if payload.first() == Some(&b'd') {
                         if let Some(dht) = self.dht.as_mut() {
@@ -1441,6 +1547,138 @@ impl<H: Host> Engine<H> {
                 Err(Error::WouldBlock) => break,
                 Err(_) => break,
             }
+        }
+    }
+
+    /// Deterministic pseudo-random 20-byte target for spontaneous DHT bucket
+    /// refresh (derived from the refresh serial + wall clock, so lookups
+    /// walk different parts of the keyspace over time without needing an
+    /// engine-owned RNG).
+    fn dht_refresh_target(&self, now: u64) -> [u8; 20] {
+        let mut buf = [0u8; 12];
+        buf[..8].copy_from_slice(&now.to_be_bytes());
+        buf[8..].copy_from_slice(&self.dht_refresh_serial.to_be_bytes());
+        let h = crate::crypto::sha256::Sha256::digest(&buf);
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&h[..20]);
+        out
+    }
+
+    /// A list of infohashes of currently active sessions, for LSD announces.
+    /// Only 20-byte (v1) hashes are announced — LSD cannot carry v2 32-byte
+    /// hashes.
+    fn lsd_active_hashes(&self) -> Vec<[u8; 20]> {
+        let mut out = Vec::new();
+        for s in self.sessions.values() {
+            if !s.is_active() {
+                continue;
+            }
+            let b = s.info_hash.as_bytes();
+            if b.len() == 20 {
+                let mut ih = [0u8; 20];
+                ih.copy_from_slice(b);
+                out.push(ih);
+            }
+        }
+        out
+    }
+
+    /// Announce one active torrent to the LAN (BEP-14), rate-limited by the
+    /// scheduler to one announce per minute, round-robin across torrents.
+    fn announce_lsd(&mut self, now: u64) {
+        if self.cfg.proxy.is_some() || !self.udp_open {
+            return; // outbound-only mode must not leak our presence
+        }
+        let active = self.lsd_active_hashes();
+        let Some(ih) = self.lsd.next_announce(&active, now) else {
+            return;
+        };
+        let msg = crate::lsd::build_announce(ih, self.cfg.listen_port, Some(&self.lsd.cookie));
+        let _ = self
+            .host
+            .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg);
+        let _ = self
+            .host
+            .udp_multicast_send(&crate::lsd::LSD_GROUP_V6, &msg);
+    }
+
+    /// Handle one LSD datagram: either a neighbour announcing a torrent we
+    /// have (reply with our presence + add them as a peer) or their reply
+    /// to our announce (add them as a peer). Our own multicast echoes are
+    /// dropped via the cookie.
+    fn handle_lsd_datagram(&mut self, addr: NetAddr, payload: &[u8], now: u64) {
+        let Some(ann) = crate::lsd::parse(payload) else {
+            return;
+        };
+        if ann.cookie == Some(self.lsd.cookie) {
+            return; // our own announce looped back
+        }
+        for ih in ann.infohashes {
+            let Some(s) = self.sessions.get_mut(&crate::metainfo::InfoHash::v1(ih)) else {
+                continue; // we don't have this torrent
+            };
+            // The announcing peer listens on the port from its header.
+            let peer_addr = match addr {
+                NetAddr::V4(ip, _) => NetAddr::V4(ip, ann.port),
+                NetAddr::V6(ip, _) => NetAddr::V6(ip, ann.port),
+            };
+            // Reply with our presence so they can connect to us too.
+            let resp =
+                crate::lsd::build_announce(&ih, self.cfg.listen_port, Some(&self.lsd.cookie));
+            let _ = self.host.udp_send(&addr, &resp);
+            // And add them to the swarm for this torrent.
+            s.enqueue_peer(peer_addr, crate::monitoring::DiscoverySource::Lsd, now);
+            s.monitor
+                .record_discovery(crate::monitoring::DiscoverySource::Lsd);
+        }
+    }
+
+    /// Number of trackers currently considered active across all sessions:
+    /// a tracker that has not hit the failure back-off (`fails < 3`, no
+    /// recorded failure) is counted. Live gauge for the UI status row.
+    pub fn active_trackers(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|s| {
+                s.trackers
+                    .iter()
+                    .filter(|t| t.fails < 3 && t.failure.is_none())
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Live peer snapshot for one torrent (address, client tag, phase, seed
+    /// flag, smoothed rates, in-flight requests). Best-effort: the engine
+    /// knows every peer in its swarm, so the UI can show REAL peers instead
+    /// of fabricating a table.
+    pub fn peer_snapshot(&self, hash: &InfoHash) -> Vec<crate::session::PeerSnapshot> {
+        match self.sessions.get(hash) {
+            Some(s) => s
+                .peers
+                .values()
+                .filter(|p| p.phase != crate::swarm::PeerPhase::Closed)
+                .map(|p| crate::session::PeerSnapshot {
+                    addr: p.addr.to_alloc_string(),
+                    client: p
+                        .rep
+                        .client
+                        .as_ref()
+                        .map(|c| c.code_str())
+                        .unwrap_or_else(|| String::from("未知")),
+                    phase: match p.phase {
+                        crate::swarm::PeerPhase::Connecting => 0,
+                        crate::swarm::PeerPhase::Handshake => 1,
+                        crate::swarm::PeerPhase::Ready => 2,
+                        crate::swarm::PeerPhase::Closed => 3,
+                    },
+                    is_seed: p.is_seed,
+                    down_rate: p.down_rate,
+                    up_rate: p.up_rate,
+                    in_flight: p.requests_in_flight,
+                })
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -1687,13 +1925,7 @@ mod tests {
         let t = make_torrent();
         let hash = t.info_hash;
         engine.add_torrent_obj(t, "/tmp").expect("add");
-
-        // Regression: `start()` used to fail hard (`Error::Io`) when the
-        // UDP socket could not be opened, so the frontend got a bare -1 and
-        // the torrent never started. It must degrade instead.
         assert!(engine.start(&hash).is_ok(), "start must not fail on UDP");
-
-        // The DHT is disabled and the host is told exactly why.
         assert!(
             engine.dht().is_none(),
             "DHT must be disabled after UDP failure"
@@ -1705,9 +1937,7 @@ mod tests {
             "expected udp_open_failed event, got {evs:?}"
         );
 
-        // The engine keeps ticking (HTTP trackers / peers still work).
         assert!(engine.tick().is_ok());
-        // No repeated UDP-open attempts (degradation is sticky).
         assert_eq!(engine.host.udp_open_calls, 1);
     }
 
@@ -1730,8 +1960,6 @@ mod tests {
         let hash = t.info_hash;
         engine.add_torrent_obj(t, "/tmp").expect("add");
 
-        // No DHT, no UDP trackers, no port mapping → UDP must never be
-        // opened at all; the HTTP-only torrent starts cleanly.
         assert!(engine.start(&hash).is_ok());
         assert_eq!(
             engine.host.udp_open_calls, 0,

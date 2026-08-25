@@ -35,6 +35,13 @@ use alloc::vec::Vec;
 /// routing table — is re-created here once the DHT has something to ask.
 const DHT_ANNOUNCE_INTERVAL_MS: u64 = 60_000;
 
+/// After we fully serve our metadata dict to a peer (ut_metadata), drop it when it shows no real
+/// interaction (piece request/data) within this window — harvesters/dead conns must not squat capacity.
+const METADATA_SERVED_IDLE_TIMEOUT_MS: u64 = 10_000;
+
+/// HTTP announce in-flight window: no second HTTP connection for a tracker within it.
+const HTTP_ANNOUNCE_PENDING_MS: u64 = 15_000;
+
 /// Per-file download priority (selective download).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePriority {
@@ -116,6 +123,26 @@ impl Default for WebSeedConfig {
     }
 }
 
+/// A live, UI-consumable view of one connected peer (see
+/// [`crate::engine::Engine::peer_snapshot`]).
+#[derive(Debug, Clone)]
+pub struct PeerSnapshot {
+    /// Human-readable endpoint (`ip:port`).
+    pub addr: String,
+    /// Fingerprinted client tag (e.g. `qBittorrent`, `未知`).
+    pub client: String,
+    /// 0=Connecting 1=Handshake 2=Ready 3=Closed.
+    pub phase: u8,
+    /// Whether the peer is a seed (has every piece).
+    pub is_seed: bool,
+    /// Smoothed download rate (bytes/s).
+    pub down_rate: u32,
+    /// Smoothed upload rate (bytes/s).
+    pub up_rate: u32,
+    /// Outstanding request blocks on this connection.
+    pub in_flight: u32,
+}
+
 /// Per-torrent configuration.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -153,6 +180,9 @@ pub struct SessionConfig {
     pub proxy: Option<ProxyConfig>,
     /// Web seed (BEP-19) options.
     pub webseed: WebSeedConfig,
+    /// Local TCP/DHT listen port (used for PEX port advertisement when no
+    /// externally-confirmed port is available).
+    pub listen_port: u16,
 }
 
 impl Default for SessionConfig {
@@ -169,6 +199,7 @@ impl Default for SessionConfig {
             trackers: Vec::new(),
             proxy: None,
             webseed: WebSeedConfig::default(),
+            listen_port: crate::consts::DEFAULT_PORT,
             use_default_trackers: true,
             upload_limit_bps: 0,
             download_limit_bps: 0,
@@ -222,6 +253,12 @@ pub struct TrackerState {
     pub interval: u64,
     /// Next announce time (ms).
     pub next_announce: u64,
+    /// HTTP announce in-flight guard: no second HTTP connection for this tracker until this
+    /// deadline (ms) passes; makes duplicate pending connections impossible across re-entrant paths.
+    pub http_pending_until: u64,
+    /// Async HTTP job id of the in-flight announce (0 = none). The engine never blocks on
+    /// trackers: the request runs on the host's worker; the result lands via on_http_job_done.
+    pub http_job_id: u64,
     /// Last failure reason.
     pub failure: Option<String>,
     /// Consecutive failures (>= 3 pauses this tracker until one succeeds).
@@ -236,7 +273,12 @@ pub struct UdpTrackerState {
     phase: UdpPhase,
     conn_id: u64,
     tid: u32,
-    addr: Option<NetAddr>,
+    /// Resolved endpoints for the tracker hostname (all DNS records, so a
+    /// dead/misbehaving record falls back to the next one). The first
+    /// element is the one currently in use.
+    addrs: Vec<NetAddr>,
+    /// Index into `addrs` currently in use (rotated on failure).
+    addr_idx: usize,
     sent_at: u64,
 }
 
@@ -246,9 +288,26 @@ impl Default for UdpTrackerState {
             phase: UdpPhase::Idle,
             conn_id: 0,
             tid: 0,
-            addr: None,
+            addrs: Vec::new(),
+            addr_idx: 0,
             sent_at: 0,
         }
+    }
+}
+
+impl UdpTrackerState {
+    /// The endpoint currently in use, if any.
+    fn current_addr(&self) -> Option<NetAddr> {
+        self.addrs.get(self.addr_idx).copied()
+    }
+    /// Advance to the next DNS record (fallback on failure). Returns the
+    /// new endpoint, if any.
+    fn next_addr(&mut self) -> Option<NetAddr> {
+        if self.addrs.len() <= 1 {
+            return self.current_addr();
+        }
+        self.addr_idx = (self.addr_idx + 1) % self.addrs.len();
+        self.addrs.get(self.addr_idx).copied()
     }
 }
 
@@ -267,10 +326,10 @@ pub struct MetadataFetch {
 
 /// One in-progress web-seed (BEP-19) piece fetch.
 ///
-/// Web seeds are fetched one 16 KiB block per engine tick through the
-/// blocking host HTTP seam (`Host::http_get_range`, or the SOCKS5 path in
-/// proxy mode), so the engine never stalls for more than one small request
-/// and the memory footprint is a single piece.
+/// Web seeds are fetched one 16 KiB block at a time through the host's
+/// async HTTP seam (falling back to the blocking range GET on hosts without
+/// a worker), so the engine thread never stalls on a web-seed request and
+/// the memory footprint stays a single piece.
 #[derive(Debug, Clone, Default)]
 pub struct WebSeedState {
     /// Piece currently being fetched (None = idle).
@@ -287,6 +346,18 @@ pub struct WebSeedState {
     pub fails: u32,
     /// Backoff deadline (ms) before retrying after all seeds failed.
     pub retry_at: u64,
+    /// Async HTTP job id of the in-flight block fetch (0 = idle). The
+    /// engine never blocks on web seeds: the request runs on the host's
+    /// worker and the block is applied by [`TorrentSession::on_range_job_done`].
+    pub job_id: u64,
+    /// Piece index of the in-flight block fetch (valid while `job_id != 0`).
+    pub job_piece: u32,
+    /// Block index of the in-flight block fetch.
+    pub job_block: u16,
+    /// Expected body length of the in-flight block fetch.
+    pub job_len: u64,
+    /// Seed index used for the in-flight block fetch (for failure rotation).
+    pub job_seed: usize,
 }
 
 /// The per-torrent session.
@@ -341,10 +412,18 @@ pub struct TorrentSession {
     dht_started: bool,
     /// Last time a DHT `get_peers` lookup was issued (ms).
     last_dht_announce: u64,
+    /// A `Started` announce is queued (start/resume/metadata-install). The
+    /// blocking HTTP announce is deferred to the tick so the DHT lookup is
+    /// never held up by it.
+    pending_started_announce: bool,
     /// Last PEX broadcast.
     last_pex_at: u64,
     /// Peers known for PEX.
     pex_known: Vec<NetAddr>,
+    /// Externally-observed port candidates (port → witness peer + time),
+    /// from extended-handshake `yourport` and PEX `p` fields. Used to
+    /// advertise the best-known external port through PEX.
+    external_ports: BTreeMap<u16, Vec<(NetAddr, u64)>>,
     /// Metadata fetch state.
     metadata: Option<MetadataFetch>,
     /// Web seeds (BEP-19) for direct HTTP piece download.
@@ -466,8 +545,10 @@ impl TorrentSession {
             connect_queue: Vec::new(),
             dht_started: false,
             last_dht_announce: 0,
+            pending_started_announce: false,
             last_pex_at: 0,
             pex_known: Vec::new(),
+            external_ports: BTreeMap::new(),
             metadata: None,
             web_seeds: torrent
                 .web_seeds
@@ -535,8 +616,10 @@ impl TorrentSession {
             connect_queue: Vec::new(),
             dht_started: false,
             last_dht_announce: 0,
+            pending_started_announce: false,
             last_pex_at: 0,
             pex_known: Vec::new(),
+            external_ports: BTreeMap::new(),
             metadata: Some(MetadataFetch {
                 size: 0,
                 pieces: BTreeMap::new(),
@@ -580,12 +663,14 @@ impl TorrentSession {
         self.announce_at = ctx.now;
         self.refresh_completion();
         self.open_files(ctx)?;
-        self.announce_to_tracker(ctx, TrackerEvent::Started);
+        // Kick DHT discovery FIRST so the first get_peers is never delayed by the (blocking) announce;
+        // the HTTP `Started` announce is deferred to the tick so `start()` never blocks.
         if let Some(dht) = ctx.dht.as_mut() {
             dht.get_peers(self.tracker_hash, ctx.port, ctx.now);
             self.dht_started = true;
             self.last_dht_announce = ctx.now;
         }
+        self.pending_started_announce = true;
         Ok(())
     }
 
@@ -612,15 +697,20 @@ impl TorrentSession {
         )
     }
 
-    /// Pause.
+    /// Pause — the download must stop IMMEDIATELY. Merely flipping the
+    /// status is not enough: request blocks already in flight keep arriving
+    /// and get verified/written, so the user sees "paused but still
+    /// downloading". Drop every peer connection (and their outstanding
+    /// requests) right away; resume re-discovers peers via tracker / DHT.
     pub fn pause<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
         if self.status == SessionStatus::Paused {
             return;
         }
         self.status = SessionStatus::Paused;
         self.announce_to_tracker(ctx, TrackerEvent::Stopped);
-        for peer in self.peers.values_mut() {
-            peer.send(&Message::NotInterested);
+        let conns: Vec<ConnId> = self.peers.keys().copied().collect();
+        for c in conns {
+            self.drop_peer(c, FailureCategory::Timeout, ctx);
         }
     }
 
@@ -632,7 +722,13 @@ impl TorrentSession {
         self.status = SessionStatus::Downloading;
         self.refresh_completion();
         self.announce_at = ctx.now;
-        self.announce_to_tracker(ctx, TrackerEvent::Started);
+        // DHT re-discovery is instant; the blocking `Started` announce is deferred to the tick.
+        if let Some(dht) = ctx.dht.as_mut() {
+            dht.get_peers(self.tracker_hash, ctx.port, ctx.now);
+            self.dht_started = true;
+            self.last_dht_announce = ctx.now;
+        }
+        self.pending_started_announce = true;
     }
 
     /// Stop (close connections and files).
@@ -837,8 +933,12 @@ impl TorrentSession {
             SessionStatus::Stopped | SessionStatus::Paused | SessionStatus::Failed => return,
             _ => {}
         }
-        // re-announce
-        if ctx.now >= self.announce_at {
+        // re-announce: a queued `Started` announce fires before the normal cadence
+        // (the blocking HTTP path is deferred out of start/resume, so DHT already went out).
+        if self.pending_started_announce {
+            self.pending_started_announce = false;
+            self.announce_to_tracker(ctx, TrackerEvent::Started);
+        } else if ctx.now >= self.announce_at {
             self.announce_to_tracker(ctx, TrackerEvent::None);
         }
         // anti-leech: expire bans, keep the list bounded
@@ -867,6 +967,9 @@ impl TorrentSession {
             self.last_evict_at = ctx.now;
             self.evict_worst(ctx);
         }
+        // Drop peers that got our full metadata but never interacted since:
+        // harvesters/dead conns must not squat session/connection capacity.
+        self.drop_metadata_idle(ctx);
         // DHT lookup / peer pull
         if self.dht_started {
             if let Some(dht) = ctx.dht.as_mut() {
@@ -989,7 +1092,29 @@ impl TorrentSession {
                 }
             }
         };
-        // (c) fetch one block through the (possibly proxied) HTTP seam
+        // (c) a block fetch is already in flight → wait for it (never block)
+        if self.webseed.job_id != 0 {
+            return;
+        }
+        // Fire an async range fetch (engine never blocks on web seeds);
+        // proxy mode has no async seam, so fall back to the sync SOCKS GET.
+        if self.cfg.proxy.is_none() {
+            let job_id = ctx.host.http_get_range_async(
+                &url,
+                range_start,
+                range_end,
+                self.cfg.webseed.timeout_ms,
+            );
+            if job_id != 0 {
+                self.webseed.job_id = job_id;
+                self.webseed.job_piece = piece;
+                self.webseed.job_block = self.webseed.next_block;
+                self.webseed.job_len = blen;
+                self.webseed.job_seed = self.webseed.seed_idx;
+                return;
+            }
+        }
+        // Sync fallback (host without an async worker, or proxy mode).
         let timeout = self.cfg.webseed.timeout_ms;
         let mut body = Vec::new();
         let got = match &self.cfg.proxy {
@@ -1006,15 +1131,31 @@ impl TorrentSession {
                 .host
                 .http_get_range(&url, range_start, range_end, timeout, &mut body),
         };
+        self.webseed_apply_block(got, &body, blen, ctx.now);
+    }
+
+    /// Apply one fetched block (success or failure) and advance the piece
+    /// state machine. Shared by the synchronous and the async paths.
+    fn webseed_apply_block(&mut self, got: Result<()>, body: &[u8], blen: u64, now: u64) {
+        let piece = match self.webseed.piece {
+            Some(p) => p,
+            None => return,
+        };
         match got {
             Ok(()) if body.len() as u64 == blen => {
                 let off = (self.webseed.next_block as u32 * BLOCK_LEN) as usize;
-                self.webseed.data[off..off + body.len()].copy_from_slice(&body);
-                self.downloaded_bytes += body.len() as u64;
-                self.monitor
-                    .record_piece_cover(NetAddr::V4([0, 0, 0, 0], 0), piece);
-                self.webseed.fails = 0;
-                self.webseed.next_block = self.webseed.next_block.saturating_add(1);
+                // Defense-in-depth: never copy past the assembled buffer.
+                if off + body.len() <= self.webseed.data.len() {
+                    self.webseed.data[off..off + body.len()].copy_from_slice(body);
+                    self.downloaded_bytes += body.len() as u64;
+                    self.monitor
+                        .record_piece_cover(NetAddr::V4([0, 0, 0, 0], 0), piece);
+                    self.webseed.fails = 0;
+                    self.webseed.next_block = self.webseed.next_block.saturating_add(1);
+                } else {
+                    // range not honored / oversized: the data is untrustworthy
+                    self.webseed.fails = self.webseed.fails.saturating_add(1);
+                }
             }
             Ok(()) => {
                 // range not honored / truncated: the data is untrustworthy
@@ -1298,6 +1439,28 @@ impl TorrentSession {
                 .note_violation(addr, peer_id.as_ref(), ctx.now);
         }
         self.drop_peer(id, FailureCategory::Timeout, ctx);
+    }
+
+    /// Disconnect peers we fully served our metadata to (ut_metadata) with no real interaction
+    /// (piece request/data) since, within METADATA_SERVED_IDLE_TIMEOUT_MS; keep-alives don't count.
+    fn drop_metadata_idle<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
+        let now = ctx.now;
+        let conns: Vec<ConnId> = self.peers.keys().copied().collect();
+        for c in conns {
+            let drop = {
+                let p = match self.peers.get(&c) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                p.metadata_served
+                    && now.saturating_sub(p.metadata_served_at)
+                        >= METADATA_SERVED_IDLE_TIMEOUT_MS
+                    && p.last_real_at <= p.metadata_served_at
+            };
+            if drop {
+                self.drop_peer(c, FailureCategory::Timeout, ctx);
+            }
+        }
     }
 
     /// Pick the next optimistic-unchoke candidate: among ready peers that
@@ -1852,6 +2015,14 @@ impl TorrentSession {
     ) -> Result<()> {
         if id == 0 {
             let ext = ExtHandshake::parse(&payload)?;
+            // BitComet `yourport`: the port this peer observes us using.
+            // A NAT-detection source for the external port we advertise via
+            // PEX (cross-confirmed with other peers before trusting it).
+            if let Some(yp) = ext.yourport {
+                if let Some(w) = self.peers.get(&conn).map(|p| p.addr) {
+                    self.observe_external_port(yp as u16, w, ctx.now);
+                }
+            }
             if let Some(peer) = self.peers.get_mut(&conn) {
                 peer.ext = Some(ext.clone());
                 peer.ext_metadata = ext.m.get("ut_metadata").copied();
@@ -1923,6 +2094,16 @@ impl TorrentSession {
                             id: meta_id,
                             payload: msg.encode(),
                         });
+                    }
+                    // Track serving completion: once every piece of our info dict is handed over,
+                    // note the moment so the idle-disconnect rule can apply.
+                    let total = (meta.len().div_ceil(piece_len)) as u32;
+                    let p = self.peers.get_mut(&conn).ok_or(Error::NotFound)?;
+                    p.metadata_total_pieces = total;
+                    p.metadata_served_pieces = p.metadata_served_pieces.saturating_add(1);
+                    if p.metadata_served_pieces >= total && total > 0 {
+                        p.metadata_served = true;
+                        p.metadata_served_at = ctx.now;
                     }
                 }
             }
@@ -2038,6 +2219,7 @@ impl TorrentSession {
             t.total_size.max(1),
         );
         self.announce_at = ctx.now;
+        self.pending_started_announce = true;
         if self.open_files(ctx).is_err() {
             self.status = SessionStatus::Failed;
         }
@@ -2127,6 +2309,7 @@ impl TorrentSession {
             key: 0x54594254, // "TYBT"
         };
         let mut attempt = 0;
+        let mut pending_skipped = false;
         let total = self.trackers.len();
         while attempt < total {
             let idx = self.tracker_cursor % total;
@@ -2138,14 +2321,44 @@ impl TorrentSession {
             let kind = self.trackers[idx].kind;
             match kind {
                 TrackerKind::Http => {
+                    // Pending guard: never open a second HTTP connection for a tracker still
+                    // inside its timeout window (re-entrant announce paths must not pile up conns).
+                    if ctx.now < self.trackers[idx].http_pending_until {
+                        pending_skipped = true;
+                        attempt += 1;
+                        self.tracker_cursor = (self.tracker_cursor + 1) % total;
+                        continue;
+                    }
+                    self.trackers[idx].http_pending_until = ctx.now + HTTP_ANNOUNCE_PENDING_MS;
                     let url = tracker::build_http_announce_url(
                         &String::from_utf8_lossy(&self.trackers[idx].url),
                         &params,
                     );
+                    // Async path (never blocks the engine): the request runs on the host's
+                    // worker; the result is applied by on_http_job_done. Proxy mode has no
+                    // async seam, so it falls back to the synchronous SOCKS GET.
+                    let job_id = if self.cfg.proxy.is_none() {
+                        ctx.host.http_get_async(&url, HTTP_ANNOUNCE_PENDING_MS)
+                    } else {
+                        0
+                    };
+                    if job_id != 0 {
+                        self.trackers[idx].http_job_id = job_id;
+                        self.tracker_cursor = (self.tracker_cursor + 1) % total;
+                        self.announce_at = ctx.now + HTTP_ANNOUNCE_PENDING_MS;
+                        return;
+                    }
+                    // Sync fallback (host without an async worker, or proxy mode).
                     let mut body = Vec::new();
                     let got = match &self.cfg.proxy {
-                        Some(p) => socks_mod::socks_http_get(ctx.host, p, &url, 15_000, &mut body),
-                        None => ctx.host.http_get(&url, 15_000, &mut body),
+                        Some(p) => socks_mod::socks_http_get(
+                            ctx.host,
+                            p,
+                            &url,
+                            HTTP_ANNOUNCE_PENDING_MS,
+                            &mut body,
+                        ),
+                        None => ctx.host.http_get(&url, HTTP_ANNOUNCE_PENDING_MS, &mut body),
                     };
                     match got {
                         Ok(()) => match tracker::parse_tracker_response(&body) {
@@ -2155,20 +2368,7 @@ impl TorrentSession {
                                     self.trackers[idx].fails =
                                         self.trackers[idx].fails.saturating_add(1);
                                 } else {
-                                    let interval = resp.interval.max(30);
-                                    let peer_count = resp.peers.len();
-                                    self.trackers[idx].interval = interval;
-                                    self.trackers[idx].next_announce = ctx.now + interval * 1000;
-                                    self.trackers[idx].failure = None;
-                                    self.trackers[idx].fails = 0;
-                                    self.on_tracker_peers(resp, ctx);
-                                    self.tracker_cursor = (idx + 1) % total;
-                                    self.announce_at = ctx.now + interval * 1000;
-                                    self.monitor.record_discovery(DiscoverySource::Tracker);
-                                    ctx.events.push(EngineEvent::TrackerAnnounced {
-                                        info_hash: self.info_hash,
-                                        peers: peer_count,
-                                    });
+                                    self.apply_tracker_response(idx, resp, total, ctx);
                                     return;
                                 }
                             }
@@ -2189,7 +2389,8 @@ impl TorrentSession {
                                 continue;
                             }
                             self.trackers[idx].failure = Some(String::from("http error"));
-                            self.trackers[idx].fails = self.trackers[idx].fails.saturating_add(1);
+                            self.trackers[idx].fails =
+                                self.trackers[idx].fails.saturating_add(1);
                         }
                     }
                 }
@@ -2204,20 +2405,24 @@ impl TorrentSession {
                     if st.udp.phase != UdpPhase::Idle
                         && ctx.now.saturating_sub(st.udp.sent_at) >= 15_000
                     {
+                        // Rotate to the next DNS record: a tracker with
+                        // multiple addresses must not keep hammering a dead
+                        // one — the whole point of resolving them all.
                         st.udp.phase = UdpPhase::Idle;
+                        let _ = st.udp.next_addr();
                         st.fails = st.fails.saturating_add(1);
                     }
                     if st.udp.phase == UdpPhase::Idle {
-                        // Resolve once and cache (hostname trackers are the
-                        // norm); the timeout reset above reuses `addr`.
-                        let addr = match st.udp.addr {
-                            Some(a) => Some(a),
-                            None => parse_udp_tracker_addr(&st.url, &mut |h, p| {
-                                ctx.host.resolve_host(h, p)
-                            }),
-                        };
-                        if let Some(a) = addr {
-                            st.udp.addr = Some(a);
+                        // Resolve every record once (hostname trackers are
+                        // the norm); the timeout reset above reuses `addrs`
+                        // and rotates the in-use index.
+                        if st.udp.addrs.is_empty() {
+                            st.udp.addrs = parse_udp_tracker_addr(&st.url, &mut |h, p| {
+                                ctx.host.resolve_host_all(h, p)
+                            });
+                            st.udp.addr_idx = 0;
+                        }
+                        if let Some(a) = st.udp.current_addr() {
                             st.udp.tid = rand_u32(ctx.now);
                             st.udp.sent_at = ctx.now;
                             let req = tracker::udp::build_connect_request(st.udp.tid);
@@ -2228,21 +2433,41 @@ impl TorrentSession {
                                 st.fails = st.fails.saturating_add(1);
                                 st.failure = Some(String::from("udp send failed"));
                                 st.udp.phase = UdpPhase::Idle;
+                                let _ = st.udp.next_addr();
                             } else {
                                 st.udp.phase = UdpPhase::ConnectSent;
                             }
+                        } else {
+                            // Unresolvable hostname: a dead tracker must not
+                            // stall the whole announce cycle (it used to
+                            // `return` here, so one bad UDP hostname blocked
+                            // every later tracker). Record the failure and
+                            // move on to the next tracker.
+                            st.fails = st.fails.saturating_add(1);
+                            st.failure = Some(String::from("resolve failed"));
                         }
                     }
-                    self.tracker_cursor = (idx + 1) % total;
-                    self.announce_at = ctx.now + 15_000;
-                    return;
+                    if st.udp.phase == UdpPhase::ConnectSent {
+                        // A connect request is on the wire: wait for the
+                        // reply (or the 15 s timeout) before touching any
+                        // other tracker — UDP announce is asynchronous.
+                        self.tracker_cursor = (idx + 1) % total;
+                        self.announce_at = ctx.now + 15_000;
+                        return;
+                    }
                 }
             }
             attempt += 1;
             self.tracker_cursor = (self.tracker_cursor + 1) % total;
         }
-        // all failed: back off
-        self.announce_at = ctx.now + 30 * 1000;
+        // All trackers failed or were skipped as pending: back off. Pending
+        // skips retry inside the HTTP timeout window, real failures wait
+        // the standard 30 s.
+        self.announce_at = if pending_skipped {
+            ctx.now + HTTP_ANNOUNCE_PENDING_MS
+        } else {
+            ctx.now + 30 * 1000
+        };
     }
 
     fn on_tracker_peers<H: Host>(&mut self, resp: TrackerResponse, ctx: &'_ mut SessionCtx<'_, H>) {
@@ -2259,6 +2484,105 @@ impl TorrentSession {
         for p in resp.peers {
             self.enqueue_peer(p, DiscoverySource::Tracker, ctx.now);
         }
+    }
+
+    /// Shared success handling for a parsed HTTP tracker response (used by
+    /// both the synchronous and the async announce paths).
+    fn apply_tracker_response<H: Host>(
+        &mut self,
+        idx: usize,
+        resp: TrackerResponse,
+        total: usize,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) {
+        let interval = resp.interval.max(30);
+        let peer_count = resp.peers.len();
+        self.trackers[idx].interval = interval;
+        self.trackers[idx].next_announce = ctx.now + interval * 1000;
+        self.trackers[idx].failure = None;
+        self.trackers[idx].fails = 0;
+        self.on_tracker_peers(resp, ctx);
+        self.tracker_cursor = (idx + 1) % total;
+        self.announce_at = ctx.now + interval * 1000;
+        self.monitor.record_discovery(DiscoverySource::Tracker);
+        ctx.events.push(EngineEvent::TrackerAnnounced {
+            info_hash: self.info_hash,
+            peers: peer_count,
+        });
+    }
+
+    /// Whether this session owns the async HTTP job `id` (tracker announce
+    /// or web-seed block fetch). The engine uses this to route results.
+    pub fn owns_http_job(&self, id: u64) -> bool {
+        self.trackers.iter().any(|t| t.http_job_id == id) || self.webseed.job_id == id
+    }
+
+    /// Apply a completed async HTTP tracker announce. The engine polls the
+    /// host's worker results each tick and routes them here — the engine
+    /// thread never blocks on tracker HTTP.
+    pub fn on_http_job_done<H: Host>(
+        &mut self,
+        id: u64,
+        result: Result<Vec<u8>>,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) {
+        let idx = match self.trackers.iter().position(|t| t.http_job_id == id) {
+            Some(i) => i,
+            None => return,
+        };
+        self.trackers[idx].http_job_id = 0;
+        self.trackers[idx].http_pending_until = 0;
+        let body = match result {
+            Ok(b) => b,
+            Err(_) => {
+                self.trackers[idx].failure = Some(String::from("http error"));
+                self.trackers[idx].fails = self.trackers[idx].fails.saturating_add(1);
+                self.announce_at = ctx.now + 30_000;
+                return;
+            }
+        };
+        match tracker::parse_tracker_response(&body) {
+            Ok(resp) => {
+                if let Some(f) = resp.failure {
+                    self.trackers[idx].failure = Some(f);
+                    self.trackers[idx].fails = self.trackers[idx].fails.saturating_add(1);
+                    self.announce_at = ctx.now + 30_000;
+                } else {
+                    self.apply_tracker_response(idx, resp, self.trackers.len(), ctx);
+                }
+            }
+            Err(_) => {
+                self.trackers[idx].failure = Some(String::from("bad response"));
+                self.trackers[idx].fails = self.trackers[idx].fails.saturating_add(1);
+                self.announce_at = ctx.now + 30_000;
+            }
+        }
+    }
+
+    /// Apply a completed async web-seed (BEP-19) range fetch.
+    pub fn on_range_job_done<H: Host>(
+        &mut self,
+        id: u64,
+        result: Result<Vec<u8>>,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) {
+        if self.webseed.job_id != id {
+            return;
+        }
+        // The fetch is over: release the slot so drive_webseed picks the
+        // next block (without this, the web seed stalls after one block).
+        self.webseed.job_id = 0;
+        let blen = self.webseed.job_len;
+        let body = match result {
+            Ok(b) => b,
+            Err(_) => Vec::new(),
+        };
+        let got = if body.len() as u64 == blen {
+            Ok(())
+        } else {
+            Err(Error::Protocol)
+        };
+        self.webseed_apply_block(got, &body, blen, ctx.now);
     }
 
     /// Handle a UDP tracker datagram routed to this session.
@@ -2282,6 +2606,26 @@ impl TorrentSession {
                     continue;
                 }
                 let action = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                // BEP-15 action 3 = the tracker rejected us; surface the
+                // reason, rotate to the next DNS record and reset the
+                // handshake instead of silently wedging in Connect/Announce.
+                if action == tracker::udp::ACTION_ERROR {
+                    let reason = String::from_utf8_lossy(&data[8..])
+                        .chars()
+                        .take(128)
+                        .collect::<String>();
+                    st.udp.phase = UdpPhase::Idle;
+                    st.fails = st.fails.saturating_add(1);
+                    st.failure = Some(if reason.is_empty() {
+                        String::from("udp tracker error")
+                    } else {
+                        reason
+                    });
+                    let _ = st.udp.next_addr();
+                    self.announce_at = ctx.now + 30_000;
+                    handled = true;
+                    break;
+                }
                 if st.udp.phase == UdpPhase::ConnectSent && action == tracker::udp::ACTION_CONNECT {
                     match tracker::udp::parse_connect_response(data, st.udp.tid) {
                         Ok(conn_id) => {
@@ -2306,7 +2650,7 @@ impl TorrentSession {
                                 key: 0x54594254,
                             };
                             let req = tracker::udp::build_announce_request(conn_id, st.udp.tid, &p);
-                            if let Some(a) = st.udp.addr {
+                            if let Some(a) = st.udp.current_addr() {
                                 if ctx.host.udp_send(&a, &req).is_err() {
                                     // Send failed: reset the handshake so the
                                     // next announce retries, and record the
@@ -2315,6 +2659,7 @@ impl TorrentSession {
                                     st.udp.phase = UdpPhase::Idle;
                                     st.fails = st.fails.saturating_add(1);
                                     st.failure = Some(String::from("udp send failed"));
+                                    let _ = st.udp.next_addr();
                                 }
                             }
                             self.announce_at = ctx.now + 15_000;
@@ -2322,7 +2667,12 @@ impl TorrentSession {
                             break;
                         }
                         Err(_) => {
+                            // Bad connect reply: rotate to the next record and
+                            // re-handshake, rather than parking on this one.
                             st.udp.phase = UdpPhase::Idle;
+                            st.fails = st.fails.saturating_add(1);
+                            let _ = st.udp.next_addr();
+                            self.announce_at = ctx.now + 15_000;
                             handled = true;
                             break;
                         }
@@ -2358,7 +2708,7 @@ impl TorrentSession {
 
     // ---------- peer queue / discovery ----------
 
-    fn enqueue_peer(&mut self, addr: NetAddr, source: DiscoverySource, now: u64) {
+    pub(crate) fn enqueue_peer(&mut self, addr: NetAddr, source: DiscoverySource, now: u64) {
         // anti-leech: never connect to a banned address
         if self.bans.is_banned(&addr, now) {
             return;
@@ -2409,6 +2759,49 @@ impl TorrentSession {
 
     // ---------- PEX ----------
 
+    /// Distinct peers that must report the same external port before it is
+    /// trusted for PEX advertisement (anti-spoofing).
+    const EXTERNAL_PORT_MIN_WITNESSES: usize = 2;
+    /// How long a port observation stays valid (15 minutes).
+    const EXTERNAL_PORT_TTL_MS: u64 = 15 * 60 * 1000;
+
+    /// Record a peer's observation of our external port (from the extended
+    /// handshake `yourport` or a PEX `p` field).
+    fn observe_external_port(&mut self, port: u16, witness: NetAddr, now: u64) {
+        if port == 0 {
+            return;
+        }
+        let entry = self.external_ports.entry(port).or_default();
+        if !entry.iter().any(|(w, _)| *w == witness) {
+            entry.push((witness, now));
+        }
+        entry.retain(|(_, t)| now.saturating_sub(*t) < Self::EXTERNAL_PORT_TTL_MS);
+        while self.external_ports.len() > 64 {
+            match self.external_ports.keys().next().copied() {
+                Some(k) => {
+                    self.external_ports.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// The external port confirmed by at least
+    /// [`Self::EXTERNAL_PORT_MIN_WITNESSES`] distinct peers.
+    fn confirmed_external_port(&self, now: u64) -> Option<u16> {
+        for (port, witnesses) in &self.external_ports {
+            if witnesses
+                .iter()
+                .filter(|(_, t)| now.saturating_sub(*t) < Self::EXTERNAL_PORT_TTL_MS)
+                .count()
+                >= Self::EXTERNAL_PORT_MIN_WITNESSES
+            {
+                return Some(*port);
+            }
+        }
+        None
+    }
+
     fn broadcast_pex(&mut self) {
         let conns: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in conns {
@@ -2445,6 +2838,15 @@ impl TorrentSession {
         }
         msg.added = v4;
         msg.added6 = v6;
+        // Advertise the best-known external port (confirmed by ≥2 distinct
+        // peers via `yourport`/PEX `p`); fall back to our configured listen
+        // port. Proxy mode never advertises a reachable port.
+        if self.cfg.proxy.is_none() {
+            let port = self
+                .confirmed_external_port(now)
+                .unwrap_or(self.cfg.listen_port);
+            msg.p = Some(port as u32);
+        }
         let payload = msg.encode();
         if let Some(p) = self.peers.get_mut(&conn) {
             p.send(&Message::Extended {
@@ -2456,6 +2858,12 @@ impl TorrentSession {
     }
 
     fn on_pex<H: Host>(&mut self, conn: ConnId, msg: PexMsg, ctx: &'_ mut SessionCtx<'_, H>) {
+        // A PEX `p` field is the sender's observation of our external port.
+        if let Some(p) = msg.p {
+            if let Some(w) = self.peers.get(&conn).map(|p| p.addr) {
+                self.observe_external_port(p as u16, w, ctx.now);
+            }
+        }
         let mut added = Vec::new();
         for c in msg.added.as_chunks::<6>().0 {
             if let Some(a) = NetAddr::from_compact6(c) {
@@ -2490,6 +2898,9 @@ impl TorrentSession {
     // ---------- request pipeline ----------
 
     fn fill_pipeline<H: Host>(&mut self, conn: ConnId, ctx: &'_ mut SessionCtx<'_, H>) {
+        let opts = PickOptions {
+            endgame: self.endgame,
+        };
         let mut guard = 0u32;
         while guard < 512 {
             guard += 1;
@@ -2506,45 +2917,60 @@ impl TorrentSession {
             if !want {
                 break;
             }
-            let opts = PickOptions {
-                endgame: self.endgame,
-            };
+            // Resolve the piece this peer is committed to (or pick a new
+            // one). A completed piece is dropped so the next iteration picks
+            // a fresh target and the pipeline stays saturated.
             let piece = {
-                let peer = self.peers.get(&conn).unwrap();
-                Picker::pick_piece(
-                    &self.pieces,
-                    self.scheduler.utilities(),
-                    &self.availability,
-                    &peer.have,
-                    peer.have_all,
-                    &self.piece_priorities,
-                    opts,
-                )
+                let peer = match self.peers.get(&conn) {
+                    Some(p) => p,
+                    None => return,
+                };
+                match peer.current_piece.filter(|&p| !self.pieces.is_have(p)) {
+                    Some(p) => p,
+                    None => match Picker::pick_piece(
+                        &self.pieces,
+                        self.scheduler.utilities(),
+                        &self.availability,
+                        &peer.have,
+                        peer.have_all,
+                        &self.piece_priorities,
+                        opts,
+                    ) {
+                        Some(p) => {
+                            if let Some(peer) = self.peers.get_mut(&conn) {
+                                peer.current_piece = Some(p);
+                            }
+                            p
+                        }
+                        None => return,
+                    },
+                }
             };
-            let piece = match piece {
-                Some(p) => p,
-                None => break,
-            };
-            let (block, begin, len, total_blocks) = {
+            let (total_blocks, piece_len) = {
                 let pi = match self.torrent.as_ref().and_then(|t| t.piece_info(piece).ok()) {
                     Some(pi) => pi,
-                    None => break,
-                };
-                let total_blocks = block_count_for(pi.len);
-                let b = match Picker::pick_block(&self.pieces, piece, total_blocks, true) {
-                    Some(b) => b,
                     None => {
-                        // this piece is fully requested by others; try next
-                        // by marking in-flight (already), continue loop
+                        // Piece no longer valid (torrent changed): release it.
+                        if let Some(p) = self.peers.get_mut(&conn) {
+                            p.current_piece = None;
+                        }
                         continue;
                     }
                 };
-                let begin = (b as u32) * BLOCK_LEN;
-                let len = core::cmp::min(BLOCK_LEN, pi.len - begin);
-                (b, begin, len, total_blocks)
+                (block_count_for(pi.len), pi.len)
             };
-            // download rate budget: never issue requests past what the
-            // per-task bucket and the per-tick global slice permit.
+            // Next missing block of the committed piece.
+            let b = match Picker::pick_block(&self.pieces, piece, total_blocks, true) {
+                Some(b) => b,
+                None => {
+                    if let Some(p) = self.peers.get_mut(&conn) {
+                        p.current_piece = None;
+                    }
+                    continue;
+                }
+            };
+            let begin = (b as u32) * BLOCK_LEN;
+            let len = core::cmp::min(BLOCK_LEN, piece_len - begin);
             let avail = self.download_limit.available(ctx.now);
             if avail < len as u64 {
                 break;
@@ -2554,12 +2980,8 @@ impl TorrentSession {
             }
             self.download_limit.consume(len as u64, ctx.now);
             self.tick_down_remaining -= len as u64;
-            // mark globally requested
-            self.pieces.mark_block_requested(piece, block, total_blocks);
-            self.requested_by
-                .entry((piece, block))
-                .or_default()
-                .push(conn);
+            self.pieces.mark_block_requested(piece, b, total_blocks);
+            self.requested_by.entry((piece, b)).or_default().push(conn);
             if let Some(p) = self.peers.get_mut(&conn) {
                 p.requests_in_flight += 1;
                 p.send(&Message::Request {
@@ -2579,7 +3001,7 @@ impl TorrentSession {
         index: u32,
         begin: u32,
         data: Vec<u8>,
-        _ctx: &'_ mut SessionCtx<'_, H>,
+        ctx: &'_ mut SessionCtx<'_, H>,
     ) -> Result<()> {
         let t = match &self.torrent {
             Some(t) => t.clone(),
@@ -2594,7 +3016,6 @@ impl TorrentSession {
         if data.len() as u32 != core::cmp::min(BLOCK_LEN, pi.len - begin) {
             return Err(Error::Protocol);
         }
-        // endgame: cancel duplicate requests to other peers
         if let Some(reqs) = self.requested_by.get(&(index, block as u16)) {
             for &c in reqs {
                 if c != conn {
@@ -2612,9 +3033,9 @@ impl TorrentSession {
         self.requested_by.remove(&(index, block as u16));
         self.pieces
             .clear_block_requested(index, block as u16, total_blocks);
-        // decrement the sender's in-flight count
         if let Some(p) = self.peers.get_mut(&conn) {
             p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
+            p.last_real_at = ctx.now;
         }
         let newly = self
             .pieces
@@ -2622,9 +3043,7 @@ impl TorrentSession {
         if !newly {
             return Ok(());
         }
-        // anti-leech: remember who supplied this block (for corrupt-blame)
         self.piece_suppliers.entry(index).or_default().push(conn);
-        // assemble
         let entry = self
             .assembling
             .entry(index)
@@ -2635,9 +3054,6 @@ impl TorrentSession {
         self.downloaded_bytes += data.len() as u64;
         self.monitor.record_piece_cover(self.peer_addr(conn), index);
         if self.pieces.piece_data_complete(index, total_blocks) {
-            // Hand the assembled piece to the verifier (worker pool or
-            // inline, decided by the engine). It stays out of the picker
-            // until the result lands: re-mark in-flight and record it.
             if let Some(buf) = self.assembling.remove(&index) {
                 self.pieces.set_in_flight(index, true);
                 self.verifying.insert(index, total_blocks as u32);
@@ -2733,7 +3149,6 @@ impl TorrentSession {
         self.write_abs(ctx, abs, &buf)?;
         self.pieces.mark_piece_have(index);
         self.piece_suppliers.remove(&index);
-        // broadcast have
         let conns: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in conns {
             if let Some(p) = self.peers.get_mut(&c) {
@@ -2742,7 +3157,6 @@ impl TorrentSession {
                 }
             }
         }
-        // receipt book + monitor
         self.receipt_book.record_range(abs, abs + buf.len() as u64);
         let sample = crate::crypto::Sha256::digest(&buf[..buf.len().min(4096)]);
         self.receipt_book.record_sample(abs, sample);
@@ -2768,8 +3182,6 @@ impl TorrentSession {
         total_blocks: u32,
         ctx: &'_ mut SessionCtx<'_, H>,
     ) {
-        // hash failure: reset the piece, attribute blame to the peers that
-        // supplied its blocks, ban repeat offenders.
         self.pieces.reset_piece(index);
         self.monitor.record_hash_failure(index);
         self.scheduler.mark_suspicious(index);
@@ -2803,8 +3215,6 @@ impl TorrentSession {
             if let Some(p) = self.peers.get_mut(&c) {
                 p.rep.corrupt_blocks = p.rep.corrupt_blocks.saturating_add(pen);
                 let pid = p.peer_id;
-                // remember the offense across disconnects / sessions so the
-                // peer starts pre-penalized next time it connects.
                 self.reputation
                     .note_corrupt(p.addr, pid.as_ref(), pen, ctx.now);
                 if p.rep.corrupt_blocks >= threshold {
@@ -2830,10 +3240,6 @@ impl TorrentSession {
             Some(t) => t.clone(),
             None => return Ok(()),
         };
-        // anti-leech: structurally invalid requests are unambiguous protocol
-        // violations (zero-length, misaligned, oversized, past the piece end,
-        // or a piece that does not exist). A single one can be a buggy peer,
-        // so we count them and only treat repeat offenders as violators.
         let structurally_bad = match t.piece_info(index) {
             Ok(pi) => {
                 length == 0
@@ -2871,6 +3277,7 @@ impl TorrentSession {
         // last asked (drives the idle-slot detection).
         if let Some(p) = self.peers.get_mut(&conn) {
             p.last_request_at = ctx.now;
+            p.last_real_at = ctx.now;
         }
         let (have, am_choking) = {
             let peer = match self.peers.get(&conn) {
@@ -3144,29 +3551,46 @@ fn detect_tracker_kind(url: &[u8]) -> TrackerKind {
 /// Parse a `udp://host:port/announce` endpoint. IPv4 literals are decoded
 /// directly; hostnames (the common case for public UDP trackers — e.g.
 /// `udp://tracker.opentrackr.org:1337`) are resolved through the host's
-/// `resolve_host`, without which they would silently never announce.
-fn parse_udp_tracker_addr<F>(url: &[u8], resolve: &mut F) -> Option<NetAddr>
+/// `resolve_host_all`, which returns **every** DNS record so a tracker with
+/// multiple addresses is tried record-by-record instead of pinning to the
+/// first.
+fn parse_udp_tracker_addr<F>(url: &[u8], resolve: &mut F) -> Vec<NetAddr>
 where
-    F: FnMut(&str, u16) -> Option<NetAddr>,
+    F: FnMut(&str, u16) -> Vec<NetAddr>,
 {
-    let s = core::str::from_utf8(url).ok()?;
-    let rest = s.strip_prefix("udp://")?;
-    let hostport = rest.split('/').next()?;
-    let (host, port) = hostport.rsplit_once(':')?;
-    let port: u16 = port.parse().ok()?;
+    let mut out = Vec::new();
+    let Some(s) = core::str::from_utf8(url).ok() else {
+        return out;
+    };
+    let Some(rest) = s.strip_prefix("udp://") else {
+        return out;
+    };
+    let Some(hostport) = rest.split('/').next() else {
+        return out;
+    };
+    let Some((host, port)) = hostport.rsplit_once(':') else {
+        return out;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return out;
+    };
     // IPv4 literal first (no DNS needed).
     let mut parts = host.split('.');
-    let literal = parts.next()?.parse::<u8>().ok().and_then(|a| {
-        let b = parts.next()?.parse::<u8>().ok()?;
-        let c = parts.next()?.parse::<u8>().ok()?;
-        let d = parts.next()?.parse::<u8>().ok()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        Some([a, b, c, d])
-    });
+    let literal = parts
+        .next()
+        .and_then(|a| a.parse::<u8>().ok())
+        .and_then(|a| {
+            let b = parts.next()?.parse::<u8>().ok()?;
+            let c = parts.next()?.parse::<u8>().ok()?;
+            let d = parts.next()?.parse::<u8>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some([a, b, c, d])
+        });
     if let Some(ip) = literal {
-        return Some(NetAddr::V4(ip, port));
+        out.push(NetAddr::V4(ip, port));
+        return out;
     }
     // Hostname (or bracketed IPv6 literal) → the host resolves it.
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -3174,9 +3598,10 @@ where
 }
 
 /// Build the per-session tracker list: torrent-declared URLs first, then
-/// config extras, deduped; when nothing was declared and
-/// `cfg.use_default_trackers` is set, fall back to the built-in public
-/// list (qBittorrent/BitComet compatible).
+/// config extras, then the curated `FALLBACK_TRACKERS` merged into every
+/// session (so a torrent with dead/blocked trackers still finds peers);
+/// only when nothing at all was declared do we fall back to the full
+/// built-in public list (qBittorrent/BitComet compatible).
 fn seed_trackers<I: IntoIterator<Item = Vec<u8>>>(
     from: I,
     cfg: &SessionConfig,
@@ -3190,6 +3615,13 @@ fn seed_trackers<I: IntoIterator<Item = Vec<u8>>>(
     }
     for url in &cfg.trackers {
         push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
+    }
+    // Always give every torrent a few reliable extra announce targets
+    // (unless the user explicitly disabled default trackers).
+    if cfg.use_default_trackers {
+        for url in crate::trackerlist::FALLBACK_TRACKERS {
+            push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
+        }
     }
     if out.is_empty() && cfg.use_default_trackers {
         for url in crate::trackerlist::DEFAULT_TRACKERS {
@@ -3216,6 +3648,8 @@ fn push_tracker(out: &mut Vec<TrackerState>, url: Vec<u8>) {
         kind,
         interval: 1800,
         next_announce: 0,
+        http_pending_until: 0,
+        http_job_id: 0,
         failure: None,
         fails: 0,
         udp: UdpTrackerState::default(),
@@ -3726,6 +4160,54 @@ mod tests {
     }
 
     #[test]
+    fn udp_tracker_dns_returns_all_records() {
+        // A hostname with multiple DNS records must yield every record, so
+        // the announce loop can fall back record-by-record instead of
+        // pinning to the first one.
+        let urls = parse_udp_tracker_addr(
+            b"udp://multi.tracker.example:1337/announce",
+            &mut |_h, p| {
+                vec![
+                    NetAddr::V4([203, 0, 113, 1], p),
+                    NetAddr::V4([203, 0, 113, 2], p),
+                    NetAddr::V4([203, 0, 113, 3], p),
+                ]
+            },
+        );
+        assert_eq!(
+            urls,
+            vec![
+                NetAddr::V4([203, 0, 113, 1], 1337),
+                NetAddr::V4([203, 0, 113, 2], 1337),
+                NetAddr::V4([203, 0, 113, 3], 1337),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_port_requires_two_distinct_witnesses() {
+        let mut t = test_torrent();
+        t.announce_list = vec![];
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            listen_port: 6881,
+            ..Default::default()
+        };
+        let mut s = TorrentSession::from_torrent(t, cfg, 1_000_000).expect("session");
+        // One witness → not confirmed.
+        s.observe_external_port(61234, NetAddr::V4([1, 2, 3, 4], 6881), 1_000_000);
+        assert_eq!(s.confirmed_external_port(1_000_000), None);
+        // Second distinct witness on the same port → confirmed.
+        s.observe_external_port(61234, NetAddr::V4([5, 6, 7, 8], 6881), 1_000_100);
+        assert_eq!(s.confirmed_external_port(1_000_200), Some(61234));
+        // A single witness on a different port must not steal the result.
+        s.observe_external_port(40000, NetAddr::V4([9, 9, 9, 9], 6881), 1_000_300);
+        assert_eq!(s.confirmed_external_port(1_000_400), Some(61234));
+        // Observations expire after the TTL.
+        assert_eq!(s.confirmed_external_port(1_000_000 + 16 * 60 * 1000), None);
+    }
+
+    #[test]
     fn web_seed_path_percent_encodes() {
         let f = FileEntry {
             path: vec![b"a b".to_vec(), b"c%2Fd.txt".to_vec()],
@@ -3780,5 +4262,254 @@ mod tests {
         let s = session();
         // piece 0 is rejected (spans files); piece 1 is whole in file 1
         assert_eq!(s.pick_webseed_piece(&t), Some((1, 16584)));
+    }
+
+    /// A host exposing the async HTTP worker seam: accepts jobs, records
+    /// URLs, and returns whatever `done` has been primed with.
+    struct AsyncHttpHost {
+        next_job: u64,
+        urls: Vec<String>,
+        done: Vec<(u64, Result<Vec<u8>>)>,
+    }
+
+    impl crate::platform::Host for AsyncHttpHost {
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+        fn fill_random(&mut self, _b: &mut [u8]) {}
+        fn log(&mut self, _l: crate::platform::LogLevel, _m: &str) {}
+        fn http_get(&mut self, _u: &str, _t: u64, _o: &mut Vec<u8>) -> Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn http_get_async(&mut self, url: &str, _timeout_ms: u64) -> u64 {
+            self.next_job += 1;
+            self.urls.push(String::from(url));
+            self.next_job
+        }
+        fn http_get_range_async(&mut self, url: &str, _s: u64, _e: u64, _t: u64) -> u64 {
+            self.next_job += 1;
+            self.urls.push(String::from(url));
+            self.next_job
+        }
+        fn http_take_done(&mut self) -> alloc::vec::Vec<(u64, Result<Vec<u8>>)> {
+            core::mem::take(&mut self.done)
+        }
+        fn tcp_connect(&mut self, _a: &NetAddr) -> Result<ConnId> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_connect_done(&mut self, _id: ConnId) -> Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_send(&mut self, _id: ConnId, _d: &[u8]) -> Result<usize> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_recv(&mut self, _id: ConnId, _b: &mut [u8]) -> Result<usize> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn tcp_close(&mut self, _id: ConnId) {}
+        fn udp_open(&mut self, _p: u16) -> Result<()> {
+            Ok(())
+        }
+        fn udp_send(&mut self, _a: &NetAddr, _d: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn udp_recv(&mut self, _b: &mut [u8]) -> Result<(NetAddr, usize)> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn disk_open(&mut self, _p: &str) -> Result<DiskId> {
+            Ok(1)
+        }
+        fn disk_read(&mut self, _id: DiskId, _o: u64, _b: &mut [u8]) -> Result<usize> {
+            Ok(0)
+        }
+        fn disk_write(&mut self, _id: DiskId, _o: u64, _d: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn disk_prealloc(&mut self, _id: DiskId, _s: u64) -> Result<()> {
+            Ok(())
+        }
+        fn disk_flush(&mut self, _id: DiskId) -> Result<()> {
+            Ok(())
+        }
+        fn disk_close(&mut self, _id: DiskId) {}
+    }
+
+    #[test]
+    fn async_http_tracker_fires_without_blocking_and_applies_result() {
+        let mut s = session();
+        s.trackers.clear();
+        s.trackers.push(TrackerState {
+            url: b"http://tracker.example.com/announce".to_vec(),
+            kind: TrackerKind::Http,
+            interval: 1800,
+            next_announce: 0,
+            http_pending_until: 0,
+            http_job_id: 0,
+            failure: None,
+            fails: 0,
+            udp: UdpTrackerState::default(),
+        });
+        s.status = SessionStatus::Downloading;
+        let mut host = AsyncHttpHost {
+            next_job: 0,
+            urls: Vec::new(),
+            done: Vec::new(),
+        };
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        // Phase 1: fire the announce (async job, no blocking).
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            s.announce_to_tracker(&mut ctx, TrackerEvent::Started);
+        }
+        assert_eq!(host.urls.len(), 1, "async job must be enqueued");
+        assert_eq!(s.trackers[0].http_job_id, 1, "job id recorded");
+        assert!(host.urls[0].contains("info_hash="), "announce URL built");
+        // Phase 2: the worker completes the job; route the result back.
+        host.done
+            .push((1, Ok(b"d8:intervali1800e5:peers0:e".to_vec())));
+        let jobs = host.http_take_done();
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            for (id, res) in jobs {
+                s.on_http_job_done(id, res, &mut ctx);
+            }
+        }
+        assert_eq!(s.trackers[0].http_job_id, 0, "job released after result");
+        assert_eq!(s.trackers[0].fails, 0, "success clears the failure counter");
+        assert_eq!(s.trackers[0].interval, 1800);
+        assert!(s.announce_at >= 1_000_000 + 1800 * 1000);
+    }
+
+    #[test]
+    fn async_http_tracker_failure_marks_tracker() {
+        let mut s = session();
+        s.trackers.clear();
+        s.trackers.push(TrackerState {
+            url: b"http://tracker.example.com/announce".to_vec(),
+            kind: TrackerKind::Http,
+            interval: 1800,
+            next_announce: 0,
+            http_pending_until: 0,
+            http_job_id: 0,
+            failure: None,
+            fails: 0,
+            udp: UdpTrackerState::default(),
+        });
+        s.status = SessionStatus::Downloading;
+        let mut host = AsyncHttpHost {
+            next_job: 0,
+            urls: Vec::new(),
+            done: Vec::new(),
+        };
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            s.announce_to_tracker(&mut ctx, TrackerEvent::Started);
+        }
+        // The worker reports a timeout → the tracker takes a failure.
+        host.done.push((1, Err(crate::error::Error::Timeout)));
+        let jobs = host.http_take_done();
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            for (id, res) in jobs {
+                s.on_http_job_done(id, res, &mut ctx);
+            }
+        }
+        assert_eq!(s.trackers[0].http_job_id, 0);
+        assert_eq!(s.trackers[0].fails, 1, "failure recorded");
+        assert!(s.announce_at > 1_000_000, "re-announce scheduled");
+    }
+
+    #[test]
+    fn async_webseed_fetches_block_and_releases_job() {
+        let mut s = session();
+        s.status = SessionStatus::Downloading;
+        s.web_seeds = vec![String::from("http://seed.example/base/")];
+        // Prime piece 0 (256 KiB → 16 blocks) for a direct block fetch.
+        s.webseed.piece = Some(0);
+        s.webseed.next_block = 0;
+        s.webseed.total_blocks = block_count_for(256 * 1024);
+        s.webseed.data = vec![0u8; 256 * 1024];
+        let mut host = AsyncHttpHost {
+            next_job: 0,
+            urls: Vec::new(),
+            done: Vec::new(),
+        };
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        // Phase 1: drive_webseed fires an async range job (never blocks).
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            s.drive_webseed(&mut ctx);
+        }
+        assert_eq!(host.urls.len(), 1, "range job must be enqueued");
+        let job_id = s.webseed.job_id;
+        assert_ne!(job_id, 0, "job id recorded");
+        // Phase 2: the worker returns the 16 KiB block.
+        let blen = s.webseed.job_len as usize;
+        host.done.push((job_id, Ok(vec![0x42u8; blen])));
+        let jobs = host.http_take_done();
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            for (id, res) in jobs {
+                s.on_range_job_done(id, res, &mut ctx);
+            }
+        }
+        assert_eq!(s.webseed.job_id, 0, "job released so the next block is fetched");
+        assert_eq!(s.webseed.next_block, 1, "block advanced");
+        assert!(
+            s.webseed.data[..blen].iter().all(|&b| b == 0x42),
+            "block bytes applied"
+        );
     }
 }

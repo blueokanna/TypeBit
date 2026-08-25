@@ -458,6 +458,8 @@ pub struct ExtHandshake {
     pub metadata_size: Option<u32>,
     /// DHT port.
     pub p: Option<u32>,
+    /// A NAT-detection data source for the external endpoint advertised through PEX.
+    pub yourport: Option<u32>,
 }
 
 impl ExtHandshake {
@@ -482,6 +484,9 @@ impl ExtHandshake {
         }
         if let Some(p) = self.p {
             entries.push((b"p", BVal::Int(p as i64)));
+        }
+        if let Some(yp) = self.yourport {
+            entries.push((b"yourport", BVal::Int(yp as i64)));
         }
         let mut out = Vec::new();
         dict(entries).encode(&mut out);
@@ -511,6 +516,11 @@ impl ExtHandshake {
             .and_then(|x| x.as_int())
             .map(|i| i as u32);
         out.p = d.get(&b"p"[..]).and_then(|x| x.as_int()).map(|i| i as u32);
+        out.yourport = d
+            .get(&b"yourport"[..])
+            .and_then(|x| x.as_int())
+            .map(|i| i as u32)
+            .filter(|p| *p > 0 && *p <= 65535);
         Ok(out)
     }
 }
@@ -616,6 +626,12 @@ pub struct PexMsg {
     pub added6_f: Vec<u8>,
     /// Dropped IPv6.
     pub dropped6: Vec<u8>,
+    /// Our TCP listen port as observed by the recipient (the libtorrent
+    /// `p` extension). Lets a peer behind NAT learn the port it should
+    /// advertise through PEX when the extended handshake did not carry one.
+    pub p: Option<u32>,
+    /// Our IPv6 TCP listen port (`p6`).
+    pub p6: Option<u32>,
 }
 
 impl PexMsg {
@@ -639,6 +655,12 @@ impl PexMsg {
         }
         if !self.dropped6.is_empty() {
             entries.push((b"dropped6", BVal::Bytes(self.dropped6.clone())));
+        }
+        if let Some(p) = self.p {
+            entries.push((b"p", BVal::Int(p as i64)));
+        }
+        if let Some(p6) = self.p6 {
+            entries.push((b"p6", BVal::Int(p6 as i64)));
         }
         let mut out = Vec::new();
         dict(entries).encode(&mut out);
@@ -680,6 +702,16 @@ impl PexMsg {
                 out.dropped6 = a.to_vec();
             }
         }
+        out.p = d
+            .get(&b"p"[..])
+            .and_then(|x| x.as_int())
+            .map(|i| i as u32)
+            .filter(|p| *p > 0 && *p <= 65535);
+        out.p6 = d
+            .get(&b"p6"[..])
+            .and_then(|x| x.as_int())
+            .map(|i| i as u32)
+            .filter(|p| *p > 0 && *p <= 65535);
         Ok(out)
     }
 }

@@ -19,6 +19,8 @@ pub enum DiscoverySource {
     Dht,
     /// Peer exchange (BEP-11).
     Pex,
+    /// Local Service Discovery (BEP-14, LAN multicast).
+    Lsd,
     /// Manually added / magnet `x.pe`.
     Manual,
     /// Web seed (BEP-19).
@@ -32,6 +34,7 @@ impl DiscoverySource {
             DiscoverySource::Tracker => "tracker",
             DiscoverySource::Dht => "dht",
             DiscoverySource::Pex => "pex",
+            DiscoverySource::Lsd => "lsd",
             DiscoverySource::Manual => "manual",
             DiscoverySource::WebSeed => "webseed",
         }
@@ -209,8 +212,9 @@ impl SwarmMonitor {
             DiscoverySource::Tracker => 0,
             DiscoverySource::Dht => 1,
             DiscoverySource::Pex => 2,
-            DiscoverySource::Manual => 3,
-            DiscoverySource::WebSeed => 4,
+            DiscoverySource::Lsd => 3,
+            DiscoverySource::Manual => 4,
+            DiscoverySource::WebSeed => 5,
         }
     }
 

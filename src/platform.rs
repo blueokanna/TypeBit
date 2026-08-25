@@ -242,6 +242,38 @@ pub trait Host {
         Err(Error::NotSupported)
     }
 
+    // ---------- async HTTP (non-blocking tracker / web-seed transport) ----------
+
+    /// Enqueue an async HTTP GET; returns a job id (>0) when accepted, 0
+    /// when the host has no async worker (the caller then falls back to the
+    /// blocking [`Self::http_get`]). Non-blocking: the request runs on a
+    /// host thread and its result arrives via [`Self::http_take_done`];
+    /// `timeout_ms` bounds the request on the worker.
+    fn http_get_async(&mut self, _url: &str, _timeout_ms: u64) -> u64 {
+        0
+    }
+
+    /// Enqueue an async HTTP GET with a `Range: bytes=start-end` header
+    /// (web seeds, BEP-19); same contract as [`Self::http_get_async`].
+    fn http_get_range_async(
+        &mut self,
+        _url: &str,
+        _range_start: u64,
+        _range_end: u64,
+        _timeout_ms: u64,
+    ) -> u64 {
+        0
+    }
+
+    /// Drain completed async HTTP jobs as `(job id, result)` — the body on
+    /// success, the error kind on failure/timeout. Jobs not returned here
+    /// are still pending on the worker.
+    fn http_take_done(
+        &mut self,
+    ) -> alloc::vec::Vec<(u64, Result<alloc::vec::Vec<u8>>)> {
+        alloc::vec::Vec::new()
+    }
+
     // ---------- network info (UPnP / NAT-PMP port mapping) ----------
 
     /// The default gateway address, when the platform can discover it.
@@ -263,6 +295,18 @@ pub trait Host {
     /// never go through this hook.
     fn resolve_host(&self, _host: &str, _port: u16) -> Option<NetAddr> {
         None
+    }
+
+    /// Resolve **all** address records for a hostname (with `port`), so a
+    /// UDP tracker whose DNS has multiple A/AAAA records can fall back
+    /// through each of them instead of pinning to the first. The default
+    /// returns just [`Self::resolve_host`]; hosts that can enumerate every
+    /// record override this.
+    fn resolve_host_all(&self, host: &str, port: u16) -> alloc::vec::Vec<NetAddr> {
+        match self.resolve_host(host, port) {
+            Some(a) => alloc::vec![a],
+            None => alloc::vec![],
+        }
     }
 
     // ---------- TCP peers ----------
@@ -297,11 +341,20 @@ pub trait Host {
     /// Send one datagram.
     fn udp_send(&mut self, addr: &NetAddr, data: &[u8]) -> Result<()>;
 
-    /// Send one datagram to a multicast group (used by SSDP discovery).
-    /// The default routes through [`Self::udp_send`]; platforms that need
-    /// multicast options (TTL/interface) override this.
+    /// Send one datagram to a multicast group (used by SSDP discovery and
+    /// LSD, BEP-14). The default routes through [`Self::udp_send`];
+    /// platforms that need multicast options (TTL/interface) override this.
     fn udp_multicast_send(&mut self, addr: &NetAddr, data: &[u8]) -> Result<()> {
         self.udp_send(addr, data)
+    }
+
+    /// Join a multicast group on the UDP socket so datagrams sent to the
+    /// group are delivered to [`Self::udp_recv`] (SSDP responses, LSD
+    /// announces, BEP-14). Default is a no-op; hosts that support multicast
+    /// membership override this. Best-effort: failure to join is not fatal.
+    fn udp_join_multicast(&mut self, addr: NetAddr) -> Result<()> {
+        let _ = addr;
+        Ok(())
     }
 
     /// Receive one datagram (non-blocking). `Err(WouldBlock)` = none pending.

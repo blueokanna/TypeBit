@@ -80,14 +80,27 @@ pub struct Peer {
     pub last_active: u64,
     /// Timestamp of last data received (for snub detection).
     pub last_data_in: u64,
+    /// Timestamp of the last *real* interaction (piece request/data) — keep-alives
+    /// and metadata fetches don't count; drives the metadata-served idle disconnect.
+    pub last_real_at: u64,
     /// Timestamp of connection start.
     pub connected_at: u64,
+    /// ut_metadata pieces of OUR info dict we have served to this peer.
+    pub metadata_served_pieces: u32,
+    /// Total ut_metadata pieces of our info dict (0 = nothing to serve).
+    pub metadata_total_pieces: u32,
+    /// True once every metadata piece has been served (ms of completion).
+    pub metadata_served: bool,
+    /// When the last metadata piece was served (ms; 0 = never).
+    pub metadata_served_at: u64,
     /// Snubbed (no data for a while despite requests).
     pub snubbed: bool,
     /// This peer holds an optimistic-unchoke slot.
     pub optimistic: bool,
     /// Outstanding request count on this connection.
     pub requests_in_flight: u32,
+    /// The piece this peer is committed to filling
+    pub current_piece: Option<u32>,
     /// Last time they requested a block from us (ms; 0 = never). Drives
     /// the idle-slot (bandwidth squatting) detection.
     pub last_request_at: u64,
@@ -146,10 +159,16 @@ impl Peer {
             up_rate: 0,
             last_active: 0,
             last_data_in: 0,
+            last_real_at: 0,
             connected_at: 0,
+            metadata_served_pieces: 0,
+            metadata_total_pieces: 0,
+            metadata_served: false,
+            metadata_served_at: 0,
             snubbed: false,
             optimistic: false,
             requests_in_flight: 0,
+            current_piece: None,
             last_request_at: 0,
             served_requests: 0,
             spurious_cancels: 0,

@@ -150,6 +150,12 @@ impl RoutingTable {
         if e.id == self.id {
             return false;
         }
+        // Drop same-endpoint entries (bootstrap ZERO placeholder / stale) so the real id re-inserts into the correct bucket exactly once.
+        if e.id != NodeId::ZERO {
+            for b in &mut self.buckets {
+                b.nodes.retain(|n| n.addr != e.addr);
+            }
+        }
         let idx = self.bucket_index(&e.id);
         self.buckets[idx].insert(e, now, self.k)
     }
@@ -237,6 +243,10 @@ pub enum KrpcBody {
         id: NodeId,
         /// Response payload.
         resp: Resp,
+        /// BEP-42: the responder's observation of the **sender's** address,
+        /// compact-encoded (4 bytes IPv4 / 16 bytes IPv6). Lets a node
+        /// behind NAT learn its external endpoint from well-behaved peers.
+        ip: Option<Vec<u8>>,
     },
     /// An error `[code, message]`.
     Error {
@@ -382,9 +392,17 @@ pub fn encode(msg: &KrpcMsg) -> Vec<u8> {
             }
             root.push((b"a", dict(a)));
         }
-        KrpcBody::Response { id, resp } => {
+        KrpcBody::Response { id, resp, ip } => {
             root.push((b"y", bytes("r")));
             let mut r: Vec<(&[u8], BVal)> = vec![(b"id", bytes(id.0.to_vec()))];
+            // BEP-42: report the sender's address as observed (only when the
+            // request came from a routable endpoint — never a private/loopback
+            // one, which would leak a LAN address and poison NAT detection).
+            if let Some(ipv) = ip {
+                if ipv.len() == 4 || ipv.len() == 16 {
+                    r.push((b"ip", bytes(ipv.clone())));
+                }
+            }
             match resp {
                 Resp::Ping { .. } => {}
                 Resp::AnnouncePeer { .. } => {}
@@ -507,6 +525,13 @@ pub fn decode(payload: &[u8]) -> Result<KrpcMsg> {
                     .and_then(|x| x.as_bytes())
                     .ok_or(Error::Dht)?,
             )?);
+            // BEP-42: the sender's observation of OUR address (4/16 bytes;
+            // tolerate the 6/18-byte ip:port form some clients use).
+            let ip = r
+                .get(&b"ip"[..])
+                .and_then(|x| x.as_bytes())
+                .map(|b| b.to_vec())
+                .filter(|b| b.len() == 4 || b.len() == 6 || b.len() == 16 || b.len() == 18);
             let body = if r.contains_key(&b"token"[..]) {
                 let token = r
                     .get(&b"token"[..])
@@ -525,6 +550,7 @@ pub fn decode(payload: &[u8]) -> Result<KrpcMsg> {
                         values: peers,
                         nodes,
                     },
+                    ip,
                 }
             } else if r.contains_key(&b"nodes"[..]) {
                 let mut nodes = parse_compact_nodes(r.get(&b"nodes"[..]));
@@ -532,11 +558,13 @@ pub fn decode(payload: &[u8]) -> Result<KrpcMsg> {
                 KrpcBody::Response {
                     id,
                     resp: Resp::FindNode { id, nodes },
+                    ip,
                 }
             } else {
                 KrpcBody::Response {
                     id,
                     resp: Resp::Ping { id },
+                    ip,
                 }
             };
             Ok(KrpcMsg { t, body })
@@ -699,9 +727,30 @@ pub struct Dht {
     /// with any value — the whole DHT discovery path would be a no-op even
     /// after a successful bootstrap.
     peer_store: BTreeMap<[u8; 20], Vec<(NetAddr, u64)>>,
+    /// BEP-42 external-address observations: observed address (16 bytes,
+    /// IPv4 in the first 4) → (witness endpoint, observation time). Only
+    /// *distinct* witnesses count, so a single malicious/buggy node cannot
+    /// poison our NAT-detected endpoint.
+    external_witnesses: BTreeMap<[u8; 16], Vec<(NetAddr, u64)>>,
+    /// The external address confirmed by >= [`Self::EXTERNAL_MIN_WITNESSES`]
+    /// distinct DHT nodes (cross-confirmed, BEP-42).
+    confirmed_external: Option<[u8; 16]>,
+    /// Externally-observed UDP port candidates (port → witness + time),
+    /// cross-confirmed like the IP. Filled from BEP-42 `ip` values that
+    /// carry a port (the 6/18-byte forms).
+    external_port_witnesses: BTreeMap<u16, Vec<(NetAddr, u64)>>,
+    /// The external UDP port confirmed by >= [`Self::EXTERNAL_MIN_WITNESSES`]
+    /// distinct DHT nodes.
+    confirmed_external_port: Option<u16>,
 }
 
 impl Dht {
+    /// Distinct nodes that must agree before an external address is trusted.
+    const EXTERNAL_MIN_WITNESSES: usize = 3;
+    /// How long a witness observation stays valid (10 minutes).
+    const EXTERNAL_WITNESS_TTL_MS: u64 = 10 * 60 * 1000;
+    /// Cap on tracked observed addresses (flood bound).
+    const EXTERNAL_MAX_OBSERVED: usize = 64;
     /// Create with an id (seed from host entropy by the caller).
     pub fn new(id: NodeId, port: u16, rng: &mut Rng) -> Self {
         let mut secret = [0u8; 16];
@@ -717,6 +766,10 @@ impl Dht {
             announced: Vec::new(),
             peer_cache: BTreeMap::new(),
             peer_store: BTreeMap::new(),
+            external_witnesses: BTreeMap::new(),
+            confirmed_external: None,
+            external_port_witnesses: BTreeMap::new(),
+            confirmed_external_port: None,
         }
     }
 
@@ -837,7 +890,8 @@ impl Dht {
         tx
     }
 
-    /// Bootstrap against seed nodes.
+    /// Bootstrap: insert resolved seeds into the table immediately (ZERO placeholder) and ping them,
+    /// so lookups + bucket refresh start before the ping round-trip; the real id replaces the placeholder.
     pub fn bootstrap(&mut self, seeds: &[NetAddr], now: u64) {
         for s in seeds {
             let e = NodeEntry {
@@ -846,6 +900,7 @@ impl Dht {
                 last_seen: now,
                 failed: 0,
             };
+            self.table.insert(e.clone(), now);
             self.ping(&e, now);
         }
     }
@@ -933,7 +988,11 @@ impl Dht {
                 }
             }
         }
-        self.announced.truncate(200);
+        // Keep only the most recent announce targets (bounded dedupe).
+        if self.announced.len() > 200 {
+            let excess = self.announced.len() - 200;
+            self.announced.drain(..excess);
+        }
     }
 
     /// Advance one lookup: query the closest unqueried nodes.
@@ -1014,10 +1073,18 @@ impl Dht {
     }
 
     /// Collect outgoing datagrams. The engine sends these via the host UDP.
+    ///
+    /// Packet pacing: at most 16 datagrams per 100 ms tick (~160/s peak),
+    /// so lookup fan-out / bootstrap / announce storms across many sessions
+    /// never dump hundreds of packets on the network device; the rest retry next tick.
     pub fn outgoing(&mut self) -> Vec<(NetAddr, Vec<u8>)> {
-        let mut out = Vec::new();
+        const MAX_OUTGOING_PER_TICK: usize = 16;
+        let mut out = Vec::with_capacity(MAX_OUTGOING_PER_TICK.min(self.pending.len()));
         let txs: Vec<u32> = self.pending.keys().copied().collect();
         for tx in txs {
+            if out.len() >= MAX_OUTGOING_PER_TICK {
+                break;
+            }
             if let Some(p) = self.pending.get(&tx) {
                 out.push((p.node.addr, p.query.clone()));
             }
@@ -1046,6 +1113,7 @@ impl Dht {
                             body: KrpcBody::Response {
                                 id: self.id,
                                 resp: Resp::Ping { id: self.id },
+                                ip: observed_compact(&from),
                             },
                         };
                         Ok(DatagramOutcome::Reply(encode(&reply)))
@@ -1058,6 +1126,7 @@ impl Dht {
                             body: KrpcBody::Response {
                                 id: self.id,
                                 resp: Resp::FindNode { id: self.id, nodes },
+                                ip: observed_compact(&from),
                             },
                         };
                         Ok(DatagramOutcome::Reply(encode(&reply)))
@@ -1085,6 +1154,7 @@ impl Dht {
                                     values,
                                     nodes,
                                 },
+                                ip: observed_compact(&from),
                             },
                         };
                         Ok(DatagramOutcome::Reply(encode(&reply)))
@@ -1140,6 +1210,7 @@ impl Dht {
                             body: KrpcBody::Response {
                                 id: self.id,
                                 resp: Resp::AnnouncePeer { id: self.id },
+                                ip: observed_compact(&from),
                             },
                         };
                         Ok(DatagramOutcome::Reply(encode(&reply)))
@@ -1147,8 +1218,14 @@ impl Dht {
                     _ => Ok(DatagramOutcome::None),
                 }
             }
-            KrpcBody::Response { id, resp } => {
+            KrpcBody::Response { id, resp, ip } => {
                 self.table.on_response(&id, from, now);
+                // BEP-42 receive side: a response's `ip` field is the
+                // responder's observation of OUR address. Cross-confirm it
+                // across distinct nodes before trusting it (防污染).
+                if let Some(ipv) = ip {
+                    self.observe_external(&ipv, from, now);
+                }
                 let tx = tx_of(&msg.t);
                 if let Some(p) = self.pending.remove(&tx) {
                     match p.kind {
@@ -1318,6 +1395,121 @@ impl Dht {
     pub fn active_lookups(&self) -> usize {
         self.lookups.iter().filter(|l| !l.done).count()
     }
+
+    /// BEP-42: record a node's observation of our external address/port; only distinct witnesses
+    /// count, so a single bad node cannot poison the confirmed endpoint (>=3 votes, 10 min TTL).
+    fn observe_external(&mut self, compact: &[u8], witness: NetAddr, now: u64) {
+        // Accept 4/6/16/18-byte forms (IP, or IP:port); 6/18 also feed the confirmed UDP port.
+        let (ip16, port) = match compact.len() {
+            4 => {
+                let mut b = [0u8; 16];
+                b[..4].copy_from_slice(compact);
+                (b, None)
+            }
+            6 => {
+                let mut b = [0u8; 16];
+                b[..4].copy_from_slice(&compact[..4]);
+                (b, Some(u16::from_be_bytes([compact[4], compact[5]])))
+            }
+            16 => {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(compact);
+                (b, None)
+            }
+            18 => {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&compact[..16]);
+                (b, Some(u16::from_be_bytes([compact[16], compact[17]])))
+            }
+            _ => return,
+        };
+        // Ignore non-routable observations (a broken/malicious node feeding us a private address).
+        if !is_routable(&ip16) {
+            return;
+        }
+        // One vote per witness address per observed IP.
+        let entry = self.external_witnesses.entry(ip16).or_default();
+        let witness_key = match witness {
+            NetAddr::V4(ip, _) => {
+                let mut b = [0u8; 16];
+                b[..4].copy_from_slice(&ip);
+                b
+            }
+            NetAddr::V6(ip, _) => ip,
+        };
+        if !entry.iter().any(|(w, _)| {
+            let wk = match *w {
+                NetAddr::V4(ip, _) => {
+                    let mut b = [0u8; 16];
+                    b[..4].copy_from_slice(&ip);
+                    b
+                }
+                NetAddr::V6(ip, _) => ip,
+            };
+            wk == witness_key
+        }) {
+            entry.push((witness, now));
+        }
+        entry.retain(|(_, t)| now.saturating_sub(*t) < Self::EXTERNAL_WITNESS_TTL_MS);
+        if entry.len() >= Self::EXTERNAL_MIN_WITNESSES {
+            self.confirmed_external = Some(ip16);
+        }
+        // bound the observation map
+        while self.external_witnesses.len() > Self::EXTERNAL_MAX_OBSERVED {
+            match self.external_witnesses.keys().next().copied() {
+                Some(k) => {
+                    self.external_witnesses.remove(&k);
+                }
+                None => break,
+            }
+        }
+        // Cross-confirm the observed UDP port (BEP-42 6/18-byte forms).
+        if let Some(port) = port {
+            if port != 0 {
+                let entry = self.external_port_witnesses.entry(port).or_default();
+                if !entry
+                    .iter()
+                    .any(|(w, _)| addr_key(*w) == addr_key(witness))
+                {
+                    entry.push((witness, now));
+                }
+                entry.retain(|(_, t)| now.saturating_sub(*t) < Self::EXTERNAL_WITNESS_TTL_MS);
+                if entry.len() >= Self::EXTERNAL_MIN_WITNESSES {
+                    self.confirmed_external_port = Some(port);
+                }
+                while self.external_port_witnesses.len() > 32 {
+                    match self.external_port_witnesses.keys().next().copied() {
+                        Some(k) => {
+                            self.external_port_witnesses.remove(&k);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// The externally-visible IP confirmed by >=3 distinct DHT nodes (BEP-42); IPv4 in the first 4 bytes.
+    pub fn confirmed_external_ip(&self) -> Option<[u8; 16]> {
+        self.confirmed_external
+    }
+
+    /// The externally-visible UDP port confirmed by >=3 distinct DHT nodes (BEP-42 ip:port forms).
+    pub fn confirmed_external_port(&self) -> Option<u16> {
+        self.confirmed_external_port
+    }
+}
+
+/// Normalize a witness endpoint to a 16-byte key (IPv4 in the leading 4).
+fn addr_key(a: NetAddr) -> [u8; 16] {
+    match a {
+        NetAddr::V4(ip, _) => {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&ip);
+            b
+        }
+        NetAddr::V6(ip, _) => ip,
+    }
 }
 
 fn tx_of(t: &[u8]) -> u32 {
@@ -1325,6 +1517,79 @@ fn tx_of(t: &[u8]) -> u32 {
         2 => u32::from_be_bytes([0, 0, t[0], t[1]]),
         1 => t[0] as u32,
         _ => 0,
+    }
+}
+
+/// Compact-encode the sender address for a BEP-42 `ip` response field.
+/// Only routable endpoints are reported — reflecting a private/loopback
+/// source would teach the caller a useless (or harmful) address.
+fn observed_compact(from: &NetAddr) -> Option<Vec<u8>> {
+    match *from {
+        NetAddr::V4(ip, _) => {
+            if !is_routable(&{
+                let mut b = [0u8; 16];
+                b[..4].copy_from_slice(&ip);
+                b
+            }) {
+                return None;
+            }
+            Some(ip.to_vec())
+        }
+        NetAddr::V6(ip, _) => {
+            if !is_routable(&ip) {
+                return None;
+            }
+            Some(ip.to_vec())
+        }
+    }
+}
+
+/// Whether a 16-byte address is publicly routable (not private/loopback/
+/// link-local/ULA — per RFC 1918 / 4193 / 4291 and friends). Accepts three
+/// shapes: a true IPv6 address, an IPv4-mapped IPv6 (`::ffff:a.b.c.d`), and
+/// a plain IPv4 stored in the first 4 bytes with the rest zero (the form
+/// the BEP-42 4/6-byte `ip` values are expanded to internally).
+fn is_routable(ip: &[u8; 16]) -> bool {
+    // IPv4-mapped: bytes 0..10 zero, bytes 10..12 0xFF
+    let mapped = ip[0..10].iter().all(|&b| b == 0) && ip[10] == 0xFF && ip[11] == 0xFF;
+    if mapped {
+        return is_routable_v4([ip[12], ip[13], ip[14], ip[15]]);
+    }
+    // Plain IPv4 in the first 4 bytes (rest zero) — as produced when
+    // expanding a compact 4/6-byte BEP-42 value.
+    if ip[4..].iter().all(|&b| b == 0) {
+        return is_routable_v4([ip[0], ip[1], ip[2], ip[3]]);
+    }
+    // true IPv6: skip the unspecified address, loopback, ULA (fc00::/7),
+    // link-local (fe80::/10) and multicast.
+    if ip.iter().all(|&b| b == 0) {
+        return false; // ::
+    }
+    if ip[0..15].iter().all(|&b| b == 0) && ip[15] == 1 {
+        return false; // ::1
+    }
+    if ip[0] & 0xfe == 0xfc {
+        return false; // fc00::/7 ULA
+    }
+    if ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80 {
+        return false; // fe80::/10 link-local
+    }
+    if ip[0] == 0xff {
+        return false; // multicast
+    }
+    true
+}
+
+/// RFC 1918 / loopback / link-local classification for a plain IPv4.
+fn is_routable_v4(v4: [u8; 4]) -> bool {
+    match v4[0] {
+        0 => false,                                 // 0.0.0.0/8
+        10 => false,                                // 10/8
+        127 => false,                               // loopback
+        169 if v4[1] == 254 => false,               // link-local
+        172 if (16..=31).contains(&v4[1]) => false, // 172.16/12
+        192 if v4[1] == 168 => false,               // 192.168/16
+        _ => true,
     }
 }
 
@@ -1372,6 +1637,7 @@ mod tests {
                     values: vec![NetAddr::V4([1, 2, 3, 4], 6881)],
                     nodes: Vec::new(),
                 },
+                ip: Some(vec![203, 0, 113, 9]),
             },
         };
         let bytes = encode(&msg);
@@ -1379,10 +1645,12 @@ mod tests {
         match dec.body {
             KrpcBody::Response {
                 resp: Resp::GetPeers { token, values, .. },
+                ip,
                 ..
             } => {
                 assert_eq!(token, b"tok123");
                 assert_eq!(values, vec![NetAddr::V4([1, 2, 3, 4], 6881)]);
+                assert_eq!(ip, Some(vec![203, 0, 113, 9]));
             }
             _ => panic!("wrong body"),
         }
@@ -1651,5 +1919,193 @@ mod tests {
             bob.discovered_peers(&ih).contains(&seed_peer),
             "discovered peers must survive lookup pruning"
         );
+    }
+
+    #[test]
+    fn bep42_response_includes_observed_ip_only_for_routable() {
+        let mut rng = Rng::from_seed([31u8; 32]);
+        let mut node = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        // A routable source → the reply carries the observed `ip`.
+        let from = NetAddr::V4([203, 0, 113, 9], 40000);
+        let ping = KrpcMsg {
+            t: t2(1),
+            body: KrpcBody::Query {
+                q: "ping",
+                args: Args {
+                    id: NodeId::random(&mut rng),
+                    ..Default::default()
+                },
+            },
+        };
+        let reply = match node.handle_datagram(from, &encode(&ping), 1).unwrap() {
+            DatagramOutcome::Reply(b) => b,
+            _ => panic!("expected reply"),
+        };
+        match decode(&reply).unwrap().body {
+            KrpcBody::Response { ip, .. } => {
+                assert_eq!(
+                    ip,
+                    Some(vec![203, 0, 113, 9]),
+                    "BEP-42 ip must be the observed source"
+                );
+            }
+            _ => panic!("expected response"),
+        }
+        // A private source → no `ip` field (would teach a useless LAN addr).
+        let private = NetAddr::V4([192, 168, 1, 50], 40001);
+        let reply = match node.handle_datagram(private, &encode(&ping), 2).unwrap() {
+            DatagramOutcome::Reply(b) => b,
+            _ => panic!("expected reply"),
+        };
+        match decode(&reply).unwrap().body {
+            KrpcBody::Response { ip, .. } => {
+                assert_eq!(ip, None, "private source must not be echoed")
+            }
+            _ => panic!("expected response"),
+        }
+    }
+
+    #[test]
+    fn bep42_external_ip_requires_cross_confirmation() {
+        let mut rng = Rng::from_seed([37u8; 32]);
+        let mut node = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        let our_ip = [203, 0, 113, 9];
+        let ipv = vec![our_ip[0], our_ip[1], our_ip[2], our_ip[3]];
+
+        // A single node claiming our external IP is NOT enough.
+        node.observe_external(&ipv, NetAddr::V4([1, 2, 3, 4], 6881), 1);
+        assert_eq!(
+            node.confirmed_external_ip(),
+            None,
+            "one witness is not enough"
+        );
+
+        // Two nodes claiming the SAME IP are still not enough.
+        node.observe_external(&ipv, NetAddr::V4([1, 2, 3, 5], 6881), 2);
+        assert_eq!(
+            node.confirmed_external_ip(),
+            None,
+            "two witnesses are not enough"
+        );
+
+        // Three distinct nodes agreeing → confirmed.
+        node.observe_external(&ipv, NetAddr::V4([1, 2, 3, 6], 6881), 3);
+        let mut got = [0u8; 16];
+        got[..4].copy_from_slice(&our_ip);
+        assert_eq!(
+            node.confirmed_external_ip(),
+            Some(got),
+            "three witnesses confirm"
+        );
+
+        // A conflicting claim from a fourth node must NOT flip the result.
+        let evil = vec![8, 8, 8, 8];
+        node.observe_external(&evil, NetAddr::V4([9, 9, 9, 9], 6881), 4);
+        assert_eq!(
+            node.confirmed_external_ip(),
+            Some(got),
+            "minority claim must not override the confirmed address"
+        );
+    }
+
+    #[test]
+    fn is_routable_filters_private_addresses() {
+        // Proper IPv4-mapped form: ::ffff:a.b.c.d
+        let mapped_v4 = |a: [u8; 4]| -> [u8; 16] {
+            let mut b = [0u8; 16];
+            b[10] = 0xFF;
+            b[11] = 0xFF;
+            b[12..].copy_from_slice(&a);
+            b
+        };
+        assert!(is_routable(&mapped_v4([8, 8, 8, 8])));
+        assert!(is_routable(&mapped_v4([203, 0, 113, 9])));
+        assert!(!is_routable(&mapped_v4([10, 1, 2, 3])));
+        assert!(!is_routable(&mapped_v4([192, 168, 1, 1])));
+        assert!(!is_routable(&mapped_v4([172, 16, 0, 1])));
+        assert!(!is_routable(&mapped_v4([127, 0, 0, 1])));
+        assert!(!is_routable(&mapped_v4([169, 254, 1, 1])));
+        // Plain IPv4 stored in the first 4 bytes (rest zero) — the form the
+        // compact 4-byte BEP-42 value expands to internally.
+        let plain_v4 = |a: [u8; 4]| -> [u8; 16] {
+            let mut b = [0u8; 16];
+            b[0..4].copy_from_slice(&a);
+            b
+        };
+        assert!(is_routable(&plain_v4([8, 8, 8, 8])));
+        assert!(!is_routable(&plain_v4([192, 168, 1, 1])));
+        assert!(!is_routable(&plain_v4([10, 9, 9, 9])));
+        // pure IPv6 cases
+        assert!(is_routable(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+        ]));
+        assert!(!is_routable(&[
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+        ]));
+        assert!(!is_routable(&[
+            0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+        ]));
+        assert!(!is_routable(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+        ]));
+    }
+
+    #[test]
+    fn bootstrap_inserts_seed_immediately() {
+        let mut rng = Rng::from_seed([41u8; 32]);
+        let mut dht = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        let seed = NetAddr::V4([1, 2, 3, 4], 6881);
+        // A resolved domain node enters the routing table BEFORE any reply.
+        dht.bootstrap(&[seed], 0);
+        assert_eq!(
+            dht.table().size(),
+            1,
+            "resolved bootstrap node must be in the table right away"
+        );
+        // And a ping is on the wire for it.
+        assert_eq!(dht.outgoing().len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_placeholder_replaced_by_real_id() {
+        let mut rng = Rng::from_seed([43u8; 32]);
+        let mut alice = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        let mut bob = Dht::new(NodeId::random(&mut rng), 6882, &mut rng);
+        let bob_addr = NetAddr::V4([127, 0, 0, 1], 6882);
+        // alice bootstraps: bob enters her table with a ZERO placeholder id.
+        alice.bootstrap(&[bob_addr], 0);
+        assert_eq!(alice.table().size(), 1);
+        // bob answers the ping with his real id.
+        for (addr, payload) in alice.outgoing() {
+            if let Ok(DatagramOutcome::Reply(reply)) = bob.handle_datagram(addr, &payload, 0) {
+                alice
+                    .handle_datagram(NetAddr::V4([127, 0, 0, 1], 6882), &reply, 0)
+                    .unwrap();
+            }
+        }
+        // Real id in, placeholder gone: exactly one entry with bob's id.
+        assert_eq!(alice.table().size(), 1, "no duplicate after real id");
+        assert!(alice.table().contains(&bob.id));
+    }
+
+    #[test]
+    fn external_port_requires_cross_confirmation() {
+        let mut rng = Rng::from_seed([47u8; 32]);
+        let mut node = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        // 6-byte ip:port form — one witness is not enough.
+        let mut ip_port = vec![203, 0, 113, 9, 0x1b, 0x39]; // :6969
+        node.observe_external(&ip_port, NetAddr::V4([1, 2, 3, 4], 6881), 1);
+        assert_eq!(node.confirmed_external_port(), None, "one witness");
+        // Two distinct witnesses agreeing.
+        node.observe_external(&ip_port, NetAddr::V4([1, 2, 3, 5], 6881), 2);
+        assert_eq!(node.confirmed_external_port(), None, "two witnesses");
+        // Three distinct witnesses → confirmed.
+        node.observe_external(&ip_port, NetAddr::V4([1, 2, 3, 6], 6881), 3);
+        assert_eq!(node.confirmed_external_port(), Some(6969));
+        // A minority claim for a different port must not flip the result.
+        ip_port[4] = 0x1c;
+        ip_port[5] = 0x20;
+        node.observe_external(&ip_port, NetAddr::V4([9, 9, 9, 9], 6881), 4);
+        assert_eq!(node.confirmed_external_port(), Some(6969));
     }
 }

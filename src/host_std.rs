@@ -104,8 +104,6 @@ impl Host for StdHost {
                 }
             }
         }
-        // Fallback (not CSPRNG-grade): derived from the clock. Embedders
-        // that need real entropy should override this method.
         let t = self.now_ms();
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (t >> (i % 64)) as u8 ^ (i as u8).wrapping_mul(31);
@@ -141,7 +139,6 @@ impl Host for StdHost {
         use courierust::courierust_http::header::{HeaderName, HeaderValue};
         use courierust::courierust_http::method::Method;
         use courierust::courierust_http::request::Request;
-        // Web seeds (BEP-19): fetch one byte window via Range.
         let mut req = Request::<Body>::new(Method::GET, "/");
         let value = format!("bytes={}-{}", range_start, range_end);
         req.headers.insert(
@@ -149,15 +146,11 @@ impl Host for StdHost {
             HeaderValue::from_bytes(value.as_bytes()).map_err(|_| crate::Error::InvalidInput)?,
         );
         let resp = self.http.execute(url, req).map_err(|_| crate::Error::Io)?;
-        // 206 Partial Content for a fulfilled range; 200 if the server
-        // ignored the Range header (we still require the exact window).
         let status = resp.status.as_u16();
         if status != 200 && status != 206 {
             return Err(crate::Error::Tracker);
         }
         let body = resp.body.collect().map_err(|_| crate::Error::Io)?;
-        // A web seed MUST honor the range (BEP-19). A body that does not
-        // match the requested window would corrupt the piece — refuse it.
         if body.len() as u64 != range_end.saturating_sub(range_start) + 1 {
             return Err(crate::Error::Protocol);
         }
@@ -166,32 +159,37 @@ impl Host for StdHost {
     }
 
     fn resolve_host(&self, host: &str, port: u16) -> Option<NetAddr> {
-        // DHT bootstrap: the well-known routers are hostnames, resolve them
-        // through the OS resolver. Returns the first answer (v4 preferred
-        // by the resolver ordering).
         let mut addrs = (host, port).to_socket_addrs().ok()?;
         let a = addrs.next()?;
         Some(from_socket_addr(a))
     }
 
+    fn resolve_host_all(&self, host: &str, port: u16) -> alloc::vec::Vec<NetAddr> {
+        let mut out = alloc::vec::Vec::new();
+        if let Ok(addrs) = (host, port).to_socket_addrs() {
+            let mut seen = alloc::collections::BTreeSet::new();
+            for a in addrs {
+                let na = from_socket_addr(a);
+                // dedupe (getaddrinfo may repeat the same address) — use a
+                // uniform 16-byte key so IPv4 and IPv6 compare cleanly.
+                let key: (u8, [u8; 16], u16) = match na {
+                    NetAddr::V4(ip, p) => {
+                        let mut b = [0u8; 16];
+                        b[..4].copy_from_slice(&ip);
+                        (0, b, p)
+                    }
+                    NetAddr::V6(ip, p) => (1, ip, p),
+                };
+                if seen.insert(key) {
+                    out.push(na);
+                }
+            }
+        }
+        out
+    }
+
     fn tcp_connect(&mut self, addr: &NetAddr) -> crate::Result<ConnId> {
         let sa = to_socket_addr(addr);
-        // Build a raw socket in non-blocking mode and start the connect.
-        // socket2 is used because `TcpStream::connect_nonblocking` is still
-        // an unstable API.
-        //
-        // The connect's OUTCOME is deliberately NOT adjudicated here: a
-        // pending non-blocking connect reports `EINPROGRESS` on Unix — an
-        // errno Rust's `io::ErrorKind` does **not** map to `WouldBlock`
-        // (socket2 itself has to match `raw_os_error() == EINPROGRESS`
-        // separately in `connect_timeout`) — while Windows reports
-        // `WSAEWOULDBLOCK`. Immediate failures (`ECONNREFUSED`…) leave the
-        // socket in an error state. Both cases are resolved authoritatively
-        // and portably by `tcp_connect_done`'s write probe, which the
-        // engine polls; classifying the errno here would need libc
-        // constants and is the kind of platform divergence that breaks one
-        // OS while passing another. So we start the connect, keep the
-        // socket either way, and let the probe be the judge.
         let domain = if sa.is_ipv4() {
             socket2::Domain::IPV4
         } else {
@@ -211,21 +209,9 @@ impl Host for StdHost {
 
     fn tcp_connect_done(&mut self, id: ConnId) -> crate::Result<()> {
         let stream = self.tcp.get_mut(&id).ok_or(Error::NotFound)?;
-        // A finished non-blocking connect either establishes the socket or
-        // latches the failure into `SO_ERROR` — Winsock and Unix both do,
-        // so `take_error` is the authoritative "did it fail" check. It must
-        // run FIRST: a zero-length write alone is ambiguous on Windows
-        // (a socket whose connect was refused can report `Ok(0)`), and
-        // `ErrorKind::NotConnected` is a *failed* connect there, not one
-        // still in flight.
         if let Some(_e) = stream.take_error().map_err(|_| Error::Io)? {
             return Err(Error::Io);
         }
-        // No error latched: the connect is either still in flight or done.
-        // The zero-length write is then a portable "writable?" probe —
-        // `Ok` = established (the socket accepted the write), `WouldBlock`
-        // = the SYN is still outstanding (EAGAIN / WSAEWOULDBLOCK both map
-        // to `WouldBlock`).
         match stream.write(&[]) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(Error::WouldBlock),
@@ -245,8 +231,6 @@ impl Host for StdHost {
     fn tcp_recv(&mut self, id: ConnId, buf: &mut [u8]) -> crate::Result<usize> {
         let stream = self.tcp.get_mut(&id).ok_or(Error::NotFound)?;
         match stream.read(buf) {
-            // `Ok(0)` is EOF: the peer closed. The engine treats it as
-            // "close this connection", so a closed seed releases its slot.
             Ok(0) => Ok(0),
             Ok(n) => Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(Error::WouldBlock),
@@ -277,14 +261,36 @@ impl Host for StdHost {
         Ok(())
     }
 
+    fn udp_multicast_send(&mut self, addr: &NetAddr, data: &[u8]) -> crate::Result<()> {
+        let sock = self.udp.as_ref().ok_or(Error::NotFound)?;
+        if matches!(*addr, NetAddr::V4(..)) {
+            let _ = sock.set_multicast_ttl_v4(16);
+            let _ = sock.set_multicast_loop_v4(true);
+        }
+        let sa = to_socket_addr(addr);
+        sock.send_to(data, sa).map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
+    fn udp_join_multicast(&mut self, addr: NetAddr) -> crate::Result<()> {
+        let sock = self.udp.as_ref().ok_or(Error::NotFound)?;
+        match addr {
+            NetAddr::V4(ip, _) => {
+                let group = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                sock.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+                    .map_err(|_| Error::Io)
+            }
+            NetAddr::V6(ip, _) => {
+                let group = Ipv6Addr::from(ip);
+                sock.join_multicast_v6(&group, 0).map_err(|_| Error::Io)
+            }
+        }
+    }
+
     fn udp_recv(&mut self, buf: &mut [u8]) -> crate::Result<(NetAddr, usize)> {
         let sock = self.udp.as_ref().ok_or(Error::NotFound)?;
         match sock.recv_from(buf) {
             Ok((n, sa)) => Ok((from_socket_addr(sa), n)),
-            // Windows: an unconnected UDP socket surfaces ICMP errors as
-            // `ConnectionReset` on the next recv — that is transient, not a
-            // failure (see the Windows UDP notes). `Interrupted` is likewise
-            // retryable. Everything else is a real error.
             Err(e)
                 if matches!(
                     e.kind(),
@@ -304,8 +310,6 @@ impl Host for StdHost {
             .create(true)
             .read(true)
             .write(true)
-            // Never truncate: pieces are written at explicit offsets and a
-            // partially-downloaded file must survive for resume.
             .truncate(false)
             .open(path)
             .map_err(|_| Error::Io)?;
@@ -341,8 +345,6 @@ impl Host for StdHost {
     }
 
     fn disk_close(&mut self, id: DiskId) {
-        // Dropping the file flushes/closes it; `disk_flush` is still called
-        // explicitly by the engine before close.
         self.disk.remove(&id);
     }
 }
@@ -368,9 +370,7 @@ mod tests {
         let id = host
             .tcp_connect(&NetAddr::V4(ip, addr.port()))
             .expect("connect");
-        // Accept on the listener side.
         let (mut server, _) = listener.accept().expect("accept");
-        // Poll the connect to completion (bounded, non-blocking).
         let mut done = false;
         for _ in 0..100 {
             if host.tcp_connect_done(id).is_ok() {
@@ -380,7 +380,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(done, "connect never completed");
-        // Roundtrip a message.
         host.tcp_send(id, b"ping").expect("send");
         let mut got = [0u8; 4];
         server.read_exact(&mut got).expect("server read");
@@ -398,7 +397,6 @@ mod tests {
         };
         assert_eq!(n, 4);
         assert_eq!(&buf, b"pong");
-        // EOF: peer closes → recv reports Ok(0).
         drop(server);
         let mut scratch = [0u8; 64];
         let eof = loop {
@@ -417,13 +415,6 @@ mod tests {
 
     #[test]
     fn connect_to_refused_port_is_reported_by_probe() {
-        // Bind a listener to grab an ephemeral port, then drop it so the
-        // port is closed. A connect to it fails (ECONNREFUSED / WSAECONN-
-        // REFUSED). Per the two-phase contract `tcp_connect` only *starts*
-        // the connect and must not fail on an in-progress/refused errno
-        // (EINPROGRESS on Unix is not `ErrorKind::WouldBlock`); the failure
-        // is surfaced by the `tcp_connect_done` probe, which the engine
-        // polls. This locks in the deferred-adjudication behavior.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
         drop(listener); // port is now closed

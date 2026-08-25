@@ -5,6 +5,29 @@
 //! Entries are plain single-line URLs. Duplicates across the list are
 //! harmless (deduplication happens at load time in `seed_trackers`).
 
+/// A small curated set of reliable public trackers merged into EVERY
+/// torrent (qBittorrent's "add trackers to new torrents" behaviour), so a
+/// torrent whose own announce URLs are dead or GFW-blocked still finds
+/// peers. Kept deliberately short: each HTTP entry can block the announce
+/// loop for up to its timeout, so only well-known, long-lived endpoints
+/// belong here. Deduplicated against the torrent's own list at load time.
+pub const FALLBACK_TRACKERS: &[&str] = &[
+    "http://tracker.opentrackr.org:1337/announce",
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "http://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "http://bt1.archive.org:6969/announce",
+    "http://bt2.archive.org:6969/announce",
+    "udp://tracker.leechers-paradise.org:6969/announce",
+    "http://tracker.gbitt.info:80/announce",
+    "udp://tracker.gbitt.info:80/announce",
+];
+
 /// Built-in public tracker URLs used when a torrent declares no announce
 /// URLs (qBittorrent/BitComet compatible). UDP/WebSocket entries are
 /// filtered out automatically in proxy mode (outbound-only).

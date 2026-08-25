@@ -30,23 +30,51 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
-/// A write-back cache keyed by (disk handle, absolute offset).
+/// A write-back cache keyed by (disk handle, absolute offset), plus a
+/// small bounded **read-through LRU** for seeding/upload reads.
+///
+/// Read amplification problem being solved: the write-back cache only
+/// serves reads while a block is still *dirty* (buffered before flush).
+/// As soon as a piece is flushed to disk it leaves the dirty map, so every
+/// subsequent upload read for that block hits the disk again — and with
+/// many peers requesting overlapping blocks the disk is read far faster
+/// than the upload can drain, i.e. disk read speed ≫ upload speed. The
+/// clean LRU keeps recently-read/flushed blocks resident so repeated
+/// upload reads are served from RAM.
 #[derive(Debug)]
 pub struct DiskCache {
     budget: u64,
     used: u64,
     dirty: BTreeMap<(DiskId, u64), Vec<u8>>,
+    /// Clean read-through LRU: (disk, offset) → (bytes, last access).
+    /// Bounded by [`Self::CLEAN_BUDGET`]; entries are promoted from dirty on
+    /// flush and populated on disk reads.
+    clean: BTreeMap<(DiskId, u64), (Vec<u8>, u64)>,
+    clean_used: u64,
+    /// Monotonic LRU clock (tick counter, not wall time).
+    lru_clock: u64,
     /// Stats.
     pub stats: CacheStats,
 }
 
 impl DiskCache {
+    /// Cap on the clean read cache (1 MiB, kept deliberately modest — it
+    /// exists to absorb upload read amplification, not to hold the whole
+    /// piece set).
+    const CLEAN_BUDGET: u64 = 1 << 20;
+    /// Cap on clean entries (bounds eviction scans under pathological
+    /// block-splitting).
+    const CLEAN_MAX_ENTRIES: usize = 4096;
+
     /// Create with a byte budget.
     pub fn new(budget: u64) -> Self {
         DiskCache {
             budget: budget.max(1 << 20),
             used: 0,
             dirty: BTreeMap::new(),
+            clean: BTreeMap::new(),
+            clean_used: 0,
+            lru_clock: 0,
             stats: CacheStats::default(),
         }
     }
@@ -170,33 +198,116 @@ impl DiskCache {
         let mut pos = offset;
         while got < buf.len() {
             let len = (buf.len() - got) as u64;
-            // dirty page covering `pos`?
-            let hit = self
+            // 1) dirty page covering `pos` (write-back hit — no clone needed)
+            let dirty_hit = self
                 .dirty
                 .range(..=(disk, pos))
                 .next_back()
-                .filter(|((d, o), v)| *d == disk && *o <= pos && pos < *o + v.len() as u64)
-                .map(|((_, o), v)| (o, v.clone()));
-            if let Some((page_off, page)) = hit {
+                .filter(|((d, o), v)| *d == disk && *o <= pos && pos < *o + v.len() as u64);
+            if let Some(((_, page_off), page)) = dirty_hit {
                 let in_page = (pos - page_off) as usize;
                 let take = core::cmp::min(len as usize, page.len() - in_page);
                 buf[got..got + take].copy_from_slice(&page[in_page..in_page + take]);
                 got += take;
                 pos += take as u64;
                 self.stats.read_hits += take as u64;
-            } else {
-                // read from disk
-                let n = host.disk_read(disk, pos, &mut buf[got..])?;
-                if n == 0 {
-                    break;
-                }
-                got += n;
-                pos += n as u64;
-                self.stats.read_ops += 1;
-                self.stats.read_bytes += n as u64;
+                continue;
             }
+            // 2) clean read cache (upload read amplification)
+            let clean_hit = self
+                .clean
+                .range(..=(disk, pos))
+                .next_back()
+                .filter(|((d, o), (v, _))| *d == disk && *o <= pos && pos < *o + v.len() as u64);
+            if let Some(((_, page_off), (page, _))) = clean_hit {
+                let in_page = (pos - page_off) as usize;
+                let take = core::cmp::min(len as usize, page.len() - in_page);
+                buf[got..got + take].copy_from_slice(&page[in_page..in_page + take]);
+                got += take;
+                pos += take as u64;
+                self.stats.read_hits += take as u64;
+                // touch LRU (bounded: only when we consumed the tail so the
+                // same page gets reused — cheap and keeps hot blocks hot)
+                if pos >= page_off + page.len() as u64 {
+                    self.lru_clock = self.lru_clock.wrapping_add(1);
+                    if let Some((_, last)) = self.clean.get_mut(&(disk, *page_off)) {
+                        *last = self.lru_clock;
+                    }
+                }
+                continue;
+            }
+            // 3) read from disk (and populate the clean cache)
+            let n = host.disk_read(disk, pos, &mut buf[got..])?;
+            if n == 0 {
+                break;
+            }
+            self.stats.read_ops += 1;
+            self.stats.read_bytes += n as u64;
+            self.promote_clean(disk, pos, &buf[got..got + n]);
+            got += n;
+            pos += n as u64;
         }
         Ok(got)
+    }
+
+    /// Insert a clean page into the read cache, evicting LRU victims when
+    /// over budget. Callers pass data that was just read from (or written
+    /// to) disk so repeated upload reads stay in RAM.
+    fn promote_clean(&mut self, disk: DiskId, offset: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.lru_clock = self.lru_clock.wrapping_add(1);
+        // coalesce with an adjacent predecessor and/or successor so the LRU
+        // holds coarse runs (fewer entries, cheaper eviction scans)
+        let mut base = offset;
+        let mut merged: Vec<u8> = data.to_vec();
+        let at_capacity = self.clean.len() >= Self::CLEAN_MAX_ENTRIES;
+        if !at_capacity {
+            if let Some((&k, _)) = self
+                .clean
+                .range(..(disk, offset))
+                .next_back()
+                .filter(|((d, o), (v, _))| *d == disk && *o + v.len() as u64 == offset)
+            {
+                let v = self.clean.remove(&k).map(|(v, _)| v).unwrap();
+                self.clean_used -= v.len() as u64;
+                base = k.1;
+                let mut pred = v;
+                pred.extend_from_slice(&merged);
+                merged = pred;
+            }
+            if let Some((&k, _)) = self
+                .clean
+                .range((disk, base + merged.len() as u64)..=(disk, u64::MAX))
+                .next()
+                .filter(|((d, o), _)| *d == disk && *o == base + merged.len() as u64)
+            {
+                let v = self.clean.remove(&k).map(|(v, _)| v).unwrap();
+                self.clean_used -= v.len() as u64;
+                merged.extend_from_slice(&v);
+            }
+        }
+        // evict LRU victims until under budget
+        while self.clean_used + merged.len() as u64 > Self::CLEAN_BUDGET && !self.clean.is_empty() {
+            let victim = self
+                .clean
+                .iter()
+                .min_by_key(|(_, (_, last))| *last)
+                .map(|(k, _)| *k);
+            match victim {
+                Some(k) => {
+                    if let Some((v, _)) = self.clean.remove(&k) {
+                        self.clean_used -= v.len() as u64;
+                    }
+                }
+                None => break,
+            }
+        }
+        if self.clean.len() < Self::CLEAN_MAX_ENTRIES {
+            self.clean_used += merged.len() as u64;
+            self.clean.insert((disk, base), (merged, self.lru_clock));
+        }
     }
 
     /// Flush everything (sorted, coalesced).
@@ -219,6 +330,8 @@ impl DiskCache {
             host.disk_write(k.0, k.1, &data)?;
             self.stats.write_ops += 1;
             self.stats.write_bytes += data.len() as u64;
+            // keep the just-written block resident for upload reads
+            self.promote_clean(k.0, k.1, &data);
         }
         Ok(())
     }
@@ -250,6 +363,9 @@ impl DiskCache {
         }
         for (d, o, data) in batch {
             host.disk_write(d, o, &data)?;
+            // promote to the clean LRU so seeding/upload reads of these
+            // just-written blocks don't go back to the disk
+            self.promote_clean(d, o, &data);
             self.stats.write_ops += 1;
             self.stats.write_bytes += data.len() as u64;
         }
