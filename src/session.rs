@@ -1453,8 +1453,7 @@ impl TorrentSession {
                     None => continue,
                 };
                 p.metadata_served
-                    && now.saturating_sub(p.metadata_served_at)
-                        >= METADATA_SERVED_IDLE_TIMEOUT_MS
+                    && now.saturating_sub(p.metadata_served_at) >= METADATA_SERVED_IDLE_TIMEOUT_MS
                     && p.last_real_at <= p.metadata_served_at
             };
             if drop {
@@ -2389,8 +2388,7 @@ impl TorrentSession {
                                 continue;
                             }
                             self.trackers[idx].failure = Some(String::from("http error"));
-                            self.trackers[idx].fails =
-                                self.trackers[idx].fails.saturating_add(1);
+                            self.trackers[idx].fails = self.trackers[idx].fails.saturating_add(1);
                         }
                     }
                 }
@@ -4505,7 +4503,10 @@ mod tests {
                 s.on_range_job_done(id, res, &mut ctx);
             }
         }
-        assert_eq!(s.webseed.job_id, 0, "job released so the next block is fetched");
+        assert_eq!(
+            s.webseed.job_id, 0,
+            "job released so the next block is fetched"
+        );
         assert_eq!(s.webseed.next_block, 1, "block advanced");
         assert!(
             s.webseed.data[..blen].iter().all(|&b| b == 0x42),

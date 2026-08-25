@@ -359,8 +359,10 @@ impl<H: Host> Engine<H> {
             self.dht_no_seed_emitted = false;
         } else if !self.dht_no_seed_emitted {
             self.dht_no_seed_emitted = true;
-            self.host
-                .log(LogLevel::Warn, "DHT bootstrap: no router hostname resolvable");
+            self.host.log(
+                LogLevel::Warn,
+                "DHT bootstrap: no router hostname resolvable",
+            );
             self.events.push(EngineEvent::Error {
                 code: 1,
                 detail: "dht_no_seeds",

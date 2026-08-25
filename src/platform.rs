@@ -268,9 +268,7 @@ pub trait Host {
     /// Drain completed async HTTP jobs as `(job id, result)` — the body on
     /// success, the error kind on failure/timeout. Jobs not returned here
     /// are still pending on the worker.
-    fn http_take_done(
-        &mut self,
-    ) -> alloc::vec::Vec<(u64, Result<alloc::vec::Vec<u8>>)> {
+    fn http_take_done(&mut self) -> alloc::vec::Vec<(u64, Result<alloc::vec::Vec<u8>>)> {
         alloc::vec::Vec::new()
     }
 

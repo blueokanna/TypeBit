@@ -1467,10 +1467,7 @@ impl Dht {
         if let Some(port) = port {
             if port != 0 {
                 let entry = self.external_port_witnesses.entry(port).or_default();
-                if !entry
-                    .iter()
-                    .any(|(w, _)| addr_key(*w) == addr_key(witness))
-                {
+                if !entry.iter().any(|(w, _)| addr_key(*w) == addr_key(witness)) {
                     entry.push((witness, now));
                 }
                 entry.retain(|(_, t)| now.saturating_sub(*t) < Self::EXTERNAL_WITNESS_TTL_MS);
