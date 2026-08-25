@@ -1,10 +1,10 @@
 [package]
 name = "typebit"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license-file = "LICENSE"
 authors = ["blueokanna, HyphenTeam"]
-description = "TypeBit: a no_std universal download engine for torrent (v1/v2, DHT, PEX, web seeds), eD2k/eMule, Xunlei, FlashGet, QQDL, IPFS, Kad and direct HTTP(S)/FTP, with provable-download receipts and a semantic utility scheduler."
+description = "TypeBit: A universal download engine for torrent (v1/v2, DHT, PEX, web seeds), eD2k/eMule, Xunlei, FlashGet, QQDL, IPFS, Kad and direct HTTP(S)/FTP, with provable-download receipts and a semantic utility scheduler."
 homepage = "https://github.com/blueokanna/TypeBit"
 repository = "https://github.com/blueokanna/TypeBit"
 readme = "README.md"
