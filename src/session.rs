@@ -1519,7 +1519,6 @@ impl TorrentSession {
         ctx: &'_ mut SessionCtx<'_, H>,
     ) -> Result<()> {
         if id == 0 {
-            // extended handshake
             let ext = ExtHandshake::parse(&payload)?;
             if let Some(peer) = self.peers.get_mut(&conn) {
                 peer.ext = Some(ext.clone());
@@ -1531,7 +1530,6 @@ impl TorrentSession {
                     peer.msgs.set_max_frame(cap);
                 }
             }
-            // if we need metadata, start requesting
             if self.torrent.is_none() {
                 if let Some(peer) = self.peers.get(&conn) {
                     if let Some(meta_id) = peer.ext_metadata {
@@ -1654,7 +1652,6 @@ impl TorrentSession {
         if !complete {
             return;
         }
-        // assemble info dict
         let mut raw = Vec::new();
         let np = {
             let m = self.metadata.as_ref().unwrap();
@@ -1665,7 +1662,6 @@ impl TorrentSession {
                 raw.extend_from_slice(d);
             }
         }
-        // verify infohash matches
         let hash_ok = if self.info_hash.is_v1() {
             crate::crypto::Sha1::digest(&raw) == self.info_hash.full()[..20]
         } else {
@@ -1786,8 +1782,6 @@ impl TorrentSession {
         let params = AnnounceParams {
             tracker_hash: self.tracker_hash,
             peer_id: ctx.peer_id,
-            // In proxy mode we accept no inbound connections; announce port
-            // 0 so peers do not try to reach our (unreachable) listen port.
             port: if self.cfg.proxy.is_some() {
                 0
             } else {
@@ -1800,7 +1794,6 @@ impl TorrentSession {
             numwant: 200,
             key: 0x54594254, // "TYBT"
         };
-        // try trackers in round-robin, skipping ones on a failure penalty
         let mut attempt = 0;
         let total = self.trackers.len();
         while attempt < total {
@@ -1818,8 +1811,6 @@ impl TorrentSession {
                         &params,
                     );
                     let mut body = Vec::new();
-                    // Proxy mode: run the HTTP GET *through* the SOCKS proxy
-                    // (domain handed to the proxy, no cleartext DNS).
                     let got = match &self.cfg.proxy {
                         Some(p) => socks_mod::socks_http_get(ctx.host, p, &url, 15_000, &mut body),
                         None => ctx.host.http_get(&url, 15_000, &mut body),
@@ -1856,9 +1847,6 @@ impl TorrentSession {
                             }
                         },
                         Err(_) => {
-                            // Defensive: UDP trackers are dropped at load time in
-                            // proxy mode; if one slipped in via add_tracker, skip it
-                            // instead of leaking the real IP.
                             if self.cfg.proxy.is_some() {
                                 self.trackers[idx].fails =
                                     self.trackers[idx].fails.saturating_add(1);
@@ -2006,8 +1994,6 @@ impl TorrentSession {
         if self.bans.is_banned(&addr, now) {
             return;
         }
-        // anti-leech: cap concurrent peers per /24 (IPv4) /64 (IPv6) so a
-        // tracker/DHT flood of one address range cannot dominate the budget.
         if self.subnet_count(&addr) >= self.cfg.leech.max_peers_per_subnet {
             return;
         }
@@ -2025,7 +2011,6 @@ impl TorrentSession {
         if self.connect_queue.iter().any(|(a, _)| *a == addr) {
             return;
         }
-        // ignore loopback unless explicit
         self.connect_queue.push((addr, source));
         self.monitor.record_discovery(source);
         let _ = now;
