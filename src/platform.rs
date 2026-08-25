@@ -307,6 +307,22 @@ pub trait Host {
         }
     }
 
+    // ---------- async DNS (non-blocking DHT bootstrap) ----------
+
+    /// Enqueue an asynchronous hostname resolution; returns `true` when the
+    /// host accepts it (the result arrives via [`Self::take_resolved_hosts`]).
+    /// The default is `false`, so callers fall back to the blocking
+    /// [`Self::resolve_host`]. Used for DHT bootstrap seeds — the engine
+    /// must never block its thread on DNS.
+    fn resolve_host_async(&mut self, _host: &str, _port: u16) -> bool {
+        false
+    }
+
+    /// Drain completed async resolutions as `(host, port, addr)`.
+    fn take_resolved_hosts(&mut self) -> alloc::vec::Vec<(alloc::string::String, u16, NetAddr)> {
+        alloc::vec::Vec::new()
+    }
+
     // ---------- TCP peers ----------
 
     /// Begin a non-blocking connect to `addr`. Returns a handle immediately.

@@ -103,6 +103,10 @@ pub struct Engine<H: Host> {
     /// Resolved DHT bootstrap seed endpoints (cached — DNS is never repeated
     /// once it succeeds, so a slow resolver cannot stall the engine loop).
     dht_seeds: Vec<NetAddr>,
+    /// Hostnames still being resolved asynchronously (for DHT bootstrap).
+    dht_seed_pending: Vec<(String, u16)>,
+    /// Last time async DHT seed resolution was (re-)kicked (ms).
+    dht_resolve_kicked_at: u64,
     /// Whether the "no DHT router resolvable" notice was already emitted.
     dht_no_seed_emitted: bool,
     /// Connections still establishing (outbound).
@@ -170,10 +174,6 @@ impl<H: Host> Engine<H> {
         rng.fill(&mut lsd_cookie);
         let dht = if cfg.dht_enabled {
             let id = NodeId::random(&mut rng);
-            // DHT starts empty; the first tick bootstraps it from the BEP-5
-            // routers (see [`Self::ensure_dht_seeds`]). Resolving the router
-            // hostnames here would block the whole engine thread on DNS
-            // before the loop even starts.
             Some(Dht::new(id, cfg.listen_port, &mut rng))
         } else {
             None
@@ -227,6 +227,8 @@ impl<H: Host> Engine<H> {
             // 0 → the very first tick bootstraps the DHT (fast startup).
             last_bootstrap_at: 0,
             dht_seeds: Vec::new(),
+            dht_seed_pending: Vec::new(),
+            dht_resolve_kicked_at: 0,
             dht_no_seed_emitted: false,
             connecting: Vec::new(),
             inbound: BTreeMap::new(),
@@ -319,8 +321,6 @@ impl<H: Host> Engine<H> {
         };
         let s = self.sessions.get_mut(hash).ok_or(Error::NotFound)?;
         s.start(&mut ctx)?;
-        // LSD (BEP-14): announce this torrent to the LAN right away so
-        // local peers find it without waiting for the minute tick.
         if !self.cfg.proxy.is_some() && self.udp_open {
             let b = s.info_hash.as_bytes();
             if b.len() == 20 {
@@ -343,21 +343,59 @@ impl<H: Host> Engine<H> {
         Ok(())
     }
 
-    /// Resolve (once) and cache the DHT bootstrap seed endpoints, then ping
-    /// them. Never blocks the engine loop repeatedly: DNS runs at most once
-    /// per seed set, and the seeds stay cached in the routing table.
-    fn bootstrap_dht(&mut self, now: u64) {
-        let Some(dht) = self.dht.as_mut() else {
+    /// Collect resolved DHT bootstrap seeds without ever blocking the engine
+    /// on DNS. Async-capable hosts resolve on their own thread (results are
+    /// drained here every tick); hosts without the async seam fall back to
+    /// the blocking resolver, bounded to the bootstrapping path only.
+    fn collect_dht_seeds(&mut self, now: u64) {
+        let resolved = self.host.take_resolved_hosts();
+        for (host, port, addr) in resolved {
+            if !self.dht_seeds.contains(&addr) {
+                self.dht_seeds.push(addr);
+            }
+            self.dht_seed_pending
+                .retain(|(h, p)| *h != host || *p != port);
+        }
+        if !self.dht_seeds.is_empty() {
+            self.dht_no_seed_emitted = false;
             return;
-        };
-        self.last_bootstrap_at = now;
-        if self.dht_seeds.is_empty() {
+        }
+        if now.saturating_sub(self.dht_resolve_kicked_at) >= BOOTSTRAP_RETRY_MS {
+            self.dht_resolve_kicked_at = now;
+            let mut any_async = false;
             for (host, port) in crate::consts::DHT_BOOTSTRAP {
-                if let Some(a) = self.host.resolve_host(host, *port) {
-                    self.dht_seeds.push(a);
+                if self
+                    .dht_seed_pending
+                    .iter()
+                    .any(|(h, p)| h == *host && *p == *port)
+                {
+                    continue;
+                }
+                if self.host.resolve_host_async(host, *port) {
+                    any_async = true;
+                    self.dht_seed_pending.push((String::from(*host), *port));
+                }
+            }
+            if !any_async {
+                for (host, port) in crate::consts::DHT_BOOTSTRAP {
+                    if let Some(a) = self.host.resolve_host(host, *port) {
+                        if !self.dht_seeds.contains(&a) {
+                            self.dht_seeds.push(a);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Ensure the DHT has seeds to query, then ping them. Never blocks the
+    /// engine loop: DNS runs on the host's async resolver (or once, cached).
+    fn bootstrap_dht(&mut self, now: u64) {
+        self.last_bootstrap_at = now;
+        self.collect_dht_seeds(now);
+        let Some(dht) = self.dht.as_mut() else {
+            return;
+        };
         if !self.dht_seeds.is_empty() {
             dht.bootstrap(&self.dht_seeds, now);
             self.dht_no_seed_emitted = false;
@@ -817,6 +855,9 @@ impl<H: Host> Engine<H> {
                 dht.find_node(target, now);
             }
         }
+        // Drain async DHT-seed resolutions every tick (never blocks; the
+        // host's resolver thread does the DNS work).
+        self.collect_dht_seeds(now);
         // Retry bootstrap when the table is empty (cached seeds; DNS at most once).
         let needs_bootstrap = self
             .dht
@@ -1719,6 +1760,15 @@ impl<H: Host> Engine<H> {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Flush the disk cache so every verified piece actually reaches stable
+    /// storage. Call right before persisting resume state — the saved `have`
+    /// bitfield must only claim pieces whose bytes are really on disk,
+    /// otherwise a crash would "restore" pieces that are missing from the
+    /// `.part` files (silent corruption) instead of re-downloading them.
+    pub fn flush_cache(&mut self) {
+        let _ = self.cache.flush(&mut self.host);
     }
 
     /// Save session state for persistence (returns binary bytes).
