@@ -178,9 +178,20 @@ impl Host for StdHost {
         let sa = to_socket_addr(addr);
         // Build a raw socket in non-blocking mode and start the connect.
         // socket2 is used because `TcpStream::connect_nonblocking` is still
-        // an unstable API; `Socket::connect` on a non-blocking socket
-        // returns WouldBlock while the SYN is in flight, which is exactly
-        // the engine's `tcp_connect`/`tcp_connect_done` contract.
+        // an unstable API.
+        //
+        // The connect's OUTCOME is deliberately NOT adjudicated here: a
+        // pending non-blocking connect reports `EINPROGRESS` on Unix — an
+        // errno Rust's `io::ErrorKind` does **not** map to `WouldBlock`
+        // (socket2 itself has to match `raw_os_error() == EINPROGRESS`
+        // separately in `connect_timeout`) — while Windows reports
+        // `WSAEWOULDBLOCK`. Immediate failures (`ECONNREFUSED`…) leave the
+        // socket in an error state. Both cases are resolved authoritatively
+        // and portably by `tcp_connect_done`'s write probe, which the
+        // engine polls; classifying the errno here would need libc
+        // constants and is the kind of platform divergence that breaks one
+        // OS while passing another. So we start the connect, keep the
+        // socket either way, and let the probe be the judge.
         let domain = if sa.is_ipv4() {
             socket2::Domain::IPV4
         } else {
@@ -190,11 +201,7 @@ impl Host for StdHost {
             socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
                 .map_err(|_| Error::Io)?;
         socket.set_nonblocking(true).map_err(|_| Error::Io)?;
-        match socket.connect(&sa.into()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return Err(Error::Io),
-        }
+        let _ = socket.connect(&sa.into());
         let stream: TcpStream = socket.into();
         let id = self.next_tcp;
         self.next_tcp = self.next_tcp.wrapping_add(1);
@@ -204,13 +211,24 @@ impl Host for StdHost {
 
     fn tcp_connect_done(&mut self, id: ConnId) -> crate::Result<()> {
         let stream = self.tcp.get_mut(&id).ok_or(Error::NotFound)?;
-        // A zero-length write is the portable way to poll a non-blocking
-        // connect: `Ok(_)` = established, `WouldBlock`/`NotConnected` =
-        // still in progress, anything else = the connect failed.
+        // A finished non-blocking connect either establishes the socket or
+        // latches the failure into `SO_ERROR` — Winsock and Unix both do,
+        // so `take_error` is the authoritative "did it fail" check. It must
+        // run FIRST: a zero-length write alone is ambiguous on Windows
+        // (a socket whose connect was refused can report `Ok(0)`), and
+        // `ErrorKind::NotConnected` is a *failed* connect there, not one
+        // still in flight.
+        if let Some(_e) = stream.take_error().map_err(|_| Error::Io)? {
+            return Err(Error::Io);
+        }
+        // No error latched: the connect is either still in flight or done.
+        // The zero-length write is then a portable "writable?" probe —
+        // `Ok` = established (the socket accepted the write), `WouldBlock`
+        // = the SYN is still outstanding (EAGAIN / WSAEWOULDBLOCK both map
+        // to `WouldBlock`).
         match stream.write(&[]) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(Error::WouldBlock),
-            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Err(Error::WouldBlock),
             Err(_) => Err(Error::Io),
         }
     }
@@ -394,6 +412,51 @@ mod tests {
             }
         };
         assert!(eof, "expected EOF after peer close");
+        host.tcp_close(id);
+    }
+
+    #[test]
+    fn connect_to_refused_port_is_reported_by_probe() {
+        // Bind a listener to grab an ephemeral port, then drop it so the
+        // port is closed. A connect to it fails (ECONNREFUSED / WSAECONN-
+        // REFUSED). Per the two-phase contract `tcp_connect` only *starts*
+        // the connect and must not fail on an in-progress/refused errno
+        // (EINPROGRESS on Unix is not `ErrorKind::WouldBlock`); the failure
+        // is surfaced by the `tcp_connect_done` probe, which the engine
+        // polls. This locks in the deferred-adjudication behavior.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // port is now closed
+        let ip = match addr {
+            SocketAddr::V4(v4) => v4.ip().octets(),
+            SocketAddr::V6(v6) => {
+                let o = v6.ip().octets();
+                [o[12], o[13], o[14], o[15]] // mapped v4
+            }
+        };
+        let mut host = StdHost::new();
+        let id = host
+            .tcp_connect(&NetAddr::V4(ip, addr.port()))
+            .expect("tcp_connect must start even when the peer refuses");
+        // The probe must eventually report the refusal.
+        let mut failed = false;
+        for _ in 0..100 {
+            match host.tcp_connect_done(id) {
+                Ok(()) => {
+                    // Defensive: on loopback a refusal surfaces fast; if a
+                    // platform ever reported Ok first, keep polling.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(Error::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "connect probe never reported the refusal");
         host.tcp_close(id);
     }
 
