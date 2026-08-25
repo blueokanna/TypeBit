@@ -37,6 +37,9 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+      - name: Test (no_std code paths)
+        run: cargo test --no-default-features
   no_std:
     name: no_std (aarch64)
     runs-on: ubuntu-latest
@@ -79,3 +82,18 @@ jobs:
 
       - name: FFI integration (extern C calls the exported symbols)
         run: cargo run --example ffi_demo --features ffi
+
+  package:
+    name: crates.io package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify the crate packages cleanly
+        run: cargo package
+
+      - name: Confirm the packaged tarball contents
+        run: cargo package --list | head -n 200

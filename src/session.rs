@@ -1526,8 +1526,9 @@ impl TorrentSession {
                 peer.ext_metadata = ext.m.get("ut_metadata").copied();
                 peer.ext_pex = ext.m.get("ut_pex").copied();
                 if let Some(ms) = ext.metadata_size {
-                    peer.msgs
-                        .set_max_frame((ms as usize).max(peer.msgs.max_frame()));
+                    let legit_cap = crate::consts::MAX_METADATA_SIZE as usize;
+                    let cap = (ms as usize).min(legit_cap).max(peer.msgs.max_frame());
+                    peer.msgs.set_max_frame(cap);
                 }
             }
             // if we need metadata, start requesting
