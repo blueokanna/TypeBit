@@ -21,18 +21,24 @@ pub struct PickOptions {
 pub struct Picker;
 
 impl Picker {
-    /// Pick the best piece to request from `peer_have`.
+    /// Pick the best piece to request from a peer.
     ///
     /// `utilities` comes from the scheduler; `availability` is the per-piece
-    /// peer count (used for rare-first tie-breaking); `priorities` carries
-    /// per-piece multipliers from the file priorities (0 = skipped file —
-    /// such pieces are never picked). Pieces we already have or (unless
-    /// endgame) already have in flight are skipped.
+    /// peer count (used for rare-first tie-breaking); `peer_have` is the
+    /// peer's piece bitfield and `peer_has_all` whether it declared
+    /// `have_all` (fast extension, BEP-6) — a `have_all` seed owns every
+    /// piece while its bitfield stays empty, so the picker MUST NOT consult
+    /// `peer_have` for it or it would refuse to pick anything and stall the
+    /// download at 0% against seeds. `priorities` carries per-piece
+    /// multipliers from the file priorities (0 = skipped file — such pieces
+    /// are never picked). Pieces we already have or (unless endgame) already
+    /// have in flight are skipped.
     pub fn pick_piece(
         tracker: &PieceTracker,
         utilities: &[i64],
         availability: &[u32],
         peer_have: &Bitfield,
+        peer_has_all: bool,
         priorities: &[i64],
         opts: PickOptions,
     ) -> Option<u32> {
@@ -46,7 +52,7 @@ impl Picker {
             if !opts.endgame && tracker.is_in_flight(p) {
                 continue;
             }
-            if !peer_have.get(p) {
+            if !peer_has_all && !peer_have.get(p) {
                 continue;
             }
             let prio = priorities.get(p as usize).copied().unwrap_or(1);
@@ -120,8 +126,16 @@ mod tests {
         let util = [0i64, 0, 0, 100, 0, 90, 0, 0];
         let avail = [0u32; 8];
         let prio = [1i64; 8];
-        let p =
-            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
+        let p = Picker::pick_piece(
+            &t,
+            &util,
+            &avail,
+            &peer,
+            false,
+            &prio,
+            PickOptions::default(),
+        )
+        .unwrap();
         assert_eq!(p, 3);
     }
 
@@ -135,8 +149,16 @@ mod tests {
         let util = [0i64; 4];
         let avail = [0u32; 4];
         let prio = [1i64; 4];
-        let p =
-            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
+        let p = Picker::pick_piece(
+            &t,
+            &util,
+            &avail,
+            &peer,
+            false,
+            &prio,
+            PickOptions::default(),
+        )
+        .unwrap();
         assert_eq!(p, 1);
     }
 
@@ -149,14 +171,29 @@ mod tests {
         let avail = [0u32; 4];
         // piece 2 belongs to a skipped file
         let prio = [1i64, 1, 0, 1];
-        let p =
-            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
+        let p = Picker::pick_piece(
+            &t,
+            &util,
+            &avail,
+            &peer,
+            false,
+            &prio,
+            PickOptions::default(),
+        )
+        .unwrap();
         assert_ne!(p, 2);
-        // all skipped → nothing to pick
+        // all skipped → nothing to pick (even for a have_all seed)
         let prio = [0i64; 4];
-        assert!(
-            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).is_none()
-        );
+        assert!(Picker::pick_piece(
+            &t,
+            &util,
+            &avail,
+            &peer,
+            true,
+            &prio,
+            PickOptions::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -168,9 +205,51 @@ mod tests {
         let avail = [0u32; 4];
         // high-priority piece 1 beats equal-utility normal pieces
         let prio = [1i64, 4, 1, 1];
-        let p =
-            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
+        let p = Picker::pick_piece(
+            &t,
+            &util,
+            &avail,
+            &peer,
+            false,
+            &prio,
+            PickOptions::default(),
+        )
+        .unwrap();
         assert_eq!(p, 1);
+    }
+
+    #[test]
+    fn have_all_seed_is_pickable_with_empty_bitfield() {
+        // A fast-extension seed declares have_all but keeps its bitfield
+        // empty. The picker must treat it as owning every piece — otherwise
+        // no request is ever issued and the download stalls at 0%.
+        let t = PieceTracker::new(8, 16 * 1024);
+        let empty = Bitfield::new(8); // have_all: bitfield stays empty
+        let util = [0i64; 8];
+        let avail = [1u32; 8];
+        let prio = [1i64; 8];
+        let p = Picker::pick_piece(
+            &t,
+            &util,
+            &avail,
+            &empty,
+            true,
+            &prio,
+            PickOptions::default(),
+        )
+        .expect("have_all seed must be pickable");
+        assert!(p < 8);
+        // without the have_all flag the same empty bitfield is unpickable
+        assert!(Picker::pick_piece(
+            &t,
+            &util,
+            &avail,
+            &empty,
+            false,
+            &prio,
+            PickOptions::default()
+        )
+        .is_none());
     }
 
     #[test]

@@ -1456,14 +1456,12 @@ impl TorrentSession {
         if self.torrent.is_none() && peer.ext_metadata.is_none() && their.has_metadata() {
             // request will be triggered once we learn their ut_metadata id
         }
-        // interest
-        if self.torrent.is_some() {
-            let want = peer.should_be_interested(self.pieces.have_bitfield());
-            if want {
-                peer.am_interested = true;
-                peer.send(&Message::Interested);
-            }
-        }
+        // Interest is NOT decided here: their availability (bitfield /
+        // have_all / have_none) always follows the handshake, so we derive
+        // it from `sync_interest` as soon as `dispatch` processes those
+        // messages — and again on every `have`. That keeps a seed that
+        // unchokes only interested peers from deadlocking us (see
+        // `Peer::should_be_interested`).
         // record peer id in monitor (no-op), log via event
         self.monitor.record_rates(peer.addr, 0, 0, ctx.now);
         ctx.events.push(EngineEvent::PeerConnected {
@@ -1484,6 +1482,7 @@ impl TorrentSession {
         };
         peer.on_data_in(data.len(), ctx.now);
         // handshake stage
+        let mut just_handshook = false;
         if peer.phase == PeerPhase::Handshake {
             peer.handshake_buf.extend_from_slice(data);
             if peer.handshake_buf.len() >= crate::wire::HANDSHAKE_LEN {
@@ -1501,6 +1500,7 @@ impl TorrentSession {
                     self.drop_peer(conn, FailureCategory::Timeout, ctx);
                     return;
                 }
+                just_handshook = true;
             } else {
                 return;
             }
@@ -1510,9 +1510,16 @@ impl TorrentSession {
             Some(p) => p,
             None => return,
         };
-        // messages already fed above for the handshake leftover; if phase
-        // was already Ready, feed data directly
-        if peer.phase == PeerPhase::Ready && peer.handshake_buf.is_empty() {
+        // If this call consumed the handshake, its bytes (and only the
+        // bytes *after* it) were already routed above: the handshake went
+        // into `handshake_buf` and the leftover into `msgs`. Re-feeding
+        // `data` here would inject the raw handshake bytes into the message
+        // stream — its leading 4 bytes (`0x13 'B' 'i' 't'`) parse as a
+        // ~323 MB frame, so every peer would be dropped as a "protocol
+        // violator" the instant its handshake + first messages (bitfield,
+        // unchoke…) arrive in one TCP segment. Only feed `data` when the
+        // peer was already Ready before this call.
+        if !just_handshook && peer.phase == PeerPhase::Ready && peer.handshake_buf.is_empty() {
             peer.msgs.feed(data);
         }
         // drain messages
@@ -1687,6 +1694,7 @@ impl TorrentSession {
                 }
                 self.monitor.record_piece_cover(self.peer_addr(conn), piece);
                 self.recompute_availability();
+                self.sync_interest(conn);
             }
             Message::Bitfield(b) => {
                 let n = self.pieces.piece_count();
@@ -1703,6 +1711,7 @@ impl TorrentSession {
                     }
                 }
                 self.recompute_availability();
+                self.sync_interest(conn);
             }
             Message::HaveAll => {
                 if let Some(peer) = self.peers.get_mut(&conn) {
@@ -1713,6 +1722,7 @@ impl TorrentSession {
                     peer.is_seed = true;
                 }
                 self.recompute_availability();
+                self.sync_interest(conn);
             }
             Message::HaveNone => {
                 if let Some(peer) = self.peers.get_mut(&conn) {
@@ -1721,6 +1731,7 @@ impl TorrentSession {
                     }
                     peer.have_none = true;
                 }
+                self.sync_interest(conn);
             }
             Message::Request {
                 index,
@@ -1773,6 +1784,39 @@ impl TorrentSession {
             .get(&conn)
             .map(|p| p.addr)
             .unwrap_or(NetAddr::V4([0; 4], 0))
+    }
+
+    /// Recompute whether we are interested in `conn` and emit the
+    /// `Interested`/`NotInterested` transition when it changed. Interest
+    /// means "they have at least one piece we lack" and is independent of
+    /// choke state — see [`Peer::should_be_interested`]. Called whenever
+    /// their availability changes (bitfield / have_all / have_none / have).
+    fn sync_interest(&mut self, conn: ConnId) {
+        let our_have = self.pieces.have_bitfield().clone();
+        let want = {
+            let p = match self.peers.get(&conn) {
+                Some(p) => p,
+                None => return,
+            };
+            if p.phase != PeerPhase::Ready {
+                return;
+            }
+            p.should_be_interested(&our_have)
+        };
+        let p = match self.peers.get_mut(&conn) {
+            Some(p) => p,
+            None => return,
+        };
+        if want == p.am_interested {
+            return;
+        }
+        p.am_interested = want;
+        let m = if want {
+            Message::Interested
+        } else {
+            Message::NotInterested
+        };
+        p.send(&m);
     }
 
     // ---------- extended messages ----------
@@ -2129,8 +2173,27 @@ impl TorrentSession {
                 }
                 TrackerKind::Udp => {
                     let st = &mut self.trackers[idx];
+                    // UDP is lossy: if a request has gone unanswered for one
+                    // announce interval, restart the handshake instead of
+                    // waiting on a packet that will never come (otherwise a
+                    // single lost connect request would stall this tracker
+                    // forever). Three consecutive timeouts park it like any
+                    // other failing tracker.
+                    if st.udp.phase != UdpPhase::Idle
+                        && ctx.now.saturating_sub(st.udp.sent_at) >= 15_000
+                    {
+                        st.udp.phase = UdpPhase::Idle;
+                        st.fails = st.fails.saturating_add(1);
+                    }
                     if st.udp.phase == UdpPhase::Idle {
-                        let addr = parse_udp_tracker_addr(&st.url);
+                        // Resolve once and cache (hostname trackers are the
+                        // norm); the timeout reset above reuses `addr`.
+                        let addr = match st.udp.addr {
+                            Some(a) => Some(a),
+                            None => parse_udp_tracker_addr(&st.url, &mut |h, p| {
+                                ctx.host.resolve_host(h, p)
+                            }),
+                        };
                         if let Some(a) = addr {
                             st.udp.addr = Some(a);
                             st.udp.tid = rand_u32(ctx.now);
@@ -2235,6 +2298,8 @@ impl TorrentSession {
                             st.interval = interval;
                             st.next_announce = ctx.now + interval * 1000;
                             st.udp.phase = UdpPhase::Idle;
+                            st.fails = 0;
+                            st.failure = None;
                             self.announce_at = ctx.now + interval * 1000;
                             self.on_tracker_peers(resp, ctx);
                             handled = true;
@@ -2413,6 +2478,7 @@ impl TorrentSession {
                     self.scheduler.utilities(),
                     &self.availability,
                     &peer.have,
+                    peer.have_all,
                     &self.piece_priorities,
                     opts,
                 )
@@ -3037,23 +3103,36 @@ fn detect_tracker_kind(url: &[u8]) -> TrackerKind {
     }
 }
 
-fn parse_udp_tracker_addr(url: &[u8]) -> Option<NetAddr> {
-    // udp://host:port/announce
+/// Parse a `udp://host:port/announce` endpoint. IPv4 literals are decoded
+/// directly; hostnames (the common case for public UDP trackers — e.g.
+/// `udp://tracker.opentrackr.org:1337`) are resolved through the host's
+/// `resolve_host`, without which they would silently never announce.
+fn parse_udp_tracker_addr<F>(url: &[u8], resolve: &mut F) -> Option<NetAddr>
+where
+    F: FnMut(&str, u16) -> Option<NetAddr>,
+{
     let s = core::str::from_utf8(url).ok()?;
     let rest = s.strip_prefix("udp://")?;
     let hostport = rest.split('/').next()?;
     let (host, port) = hostport.rsplit_once(':')?;
     let port: u16 = port.parse().ok()?;
-    // resolve IPv4 literal (host resolves DNS later in std host)
+    // IPv4 literal first (no DNS needed).
     let mut parts = host.split('.');
-    let a: u8 = parts.next()?.parse().ok()?;
-    let b: u8 = parts.next()?.parse().ok()?;
-    let c: u8 = parts.next()?.parse().ok()?;
-    let d: u8 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
+    let literal = parts.next()?.parse::<u8>().ok().and_then(|a| {
+        let b = parts.next()?.parse::<u8>().ok()?;
+        let c = parts.next()?.parse::<u8>().ok()?;
+        let d = parts.next()?.parse::<u8>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some([a, b, c, d])
+    });
+    if let Some(ip) = literal {
+        return Some(NetAddr::V4(ip, port));
     }
-    Some(NetAddr::V4([a, b, c, d], port))
+    // Hostname (or bracketed IPv6 literal) → the host resolves it.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    resolve(host, port)
 }
 
 /// Build the per-session tracker list: torrent-declared URLs first, then
@@ -3165,6 +3244,7 @@ pub fn pex_compact6(list: &[NetAddr]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::metainfo::{FileEntry, Torrent, TorrentKind};
+    use crate::platform::DiskId;
 
     /// A 2-file v1 torrent: piece 0 lives in file 0, pieces 1–2 in file 1.
     fn test_torrent() -> Torrent {
@@ -3207,6 +3287,404 @@ mod tests {
             ..Default::default()
         };
         TorrentSession::from_torrent(test_torrent(), cfg, 0).expect("session")
+    }
+
+    /// A host that records every UDP datagram it sends and resolves one
+    /// fake tracker hostname — enough to exercise the UDP tracker path.
+    struct UdpTrackerHost {
+        sent: Vec<NetAddr>,
+    }
+
+    impl crate::platform::Host for UdpTrackerHost {
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+        fn fill_random(&mut self, _b: &mut [u8]) {}
+        fn log(&mut self, _l: crate::platform::LogLevel, _m: &str) {}
+        fn http_get(&mut self, _u: &str, _t: u64, _o: &mut Vec<u8>) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn resolve_host(&self, host: &str, port: u16) -> Option<NetAddr> {
+            if host == "tracker.example.com" {
+                Some(NetAddr::V4([192, 0, 2, 10], port))
+            } else {
+                None
+            }
+        }
+        fn tcp_connect(&mut self, _a: &NetAddr) -> crate::error::Result<ConnId> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_connect_done(&mut self, _id: ConnId) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_send(&mut self, _id: ConnId, _d: &[u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_recv(&mut self, _id: ConnId, _b: &mut [u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn tcp_close(&mut self, _id: ConnId) {}
+        fn udp_open(&mut self, _p: u16) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_send(&mut self, addr: &NetAddr, _d: &[u8]) -> crate::error::Result<()> {
+            self.sent.push(*addr);
+            Ok(())
+        }
+        fn udp_recv(&mut self, _b: &mut [u8]) -> crate::error::Result<(NetAddr, usize)> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn disk_open(&mut self, _p: &str) -> crate::error::Result<DiskId> {
+            Ok(1)
+        }
+        fn disk_read(
+            &mut self,
+            _id: DiskId,
+            _o: u64,
+            _b: &mut [u8],
+        ) -> crate::error::Result<usize> {
+            Ok(0)
+        }
+        fn disk_write(&mut self, _id: DiskId, _o: u64, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_prealloc(&mut self, _id: DiskId, _s: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_flush(&mut self, _id: DiskId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_close(&mut self, _id: DiskId) {}
+    }
+
+    /// A host whose sockets are inert (no data ever arrives) — enough to
+    /// construct a `SessionCtx` for pure in-memory session tests.
+    struct NoopHost;
+
+    impl crate::platform::Host for NoopHost {
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+        fn fill_random(&mut self, _b: &mut [u8]) {}
+        fn log(&mut self, _l: crate::platform::LogLevel, _m: &str) {}
+        fn http_get(&mut self, _u: &str, _t: u64, _o: &mut Vec<u8>) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_connect(&mut self, _a: &NetAddr) -> crate::error::Result<ConnId> {
+            Ok(1)
+        }
+        fn tcp_connect_done(&mut self, _id: ConnId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn tcp_send(&mut self, _id: ConnId, d: &[u8]) -> crate::error::Result<usize> {
+            Ok(d.len())
+        }
+        fn tcp_recv(&mut self, _id: ConnId, _b: &mut [u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn tcp_close(&mut self, _id: ConnId) {}
+        fn udp_open(&mut self, _p: u16) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn udp_send(&mut self, _a: &NetAddr, _d: &[u8]) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn udp_recv(&mut self, _b: &mut [u8]) -> crate::error::Result<(NetAddr, usize)> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn disk_open(&mut self, _p: &str) -> crate::error::Result<DiskId> {
+            Ok(1)
+        }
+        fn disk_read(
+            &mut self,
+            _id: DiskId,
+            _o: u64,
+            _b: &mut [u8],
+        ) -> crate::error::Result<usize> {
+            Ok(0)
+        }
+        fn disk_write(&mut self, _id: DiskId, _o: u64, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_prealloc(&mut self, _id: DiskId, _s: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_flush(&mut self, _id: DiskId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_close(&mut self, _id: DiskId) {}
+    }
+
+    /// Craft the wire bytes of a remote peer that sends its handshake and
+    /// its first messages (bitfield + unchoke) inside ONE TCP segment — the
+    /// common case, since TCP coalesces a seed's first burst.
+    fn remote_handshake_plus_first_messages(info_hash: [u8; 20], have_all: bool) -> Vec<u8> {
+        let mut reserved = [0u8; 8];
+        reserved[5] = 0x10; // extension (BEP-10)
+        reserved[7] = 0x04 | 0x08; // fast + metadata (BEP-6/BEP-9)
+        let mut b = Vec::new();
+        b.push(19);
+        b.extend_from_slice(b"BitTorrent protocol");
+        b.extend_from_slice(&reserved);
+        b.extend_from_slice(&info_hash);
+        b.extend_from_slice(&[9u8; 20]); // peer id
+                                         // first messages in the same segment
+        b.extend_from_slice(&Message::Unchoke.encode());
+        if have_all {
+            b.extend_from_slice(&Message::HaveAll.encode());
+        } else {
+            b.extend_from_slice(&Message::Bitfield(vec![0b111]).encode());
+        }
+        b
+    }
+
+    #[test]
+    fn handshake_and_first_messages_in_one_segment_keep_peer() {
+        let mut s = session();
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        s.attach_peer(
+            1,
+            NetAddr::V4([93, 184, 216, 34], 6881),
+            true,
+            DiscoverySource::Tracker,
+            &mut ctx,
+        );
+        assert!(s.peers.contains_key(&1));
+        // one segment: handshake + unchoke + have_all
+        let seg = remote_handshake_plus_first_messages([1u8; 20], true);
+        s.on_data(1, &seg, &mut ctx);
+        // The peer MUST survive the handshake and process the trailing
+        // messages — a seed that unchokes us in the same segment as its
+        // handshake is the normal case, not a protocol violation.
+        let p = s.peers.get(&1).expect("peer was dropped after handshake");
+        assert_eq!(p.phase, PeerPhase::Ready);
+        assert!(!p.peer_choking, "unchoke was not processed");
+        assert!(p.have_all, "have_all was not processed");
+        assert!(p.is_seed);
+    }
+
+    #[test]
+    fn interested_is_sent_to_a_choking_seed_with_missing_pieces() {
+        let mut s = session();
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        s.attach_peer(
+            1,
+            NetAddr::V4([93, 184, 216, 34], 6881),
+            true,
+            DiscoverySource::Tracker,
+            &mut ctx,
+        );
+        // handshake + have_all only (the seed has NOT unchoked us yet).
+        // Note: unchoke and have_all both encode to 5 bytes, so drop the
+        // unchoke by its position right after the 68-byte handshake.
+        let mut seg = remote_handshake_plus_first_messages([1u8; 20], true);
+        seg.drain(crate::wire::HANDSHAKE_LEN..crate::wire::HANDSHAKE_LEN + 5);
+        s.on_data(1, &seg, &mut ctx);
+        let p = s.peers.get(&1).expect("peer was dropped after handshake");
+        // We lack every piece and it has everything → we MUST be interested,
+        // even while choked. Otherwise seeds that only unchoke interested
+        // peers never let us download (the classic 0% deadlock).
+        assert!(p.am_interested, "no Interested sent to a choking seed");
+        assert!(p.peer_choking);
+        assert!(p
+            .out
+            .windows(Message::Interested.encode().len())
+            .any(|w| w == Message::Interested.encode().as_slice()));
+    }
+
+    /// A one-piece, one-block v1 torrent whose sole piece is a known byte
+    /// pattern (so its SHA-1 can be computed up front and the piece will
+    /// verify when the seed sends it back).
+    fn single_block_torrent() -> Torrent {
+        use crate::crypto::Sha1;
+        let pl = BLOCK_LEN; // 16 KiB → exactly one block
+        let data: Vec<u8> = vec![0xAB; pl as usize];
+        let hash = Sha1::digest(&data);
+        Torrent {
+            name: String::from("dl.bin"),
+            piece_length: pl,
+            total_size: pl as u64,
+            files: vec![FileEntry {
+                path: vec![b"dl.bin".to_vec()],
+                length: pl as u64,
+                root: None,
+            }],
+            kind: TorrentKind::V1,
+            info_hash: InfoHash::v1([2u8; 20]),
+            v1_hashes: Some(vec![hash]),
+            v2_hashes: None,
+            announce: None,
+            announce_list: Vec::new(),
+            web_seeds: Vec::new(),
+            private: false,
+            piece_layers: Vec::new(),
+            info_raw: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+        }
+    }
+
+    #[test]
+    fn full_download_from_have_all_seed() {
+        use crate::crypto::Sha1;
+        let t = single_block_torrent();
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            download_limit_bps: 0,
+            upload_limit_bps: 0,
+            ..Default::default()
+        };
+        let mut s = TorrentSession::from_torrent(t, cfg, 1_000_000).expect("session");
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        // Start the session: opens the target file(s) and begins announces
+        // (the NoopHost's http_get fails, which the session tolerates).
+        s.start(&mut ctx).expect("start");
+        // The seed connects and sends handshake + unchoke + have_all in one
+        // TCP segment (the common fast-extension seed case).
+        s.attach_peer(
+            1,
+            NetAddr::V4([203, 0, 113, 9], 6881),
+            true,
+            DiscoverySource::Tracker,
+            &mut ctx,
+        );
+        let seg = remote_handshake_plus_first_messages([2u8; 20], true);
+        s.on_data(1, &seg, &mut ctx);
+        {
+            let p = s.peers.get(&1).expect("seed dropped after handshake");
+            assert_eq!(p.phase, PeerPhase::Ready);
+            assert!(!p.peer_choking, "seed unchoke not processed");
+            assert!(p.am_interested, "not interested in a have_all seed");
+        }
+        // Grant the per-tick budget (the engine does this in `tick`) and
+        // pump the request pipeline.
+        s.tick_down_remaining = u64::MAX;
+        s.tick_up_allowance = u64::MAX;
+        s.fill_pipeline(1, &mut ctx);
+        {
+            let p = s.peers.get(&1).unwrap();
+            let want = Message::Request {
+                index: 0,
+                begin: 0,
+                length: BLOCK_LEN,
+            }
+            .encode();
+            assert!(
+                p.out.windows(want.len()).any(|w| w == want.as_slice()),
+                "no block request sent to the have_all seed"
+            );
+        }
+        // The seed answers with the piece block.
+        let data = vec![0xABu8; BLOCK_LEN as usize];
+        let piece_msg = Message::Piece {
+            index: 0,
+            begin: 0,
+            data: data.clone(),
+        }
+        .encode();
+        s.on_data(1, &piece_msg, &mut ctx);
+        // The piece is assembled and handed to the verifier.
+        assert!(
+            s.pending_verify.contains_key(&0),
+            "assembled piece was not queued for verification"
+        );
+        let pending = s.take_pending_verify();
+        let buf = pending.get(&0).cloned().expect("piece bytes");
+        assert_eq!(Sha1::digest(&buf), Sha1::digest(&data));
+        let (ok, buf) = s.verify_inline(0, buf);
+        assert!(ok, "piece failed verification");
+        s.on_verified(0, ok, buf, &mut ctx).expect("verify apply");
+        assert!(s.pieces.is_have(0), "piece was not marked have");
+        assert!(
+            s.status == SessionStatus::Seeding,
+            "one-piece torrent should complete"
+        );
+        assert!(s.progress() > 0.999);
+    }
+
+    #[test]
+    fn udp_tracker_resolves_hostname_and_retransmits_after_timeout() {
+        // A torrent whose only tracker is a *hostname* UDP tracker — the
+        // common shape of public UDP trackers. Without resolution it would
+        // silently never announce; without the timeout reset a single lost
+        // connect request would stall it forever.
+        let mut t = test_torrent();
+        t.announce_list = vec![vec![b"udp://tracker.example.com:1337/announce".to_vec()]];
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            ..Default::default()
+        };
+        let mut s = TorrentSession::from_torrent(t, cfg, 1_000_000).expect("session");
+        let mut host = UdpTrackerHost { sent: Vec::new() };
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        // First announce: hostname is resolved through the host → the
+        // connect request goes to the resolved address.
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            s.announce_to_tracker(&mut ctx, TrackerEvent::Started);
+        }
+        assert_eq!(host.sent.len(), 1, "one connect request on first announce");
+        assert_eq!(host.sent[0], NetAddr::V4([192, 0, 2, 10], 1337));
+        // Tracker never answers. 16 s later we re-announce: the pending
+        // request timed out and a fresh connect request is sent (cached
+        // address reused — no second DNS lookup).
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_016_000,
+                dht: None,
+                events: &mut events,
+            };
+            s.announce_to_tracker(&mut ctx, TrackerEvent::None);
+        }
+        assert_eq!(host.sent.len(), 2, "connect request re-sent after timeout");
+        assert_eq!(host.sent[1], NetAddr::V4([192, 0, 2, 10], 1337));
     }
 
     #[test]

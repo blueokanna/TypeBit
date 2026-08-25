@@ -256,6 +256,15 @@ pub trait Host {
         None
     }
 
+    /// Resolve a hostname to an IP endpoint (with `port`). Returns `None`
+    /// when the platform cannot resolve (or the name does not exist). This
+    /// is used to bootstrap the DHT from its well-known router hostnames
+    /// (BEP-5) — tracker URLs are always resolved inside `http_get` and
+    /// never go through this hook.
+    fn resolve_host(&self, _host: &str, _port: u16) -> Option<NetAddr> {
+        None
+    }
+
     // ---------- TCP peers ----------
 
     /// Begin a non-blocking connect to `addr`. Returns a handle immediately.

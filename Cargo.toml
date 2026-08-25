@@ -27,10 +27,11 @@ rustbinary = { version = "0.1.7", default-features = false, features = [
 ] }
 tzcraft = { version = "0.1", default-features = false }
 courierust = { version = "1.0", default-features = false }
+socket2 = { version = "0.6.5", optional = true }
 
 [features]
 default = []
-std = ["nextjson/std", "tzcraft/std", "courierust/std"]
+std = ["nextjson/std", "tzcraft/std", "courierust/std", "socket2"]
 ffi = ["std"]
 
 [[example]]

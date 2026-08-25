@@ -149,8 +149,19 @@ impl<H: Host> Engine<H> {
         let dht = if cfg.dht_enabled {
             let id = NodeId::random(&mut rng);
             let mut d = Dht::new(id, cfg.listen_port, &mut rng);
-            // bootstrap from well-known nodes (resolved by the std host)
-            let _ = &mut d;
+            // Bootstrap from the well-known BEP-5 routers. Their names are
+            // resolved through the host (never hardcoded IPs, which rot);
+            // a host without a resolver simply yields no seeds and the DHT
+            // stays dormant (HTTP/UDP trackers still work).
+            let mut seeds: Vec<NetAddr> = Vec::new();
+            for (host, port) in crate::consts::DHT_BOOTSTRAP {
+                if let Some(a) = h.resolve_host(host, *port) {
+                    seeds.push(a);
+                }
+            }
+            if !seeds.is_empty() {
+                d.bootstrap(&seeds, now);
+            }
             Some(d)
         } else {
             None
@@ -279,16 +290,20 @@ impl<H: Host> Engine<H> {
         };
         let s = self.sessions.get_mut(hash).ok_or(Error::NotFound)?;
         s.start(&mut ctx)?;
-        // bootstrap DHT once
+        // Re-kick DHT bootstrap when the routing table is still empty (the
+        // construction-time seeds may have failed, e.g. no connectivity yet).
+        // `bootstrap` is idempotent — it only pings, and an existing table
+        // is left untouched.
         if let Some(dht) = self.dht.as_mut() {
             if dht.table().size() == 0 {
+                let mut seeds: Vec<NetAddr> = Vec::new();
                 for (host, port) in crate::consts::DHT_BOOTSTRAP {
-                    // the std host resolves hostnames; core passes 0.0.0.0 as
-                    // a marker only for literal IPv4 seeds.
-                    if let Ok(ip) = host.parse::<core::net::Ipv4Addr>() {
-                        let _ = ip;
+                    if let Some(a) = self.host.resolve_host(host, *port) {
+                        seeds.push(a);
                     }
-                    let _ = (host, port);
+                }
+                if !seeds.is_empty() {
+                    dht.bootstrap(&seeds, now);
                 }
             }
         }
@@ -1011,7 +1026,24 @@ impl<H: Host> Engine<H> {
         let mut recv_buf = [0u8; 16 * 1024];
         loop {
             match self.host.tcp_recv(conn, &mut recv_buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    // Orderly EOF: the peer closed the connection. Release
+                    // the slot (and any in-flight block bookkeeping) instead
+                    // of pinning a dead peer forever.
+                    let mut ctx = SessionCtx {
+                        host: &mut self.host,
+                        cache: &mut self.cache,
+                        peer_id: self.peer_id,
+                        port: self.cfg.listen_port,
+                        now,
+                        dht: self.dht.as_mut(),
+                        events: &mut self.events,
+                    };
+                    if let Some(s) = self.sessions.get_mut(&hash) {
+                        s.drop_peer(conn, crate::monitoring::FailureCategory::Timeout, &mut ctx);
+                    }
+                    return;
+                }
                 Ok(n) => {
                     let mut ctx = SessionCtx {
                         host: &mut self.host,
