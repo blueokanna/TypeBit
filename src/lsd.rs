@@ -38,6 +38,40 @@ pub const LSD_GROUP_V6: crate::platform::NetAddr = crate::platform::NetAddr::V6(
 /// LSD announce interval (ms) — one announce per minute max.
 pub const LSD_INTERVAL_MS: u64 = 60_000;
 
+/// Upper bound on infohashes accepted from a single announce datagram.
+pub const MAX_INFOHASHES_PER_ANNOUNCE: usize = 32;
+
+/// The `Host:` header value for the LSD multicast group (no port — the
+/// listen port is a separate `Port` header).
+fn host_header(group: crate::platform::NetAddr) -> String {
+    match group {
+        crate::platform::NetAddr::V4(ip, _) => {
+            let mut s = String::with_capacity(15);
+            for (i, o) in ip.iter().enumerate() {
+                if i > 0 {
+                    s.push('.');
+                }
+                s.push_str(&o.to_string());
+            }
+            s
+        }
+        crate::platform::NetAddr::V6(ip, _) => {
+            let mut s = String::with_capacity(39);
+            s.push('[');
+            for (i, g) in ip.chunks(2).enumerate() {
+                if i > 0 {
+                    s.push(':');
+                }
+                let v = u16::from_be_bytes([g[0], g[1]]);
+                // RFC 5952: each group is lowercase hex with no leading zeros.
+                s.push_str(&alloc::format!("{:x}", v));
+            }
+            s.push(']');
+            s
+        }
+    }
+}
+
 /// One parsed LSD announce.
 #[derive(Debug, Clone)]
 pub struct LsdAnnounce {
@@ -87,11 +121,20 @@ fn hex_encode(b: &[u8]) -> String {
 
 /// Build a BT-SEARCH announce / response packet for one infohash.
 /// A response carries the same shape, sent unicast to the requester.
-pub fn build_announce(infohash: &[u8; 20], port: u16, cookie: Option<&[u8; 8]>) -> Vec<u8> {
+/// `group` is the multicast group the announce targets — the `Host` header
+/// must match its address family (v4 group → dotted quad, v6 → bracketed
+/// group).
+pub fn build_announce(
+    infohash: &[u8; 20],
+    port: u16,
+    cookie: Option<&[u8; 8]>,
+    group: crate::platform::NetAddr,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     out.extend_from_slice(b"BT-SEARCH * HTTP/1.1\r\n");
-    // Host header: the multicast group (matching what we send to / joined).
-    out.extend_from_slice(b"Host: 239.192.152.143\r\n");
+    out.extend_from_slice(b"Host: ");
+    out.extend_from_slice(host_header(group).as_bytes());
+    out.extend_from_slice(b"\r\n");
     out.extend_from_slice(b"Port: ");
     out.extend_from_slice(port.to_string().as_bytes());
     out.extend_from_slice(b"\r\n");
@@ -156,6 +199,9 @@ pub fn parse(data: &[u8]) -> Option<LsdAnnounce> {
                 }
             }
             b"Infohash" => {
+                if infohashes.len() >= MAX_INFOHASHES_PER_ANNOUNCE {
+                    continue; // ignore excess infohashes (flood bound)
+                }
                 if let Some(dec) = hex_decode(&value) {
                     if dec.len() == 20 {
                         let mut ih = [0u8; 20];
@@ -201,6 +247,12 @@ impl LsdScheduler {
         }
     }
 
+    /// Whether an announce is due (rate-limit elapsed). Cheap check the
+    /// engine performs *before* building the active-hash list.
+    pub fn due(&self, now: u64) -> bool {
+        now.saturating_sub(self.last_announce_at) >= LSD_INTERVAL_MS
+    }
+
     /// Pick the next infohash to announce, if enough time has passed.
     /// Returns `None` when we must stay quiet (rate limit).
     pub fn next_announce<'a>(&mut self, active: &'a [[u8; 20]], now: u64) -> Option<&'a [u8; 20]> {
@@ -226,7 +278,7 @@ mod tests {
     fn announce_roundtrip() {
         let ih = [7u8; 20];
         let cookie = [0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4];
-        let msg = build_announce(&ih, 6881, Some(&cookie));
+        let msg = build_announce(&ih, 6881, Some(&cookie), LSD_GROUP_V4);
         assert!(msg.starts_with(b"BT-SEARCH * HTTP/1.1\r\n"));
         assert!(msg.windows(10).any(|w| w == b"Port: 6881"));
         assert!(msg.windows(12).any(|w| w == b"Infohash: 07"));
@@ -235,6 +287,45 @@ mod tests {
         assert_eq!(parsed.port, 6881);
         assert_eq!(parsed.cookie, Some(cookie));
         assert_eq!(parsed.infohashes, vec![[7u8; 20]]);
+    }
+
+    #[test]
+    fn host_header_matches_group_family() {
+        let ih = [1u8; 20];
+        let raw4 = build_announce(&ih, 6881, None, LSD_GROUP_V4);
+        let v4 = String::from_utf8_lossy(&raw4);
+        assert!(
+            v4.contains("Host: 239.192.152.143"),
+            "v4 announce must carry the v4 group Host, got {v4:?}"
+        );
+        let raw6 = build_announce(&ih, 6881, None, LSD_GROUP_V6);
+        let v6 = String::from_utf8_lossy(&raw6);
+        assert!(
+            v6.contains("Host: [ff15:0:0:0:0:0:efc0:988f]"),
+            "v6 announce must carry the v6 group Host, got {v6:?}"
+        );
+    }
+
+    #[test]
+    fn infohash_cap_bounds_parsing() {
+        // A single datagram must not force us to parse an unbounded number
+        // of infohashes (LAN flood / amplification bound).
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"BT-SEARCH * HTTP/1.1\r\nPort: 6881\r\n");
+        let n = MAX_INFOHASHES_PER_ANNOUNCE + 64;
+        for i in 0..n {
+            let ih = [i as u8; 20];
+            msg.extend_from_slice(b"Infohash: ");
+            msg.extend_from_slice(hex_encode(&ih).as_bytes());
+            msg.extend_from_slice(b"\r\n");
+        }
+        msg.extend_from_slice(b"\r\n");
+        let parsed = parse(&msg).expect("parse");
+        assert_eq!(
+            parsed.infohashes.len(),
+            MAX_INFOHASHES_PER_ANNOUNCE,
+            "excess infohashes must be dropped"
+        );
     }
 
     #[test]
@@ -248,7 +339,7 @@ mod tests {
     fn multiple_infohashes_are_parsed() {
         let ih1 = [1u8; 20];
         let ih2 = [2u8; 20];
-        let mut msg = build_announce(&ih1, 6881, None);
+        let mut msg = build_announce(&ih1, 6881, None, LSD_GROUP_V4);
         // append a second Infohash header before the final blank line
         let tail = msg.split_off(msg.len() - 2);
         msg.extend_from_slice(b"Infohash: ");

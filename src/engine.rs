@@ -326,8 +326,12 @@ impl<H: Host> Engine<H> {
             if b.len() == 20 {
                 let mut ih20 = [0u8; 20];
                 ih20.copy_from_slice(b);
-                let msg =
-                    crate::lsd::build_announce(&ih20, self.cfg.listen_port, Some(&self.lsd.cookie));
+                let msg = crate::lsd::build_announce(
+                    &ih20,
+                    self.cfg.listen_port,
+                    Some(&self.lsd.cookie),
+                    crate::lsd::LSD_GROUP_V4,
+                );
                 let _ = self
                     .host
                     .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg);
@@ -1495,7 +1499,16 @@ impl<H: Host> Engine<H> {
             return;
         }
         let mut buf = [0u8; 64 * 1024];
+        // Per-tick datagram budget: a LAN peer flooding multicast datagrams
+        // must not pin the engine in this receive loop forever. The budget
+        // is ample (256 datagrams/tick); the remainder is picked up on the
+        // next tick, so nothing is dropped by this bound.
+        let mut budget = 256u32;
         loop {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
             match self.host.udp_recv(&mut buf) {
                 Ok((addr, n)) => {
                     let payload = &buf[..n];
@@ -1591,17 +1604,26 @@ impl<H: Host> Engine<H> {
         if self.cfg.proxy.is_some() || !self.udp_open {
             return; // outbound-only mode must not leak our presence
         }
+        // Rate check first: skip the per-tick active-hash list allocation
+        // when the scheduler is not due yet.
+        if !self.lsd.due(now) {
+            return;
+        }
         let active = self.lsd_active_hashes();
         let Some(ih) = self.lsd.next_announce(&active, now) else {
             return;
         };
-        let msg = crate::lsd::build_announce(ih, self.cfg.listen_port, Some(&self.lsd.cookie));
+        let port = self.cfg.listen_port;
+        let cookie = self.lsd.cookie;
+        // Per-family packets: the Host header must match the group.
+        let msg4 = crate::lsd::build_announce(ih, port, Some(&cookie), crate::lsd::LSD_GROUP_V4);
         let _ = self
             .host
-            .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg);
+            .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg4);
+        let msg6 = crate::lsd::build_announce(ih, port, Some(&cookie), crate::lsd::LSD_GROUP_V6);
         let _ = self
             .host
-            .udp_multicast_send(&crate::lsd::LSD_GROUP_V6, &msg);
+            .udp_multicast_send(&crate::lsd::LSD_GROUP_V6, &msg6);
     }
 
     /// Handle one LSD datagram: either a neighbour announcing a torrent we
@@ -1615,6 +1637,17 @@ impl<H: Host> Engine<H> {
         if ann.cookie == Some(self.lsd.cookie) {
             return; // our own announce looped back
         }
+        // BEP-14: `Port: 0` means the announcing peer is not accepting
+        // incoming connections — enqueuing `IP:0` would be useless.
+        if ann.port == 0 {
+            return;
+        }
+        // The multicast group we answer on matches the sender's address
+        // family, so the reply's Host header is consistent.
+        let group = match addr {
+            NetAddr::V4(..) => crate::lsd::LSD_GROUP_V4,
+            NetAddr::V6(..) => crate::lsd::LSD_GROUP_V6,
+        };
         for ih in ann.infohashes {
             let Some(s) = self.sessions.get_mut(&crate::metainfo::InfoHash::v1(ih)) else {
                 continue; // we don't have this torrent
@@ -1625,8 +1658,12 @@ impl<H: Host> Engine<H> {
                 NetAddr::V6(ip, _) => NetAddr::V6(ip, ann.port),
             };
             // Reply with our presence so they can connect to us too.
-            let resp =
-                crate::lsd::build_announce(&ih, self.cfg.listen_port, Some(&self.lsd.cookie));
+            let resp = crate::lsd::build_announce(
+                &ih,
+                self.cfg.listen_port,
+                Some(&self.lsd.cookie),
+                group,
+            );
             let _ = self.host.udp_send(&addr, &resp);
             // And add them to the swarm for this torrent.
             s.enqueue_peer(peer_addr, crate::monitoring::DiscoverySource::Lsd, now);

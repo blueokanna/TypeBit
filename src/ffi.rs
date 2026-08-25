@@ -373,6 +373,35 @@ impl Host for HostBridge {
 
 // ---------- C API ----------
 
+/// Validate a callback table: every **required** entry must be non-null.
+/// Dereferencing a null function pointer is UB; a half-initialized table is
+/// a host bug that must be rejected cleanly at creation rather than crash
+/// (or worse) on the first engine call. `resolve_host` is the one optional
+/// entry (null = the host cannot resolve DNS; DHT stays dormant).
+fn validate_cbs(cbs: &HostCbs) -> bool {
+    let required: [usize; 18] = [
+        cbs.now_ms as usize,
+        cbs.fill_random as usize,
+        cbs.log as usize,
+        cbs.http_get as usize,
+        cbs.tcp_connect as usize,
+        cbs.tcp_connect_done as usize,
+        cbs.tcp_send as usize,
+        cbs.tcp_recv as usize,
+        cbs.tcp_close as usize,
+        cbs.udp_open as usize,
+        cbs.udp_send as usize,
+        cbs.udp_recv as usize,
+        cbs.disk_open as usize,
+        cbs.disk_read as usize,
+        cbs.disk_write as usize,
+        cbs.disk_prealloc as usize,
+        cbs.disk_flush as usize,
+        cbs.disk_close as usize,
+    ];
+    required.iter().all(|p| *p != 0)
+}
+
 /// Create an engine. Returns a heap handle (free with `typebit_engine_free`).
 /// `cbs` must stay alive for the engine's lifetime.
 #[no_mangle]
@@ -384,6 +413,11 @@ pub unsafe extern "C" fn typebit_engine_new(
 ) -> *mut TypeBitEngine {
     if cbs.is_null() {
         return core::ptr::null_mut();
+    }
+    // SAFETY: the pointer was checked non-null above; this only reads the
+    // table to validate it before any callback is invoked.
+    if !validate_cbs(unsafe { &*cbs }) {
+        return core::ptr::null_mut(); // host bug: incomplete callback table
     }
     let cfg = EngineConfig {
         listen_port,
@@ -921,5 +955,21 @@ mod tests {
         assert_eq!(n4, 0, "queue must be drained after all events");
 
         unsafe { typebit_engine_free(engine) };
+    }
+
+    #[test]
+    #[allow(invalid_value, clippy::transmute_null_to_fn)] // null fn pointer on purpose
+    fn engine_new_rejects_incomplete_callback_table() {
+        let mut ctx = Ctx {
+            now: 0,
+            resolved: None,
+        };
+        let mut cbs = make_cbs(&mut ctx as *mut Ctx as *mut c_void);
+        // A host bug: one required callback left null. Dereferencing it
+        // later would be UB — creation must reject the table cleanly.
+        type UdpOpen = extern "C" fn(*mut c_void, u16) -> c_int;
+        cbs.udp_open = unsafe { core::mem::transmute::<usize, UdpOpen>(0usize) };
+        let e = unsafe { typebit_engine_new(&cbs, 6881, 1 << 20, 0) };
+        assert!(e.is_null(), "incomplete callback table must be rejected");
     }
 }

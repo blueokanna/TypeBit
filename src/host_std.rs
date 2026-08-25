@@ -18,6 +18,14 @@ use std::net::{
     Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, ToSocketAddrs, UdpSocket,
 };
 
+/// Hard cap on a full HTTP response body collected by [`Host::http_get`]
+/// (tracker announces, tracker lists, UPnP device descriptions). A tracker
+/// is an untrusted network peer; without this bound a hostile tracker (or
+/// a MITM on plaintext HTTP) could stream an unbounded body and exhaust
+/// memory (CWE-770). Real tracker responses with hundreds of peers are
+/// a few KB; even the community tracker list is well under 1 MiB.
+const MAX_HTTP_BODY: usize = 4 * 1024 * 1024;
+
 /// Map an engine endpoint onto a std socket address.
 fn to_socket_addr(a: &NetAddr) -> SocketAddr {
     match *a {
@@ -43,11 +51,21 @@ fn to_socket_addr(a: &NetAddr) -> SocketAddr {
     }
 }
 
-/// Map a std socket address back onto an engine endpoint.
+/// Map a std socket address back onto an engine endpoint. IPv4-mapped IPv6
+/// addresses (`::ffff:a.b.c.d`, as reported by dual-stack sockets) are
+/// normalized back to real IPv4 so the engine's address-family logic
+/// (subnet keys, compact encodings, LSD peer ports) sees true endpoints.
 fn from_socket_addr(sa: SocketAddr) -> NetAddr {
     match sa {
         SocketAddr::V4(v4) => NetAddr::V4(v4.ip().octets(), v4.port()),
-        SocketAddr::V6(v6) => NetAddr::V6(v6.ip().octets(), v6.port()),
+        SocketAddr::V6(v6) => {
+            let ip = v6.ip().octets();
+            if ip[..10] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] && ip[10] == 0xff && ip[11] == 0xff {
+                NetAddr::V4([ip[12], ip[13], ip[14], ip[15]], v6.port())
+            } else {
+                NetAddr::V6(ip, v6.port())
+            }
+        }
     }
 }
 
@@ -58,8 +76,17 @@ pub struct StdHost {
     tcp: HashMap<ConnId, TcpStream>,
     /// Next TCP conn id (1-based so 0 stays a "no handle" sentinel).
     next_tcp: ConnId,
-    /// UDP socket for DHT / UDP trackers (one per host).
+    /// UDP socket for DHT / UDP trackers / LSD. Preferentially a dual-stack
+    /// (IPv4+IPv6) socket so one socket serves both address families,
+    /// including the BEP-14 v6 multicast group; falls back to IPv4-only on
+    /// hosts without IPv6. Opened through `socket2` (for `set_only_v6` and
+    /// the IPv6 multicast hop limit — neither is exposed by std) and then
+    /// converted to `UdpSocket` so all runtime I/O stays unsafe-free.
     udp: Option<UdpSocket>,
+    /// Whether the UDP socket is dual-stack (IPv4+IPv6). When true, IPv4
+    /// destinations are sent as IPv4-mapped IPv6 addresses — Windows
+    /// rejects native AF_INET sockaddrs on an AF_INET6 dual-stack socket.
+    udp_dual_stack: bool,
     /// Open files (disk id → file).
     disk: HashMap<DiskId, File>,
     /// Next disk id (1-based).
@@ -74,8 +101,69 @@ impl StdHost {
             tcp: HashMap::new(),
             next_tcp: 1,
             udp: None,
+            udp_dual_stack: false,
             disk: HashMap::new(),
             next_disk: 1,
+        }
+    }
+
+    /// Open a dual-stack (IPv4+IPv6) non-blocking UDP socket bound to the
+    /// IPv6 wildcard with V6ONLY disabled. The IPv6 multicast hop limit is
+    /// set here once — it persists on the fd after conversion to
+    /// `UdpSocket`.
+    fn open_dual_stack(port: u16) -> crate::Result<UdpSocket> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|_| Error::Io)?;
+        sock.set_only_v6(false).map_err(|_| Error::Io)?;
+        let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0);
+        sock.bind(&bind_addr.into()).map_err(|_| Error::Io)?;
+        sock.set_nonblocking(true).map_err(|_| Error::Io)?;
+        // IPv6 multicast hop limit for LSD (BEP-14): org/site scope.
+        let _ = sock.set_multicast_hops_v6(16);
+        Ok(sock.into())
+    }
+
+    /// Fallback when dual-stack is unavailable (IPv6 disabled on the host):
+    /// an IPv4-only non-blocking UDP socket bound to `0.0.0.0:port`.
+    fn open_v4_only(port: u16) -> crate::Result<UdpSocket> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|_| Error::Io)?;
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        sock.bind(&bind_addr.into()).map_err(|_| Error::Io)?;
+        sock.set_nonblocking(true).map_err(|_| Error::Io)?;
+        Ok(sock.into())
+    }
+
+    /// The destination `SocketAddr` to hand the UDP socket. On a dual-stack
+    /// socket, Windows requires IPv4 destinations in IPv4-mapped form
+    /// (`::ffff:a.b.c.d`), so V4 addresses are mapped when the socket is
+    /// dual-stack (harmless on Unix, which accepts both forms).
+    fn send_sock_addr(&self, a: &NetAddr) -> SocketAddr {
+        match *a {
+            NetAddr::V4(ip, port) if self.udp_dual_stack => SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0xffff,
+                    u16::from_be_bytes([ip[0], ip[1]]),
+                    u16::from_be_bytes([ip[2], ip[3]]),
+                ),
+                port,
+                0,
+                0,
+            )),
+            _ => to_socket_addr(a),
         }
     }
 }
@@ -122,7 +210,12 @@ impl Host for StdHost {
         if resp.status.as_u16() != 200 {
             return Err(crate::Error::Tracker);
         }
-        let body = resp.body.collect().map_err(|_| crate::Error::Io)?;
+        // `collect_limited` enforces the cap before each allocation/copy,
+        // so a hostile tracker cannot make us materialize a huge body.
+        let body = resp
+            .body
+            .collect_limited(MAX_HTTP_BODY)
+            .map_err(|_| crate::Error::Io)?;
         out.extend_from_slice(&body);
         Ok(())
     }
@@ -150,8 +243,16 @@ impl Host for StdHost {
         if status != 200 && status != 206 {
             return Err(crate::Error::Tracker);
         }
-        let body = resp.body.collect().map_err(|_| crate::Error::Io)?;
-        if body.len() as u64 != range_end.saturating_sub(range_start) + 1 {
+        // A web seed MUST honor the range (BEP-19): bound the body to the
+        // requested window so a hostile seed cannot stream unbounded data.
+        let window = range_end.saturating_sub(range_start) + 1;
+        let body = resp
+            .body
+            .collect_limited(window as usize)
+            .map_err(|_| crate::Error::Io)?;
+        // Refuse anything that is not exactly the window (a mismatched
+        // body would corrupt the piece).
+        if body.len() as u64 != window {
             return Err(crate::Error::Protocol);
         }
         out.extend_from_slice(&body);
@@ -248,26 +349,46 @@ impl Host for StdHost {
         if self.udp.is_some() {
             return Ok(());
         }
-        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|_| Error::Io)?;
-        sock.set_nonblocking(true).map_err(|_| Error::Io)?;
-        self.udp = Some(sock);
+        // Prefer a dual-stack socket (`[::]:port`, V6ONLY off): one socket
+        // then serves DHT, UDP trackers and LSD (BEP-14) on both IPv4 and
+        // IPv6 — including the v6 LSD multicast group `ff15::efc0:988f`.
+        // On hosts without IPv6 support (socket creation/bind fails) we
+        // fall back to an IPv4-only socket so nothing regresses.
+        let (udp, dual_stack) = match Self::open_dual_stack(port) {
+            Ok(s) => (s, true),
+            Err(_) => (Self::open_v4_only(port)?, false),
+        };
+        self.udp_dual_stack = dual_stack;
+        self.udp = Some(udp);
         Ok(())
     }
 
     fn udp_send(&mut self, addr: &NetAddr, data: &[u8]) -> crate::Result<()> {
         let sock = self.udp.as_ref().ok_or(Error::NotFound)?;
-        let sa = to_socket_addr(addr);
+        let sa = self.send_sock_addr(addr);
         sock.send_to(data, sa).map_err(|_| Error::Io)?;
         Ok(())
     }
 
     fn udp_multicast_send(&mut self, addr: &NetAddr, data: &[u8]) -> crate::Result<()> {
         let sock = self.udp.as_ref().ok_or(Error::NotFound)?;
-        if matches!(*addr, NetAddr::V4(..)) {
-            let _ = sock.set_multicast_ttl_v4(16);
-            let _ = sock.set_multicast_loop_v4(true);
+        // Per-family multicast options on the (possibly dual-stack) socket:
+        // TTL/hops 16 keeps announces within the org/site scope the LSD
+        // groups are defined for, loop on so our own datagrams reach us
+        // for cookie-based echo filtering.
+        match *addr {
+            NetAddr::V4(..) => {
+                let _ = sock.set_multicast_ttl_v4(16);
+                let _ = sock.set_multicast_loop_v4(true);
+            }
+            NetAddr::V6(..) => {
+                // The v6 hop limit was set at open (it persists on the fd);
+                // ensure loop so our own datagrams reach us for cookie-
+                // based echo filtering.
+                let _ = sock.set_multicast_loop_v6(true);
+            }
         }
-        let sa = to_socket_addr(addr);
+        let sa = self.send_sock_addr(addr);
         sock.send_to(data, sa).map_err(|_| Error::Io)?;
         Ok(())
     }
@@ -290,7 +411,12 @@ impl Host for StdHost {
     fn udp_recv(&mut self, buf: &mut [u8]) -> crate::Result<(NetAddr, usize)> {
         let sock = self.udp.as_ref().ok_or(Error::NotFound)?;
         match sock.recv_from(buf) {
-            Ok((n, sa)) => Ok((from_socket_addr(sa), n)),
+            Ok((n, sa)) => {
+                // `from_socket_addr` normalizes IPv4-mapped sources
+                // (`::ffff:a.b.c.d`, reported by dual-stack sockets) back
+                // to real IPv4.
+                Ok((from_socket_addr(sa), n))
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -352,7 +478,7 @@ impl Host for StdHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, UdpSocket};
     use std::time::Duration;
 
     #[test]
@@ -474,6 +600,98 @@ mod tests {
             }
         };
         assert_eq!(&buf[..n], b"world");
+    }
+
+    #[test]
+    fn udp_dual_stack_normalizes_v4_mapped_sources() {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        let peer_addr = sock.local_addr().unwrap();
+        let mut host = StdHost::new();
+        host.udp_open(0).expect("open");
+
+        let dst = NetAddr::V4([127, 0, 0, 1], peer_addr.port());
+        host.udp_send(&dst, b"ping").expect("send");
+        let mut got = [0u8; 8];
+        let (n, from) = sock.recv_from(&mut got).expect("peer recv");
+        assert_eq!(&got[..n], b"ping");
+        sock.send_to(b"pong", from).expect("peer reply");
+
+        // A dual-stack socket reports IPv4 sources as `::ffff:127.0.0.1`;
+        // the host must hand the engine a real IPv4 endpoint so family
+        // logic (subnet keys, compact encodings, LSD peer ports) is sane.
+        let mut buf = [0u8; 8];
+        let (src, n) = loop {
+            match host.udp_recv(&mut buf) {
+                Ok(x) => break x,
+                Err(Error::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("udp_recv: {e:?}"),
+            }
+        };
+        assert_eq!(&buf[..n], b"pong");
+        assert_eq!(
+            src,
+            NetAddr::V4([127, 0, 0, 1], peer_addr.port()),
+            "v4 source must be normalized, not ::ffff-mapped v6"
+        );
+    }
+
+    #[test]
+    fn udp_v6_roundtrip_when_available() {
+        // Skip silently on hosts without IPv6 loopback.
+        let peer = match UdpSocket::bind("[::1]:0") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let peer_addr = peer.local_addr().unwrap();
+        let mut host = StdHost::new();
+        if host.udp_open(0).is_err() {
+            return; // host fell back to v4-only (no IPv6) — nothing to test
+        }
+        let mut ip = [0u8; 16];
+        ip[15] = 1; // ::1
+        let dst = NetAddr::V6(ip, peer_addr.port());
+        if host.udp_send(&dst, b"v6ping").is_err() {
+            return; // v4-only fallback socket
+        }
+        let mut got = [0u8; 16];
+        let (n, from) = peer.recv_from(&mut got).expect("peer v6 recv");
+        assert_eq!(&got[..n], b"v6ping");
+        peer.send_to(b"v6pong", from).expect("peer v6 reply");
+        let mut buf = [0u8; 16];
+        let (src, n) = loop {
+            match host.udp_recv(&mut buf) {
+                Ok(x) => break x,
+                Err(Error::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("udp_recv: {e:?}"),
+            }
+        };
+        assert_eq!(&buf[..n], b"v6pong");
+        assert_eq!(src, NetAddr::V6(ip, peer_addr.port()));
+    }
+
+    #[test]
+    fn from_socket_addr_normalizes_v4_mapped_v6() {
+        let mapped = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1]),
+            6881,
+            0,
+            0,
+        ));
+        assert_eq!(from_socket_addr(mapped), NetAddr::V4([192, 0, 2, 1], 6881));
+        let real6 = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from([0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            6881,
+            0,
+            0,
+        ));
+        assert_eq!(
+            from_socket_addr(real6),
+            NetAddr::V6([0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 6881)
+        );
     }
 
     #[test]
