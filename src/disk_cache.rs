@@ -317,6 +317,13 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Flush at most `max_bytes` of the oldest dirty data. Bounds the
+    /// engine's blocking time on slow disks; the rest is flushed by the
+    /// regular cadence. Returns the bytes actually written.
+    pub fn flush_bounded<H: Host>(&mut self, host: &mut H, max_bytes: u64) -> Result<u64> {
+        self.flush_oldest(host, max_bytes)
+    }
+
     /// Flush all dirty data for one file.
     pub fn flush_disk<H: Host>(&mut self, host: &mut H, disk: DiskId) -> Result<()> {
         let keys: alloc::vec::Vec<(DiskId, u64)> = self

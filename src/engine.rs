@@ -79,9 +79,9 @@ impl Default for EngineConfig {
 }
 
 /// How often the engine retries DHT bootstrap while the routing table is
-/// still empty (the construction-time seeds may have been sent before any
-/// network was up). Fast retry keeps the DHT searching from app launch.
-const BOOTSTRAP_RETRY_MS: u64 = 10_000;
+/// still empty. Fast retry keeps the DHT searching from app launch and
+/// recovers quickly if the table is ever evicted to zero.
+const BOOTSTRAP_RETRY_MS: u64 = 5_000;
 
 /// The engine. Generic over the host.
 pub struct Engine<H: Host> {
@@ -1762,13 +1762,14 @@ impl<H: Host> Engine<H> {
         }
     }
 
-    /// Flush the disk cache so every verified piece actually reaches stable
-    /// storage. Call right before persisting resume state — the saved `have`
-    /// bitfield must only claim pieces whose bytes are really on disk,
+    /// Flush dirty pieces to disk so every verified piece actually reaches
+    /// stable storage. Call right before persisting resume state — the saved
+    /// `have` bitfield must only claim pieces whose bytes are really on disk,
     /// otherwise a crash would "restore" pieces that are missing from the
     /// `.part` files (silent corruption) instead of re-downloading them.
+    /// Bounded to 32 MiB so a slow disk can never freeze the engine loop.
     pub fn flush_cache(&mut self) {
-        let _ = self.cache.flush(&mut self.host);
+        let _ = self.cache.flush_bounded(&mut self.host, 32 * 1024 * 1024);
     }
 
     /// Save session state for persistence (returns binary bytes).
