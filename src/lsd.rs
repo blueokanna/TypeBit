@@ -61,11 +61,12 @@ fn hex_val(c: u8) -> Option<u8> {
 
 /// Decode a hex string into bytes. `None` on odd length or invalid chars.
 fn hex_decode(s: &[u8]) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in s.chunks_exact(2) {
+    // Length is guaranteed even above, so `as_chunks` never truncates.
+    for pair in s.as_chunks::<2>().0 {
         let hi = hex_val(pair[0])?;
         let lo = hex_val(pair[1])?;
         out.push((hi << 4) | lo);

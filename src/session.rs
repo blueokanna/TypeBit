@@ -2571,10 +2571,7 @@ impl TorrentSession {
         // next block (without this, the web seed stalls after one block).
         self.webseed.job_id = 0;
         let blen = self.webseed.job_len;
-        let body = match result {
-            Ok(b) => b,
-            Err(_) => Vec::new(),
-        };
+        let body = result.unwrap_or_default();
         let got = if body.len() as u64 == blen {
             Ok(())
         } else {
