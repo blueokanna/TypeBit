@@ -22,6 +22,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 pub use engine_events::EngineEvent;
 
+/// Per-tick disk-cache flush budget
+const CACHE_FLUSH_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Engine-wide configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -944,8 +947,14 @@ impl<H: Host> Engine<H> {
                 }
             }
         }
-        if now.saturating_sub(self.last_cache_flush) >= 5_000 {
-            let _ = self.cache.flush(&mut self.host);
+        if now.saturating_sub(self.last_cache_flush) >= 1_000 {
+            // Bounded drain: flush at most CACHE_FLUSH_BUDGET_BYTES per
+            // second so a slow disk can never freeze the engine loop.
+            // (`flush_bounded` exists since 0.1.3; a plain `flush` would
+            // write the whole cache in one blocking call.)
+            let _ = self
+                .cache
+                .flush_bounded(&mut self.host, CACHE_FLUSH_BUDGET_BYTES);
             self.last_cache_flush = now;
         }
         // LSD (BEP-14): announce one active torrent to the LAN per minute.
@@ -1760,6 +1769,13 @@ impl<H: Host> Engine<H> {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// The parsed metainfo of a torrent, if its metadata is known (file
+    /// torrents from add time; magnets once the metadata arrived). Lets the
+    /// bridge mirror file tables and clean up staged files on removal.
+    pub fn metainfo(&self, hash: &InfoHash) -> Option<&Torrent> {
+        self.sessions.get(hash).and_then(|s| s.torrent.as_ref())
     }
 
     /// Flush dirty pieces to disk so every verified piece actually reaches
