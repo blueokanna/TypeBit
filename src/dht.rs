@@ -687,6 +687,18 @@ pub struct Dht {
     lookups: Vec<Lookup>,
     /// Endpoints we have announced to recently (dedupe).
     announced: Vec<NetAddr>,
+    /// Peers discovered by `get_peers` lookups, kept **beyond the lookup's
+    /// lifetime** (infohash → peers). A lookup that is pruned (timeout or
+    /// exhausted before the bootstrap populated the table) must not throw
+    /// away peers that arrived late; the session drains this cache every
+    /// tick, so late bootstrap results still reach the downloader.
+    peer_cache: BTreeMap<[u8; 20], Vec<NetAddr>>,
+    /// BEP-5 peer storage served by `get_peers` responses: infohash →
+    /// announced (endpoint, expiry). Without this store, `announce_peer`
+    /// replies success but drops the peer, and `get_peers` can never answer
+    /// with any value — the whole DHT discovery path would be a no-op even
+    /// after a successful bootstrap.
+    peer_store: BTreeMap<[u8; 20], Vec<(NetAddr, u64)>>,
 }
 
 impl Dht {
@@ -703,6 +715,8 @@ impl Dht {
             pending: BTreeMap::new(),
             lookups: Vec::new(),
             announced: Vec::new(),
+            peer_cache: BTreeMap::new(),
+            peer_store: BTreeMap::new(),
         }
     }
 
@@ -748,6 +762,19 @@ impl Dht {
 
     /// Cap on tracked in-flight transactions (bounds memory under flood).
     const MAX_PENDING: usize = 4096;
+
+    /// Bounds on the discovered-peer cache (memory bound under flood).
+    const PEER_CACHE_MAX_HASHES: usize = 256;
+    /// Per-infohash cap on cached peers.
+    const PEER_CACHE_MAX_PER_HASH: usize = 256;
+
+    /// How long a BEP-5 announced peer stays servable (30 minutes, matching
+    /// the mainstream clients).
+    const PEER_STORE_TTL_MS: u64 = 30 * 60 * 1000;
+    /// Cap on announced peers served per infohash.
+    const PEER_STORE_MAX_PER_HASH: usize = 64;
+    /// Cap on infohashes in the peer store.
+    const PEER_STORE_MAX_HASHES: usize = 1024;
 
     fn push_pending(&mut self, tx: u32, p: Pending) -> bool {
         if self.pending.len() >= Self::MAX_PENDING {
@@ -891,6 +918,21 @@ impl Dht {
                 idx += 1;
             }
         }
+        // Prune BEP-5 announced peers whose TTL expired (and bound the store).
+        let expired: Vec<[u8; 20]> = self
+            .peer_store
+            .iter()
+            .filter(|(_, v)| v.iter().all(|(_, exp)| now >= *exp))
+            .map(|(k, _)| *k)
+            .collect();
+        for h in expired {
+            if let Some(v) = self.peer_store.get_mut(&h) {
+                v.retain(|(_, exp)| now < *exp);
+                if v.is_empty() {
+                    self.peer_store.remove(&h);
+                }
+            }
+        }
         self.announced.truncate(200);
     }
 
@@ -923,6 +965,16 @@ impl Dht {
             .cloned()
             .collect();
         if to_query.is_empty() {
+            // Nothing to query right now. If we never even queried a single
+            // node, the routing table is empty because the bootstrap pings
+            // are still in flight — the lookup must NOT die here: each tick
+            // refreshes `closest` from the table, so once a bootstrap node
+            // answers, the lookup starts querying it. Only a lookup that has
+            // actually exhausted its candidate set is finished. (A never-
+            // populated table is still bounded by LOOKUP_TIMEOUT_MS above.)
+            if self.lookups[idx].queried.is_empty() {
+                return false;
+            }
             return true; // all queried; no more progress possible
         }
         for node in to_query {
@@ -1012,9 +1064,17 @@ impl Dht {
                     }
                     "get_peers" => {
                         let token = self.make_token(&from);
-                        let nodes = self
-                            .table
-                            .closest(&NodeId(args.info_hash.unwrap_or([0; 20])), K);
+                        let ih = args.info_hash.unwrap_or([0; 20]);
+                        let nodes = self.table.closest(&NodeId(ih), K);
+                        // BEP-5: serve the peers that announced for this
+                        // infohash (compact values), alongside the closest
+                        // nodes so the querying node can continue its
+                        // iterative lookup.
+                        let values: Vec<NetAddr> = self
+                            .peer_store
+                            .get(&ih)
+                            .map(|v| v.iter().map(|(a, _)| *a).collect())
+                            .unwrap_or_default();
                         let reply = KrpcMsg {
                             t: msg.t,
                             body: KrpcBody::Response {
@@ -1022,7 +1082,7 @@ impl Dht {
                                 resp: Resp::GetPeers {
                                     id: self.id,
                                     token,
-                                    values: Vec::new(),
+                                    values,
                                     nodes,
                                 },
                             },
@@ -1043,6 +1103,37 @@ impl Dht {
                                 },
                             };
                             return Ok(DatagramOutcome::Reply(encode(&reply)));
+                        }
+                        // BEP-5: store the announcing peer so later
+                        // `get_peers` queries can return it. The port is the
+                        // caller's listening port (or the UDP source port
+                        // when `implied_port` is set); the IP is the UDP
+                        // source address.
+                        if let Some(ih) = args.info_hash {
+                            let port =
+                                if args.implied_port == Some(1) || args.port.unwrap_or(0) == 0 {
+                                    from.port()
+                                } else {
+                                    args.port.unwrap_or_else(|| from.port())
+                                };
+                            let endpoint = match from {
+                                NetAddr::V4(ip, _) => NetAddr::V4(ip, port),
+                                NetAddr::V6(ip, _) => NetAddr::V6(ip, port),
+                            };
+                            let entry = self.peer_store.entry(ih).or_default();
+                            entry.retain(|(a, _)| *a != endpoint); // refresh
+                            entry.push((endpoint, now + Self::PEER_STORE_TTL_MS));
+                            if entry.len() > Self::PEER_STORE_MAX_PER_HASH {
+                                entry.drain(..entry.len() - Self::PEER_STORE_MAX_PER_HASH);
+                            }
+                            while self.peer_store.len() > Self::PEER_STORE_MAX_HASHES {
+                                match self.peer_store.keys().next().copied() {
+                                    Some(k) => {
+                                        self.peer_store.remove(&k);
+                                    }
+                                    None => break,
+                                }
+                            }
                         }
                         let reply = KrpcMsg {
                             t: msg.t,
@@ -1124,6 +1215,31 @@ impl Dht {
                 }
             }
         }
+        // Persist discovered peers beyond the lookup's lifetime, so results
+        // that arrive late (e.g. after the bootstrap populated the table) are
+        // still delivered to the session even if this lookup is pruned.
+        if !values.is_empty() {
+            // Scope the entry borrow so the cache can be pruned afterwards.
+            {
+                let entry = self.peer_cache.entry(tid).or_default();
+                for v in &values {
+                    if !entry.contains(v) {
+                        entry.push(*v);
+                    }
+                }
+                if entry.len() > Self::PEER_CACHE_MAX_PER_HASH {
+                    entry.truncate(Self::PEER_CACHE_MAX_PER_HASH);
+                }
+            }
+            while self.peer_cache.len() > Self::PEER_CACHE_MAX_HASHES {
+                match self.peer_cache.keys().next().copied() {
+                    Some(k) => {
+                        self.peer_cache.remove(&k);
+                    }
+                    None => break,
+                }
+            }
+        }
         self.send_announces_if_ready(tid, now);
     }
 
@@ -1179,12 +1295,20 @@ impl Dht {
         }
     }
 
-    /// Peers discovered so far for an infohash lookup.
+    /// Peers discovered for an infohash, from live lookups **and** the
+    /// persisted cache (so results survive a lookup being pruned).
     pub fn discovered_peers(&self, info_hash: &[u8; 20]) -> Vec<NetAddr> {
         let mut out = Vec::new();
         for l in &self.lookups {
             if l.kind == LookupKind::GetPeers && l.target == *info_hash {
                 out.extend(l.values.iter().copied());
+            }
+        }
+        if let Some(cached) = self.peer_cache.get(info_hash) {
+            for v in cached {
+                if !out.contains(v) {
+                    out.push(*v);
+                }
             }
         }
         out
@@ -1369,5 +1493,163 @@ mod tests {
             }
         }
         assert!(accepted);
+    }
+
+    #[test]
+    fn lookup_survives_empty_table_until_bootstrap() {
+        let mut rng = Rng::from_seed([17u8; 32]);
+        let mut alice = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        let mut bob = Dht::new(NodeId::random(&mut rng), 6882, &mut rng);
+        let ih = [0xCDu8; 20];
+        let bob_addr = NetAddr::V4([127, 0, 0, 1], 6882);
+        let alice_addr = NetAddr::V4([127, 0, 0, 1], 6881);
+
+        // 1) bob starts a get_peers lookup while its routing table is EMPTY
+        //    (the "session started before bootstrap answered" race).
+        bob.get_peers(ih, 7777, 1);
+
+        // 2) Driving the lookup must NOT prune it: nothing was queried yet
+        //    and the table may still be populated by in-flight bootstrap
+        //    pings. (Regression: it used to end immediately.)
+        bob.tick(2);
+        assert_eq!(
+            bob.active_lookups(),
+            1,
+            "empty-table lookup must stay alive"
+        );
+
+        // 3) bob learns alice through a bootstrap ping.
+        alice.bootstrap(&[bob_addr], 3);
+        for (addr, payload) in alice.outgoing() {
+            if let Ok(DatagramOutcome::Reply(reply)) = bob.handle_datagram(addr, &payload, 3) {
+                alice.handle_datagram(alice_addr, &reply, 3).unwrap();
+            }
+        }
+        assert!(bob.table().contains(&alice.id));
+
+        // 4) The SAME lookup must now query the newly learned node.
+        bob.tick(4);
+        let out = bob.outgoing();
+        assert!(!out.is_empty(), "lookup must query the newly learned node");
+    }
+
+    #[test]
+    fn announce_then_get_peers_returns_peer() {
+        let mut rng = Rng::from_seed([19u8; 32]);
+        let mut node = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        let ih = [0xEEu8; 20];
+        let announcer = NetAddr::V4([10, 0, 0, 9], 9000);
+
+        // BEP-5 token for the announcer's IP.
+        let token = node.make_token(&announcer);
+        let ann = KrpcMsg {
+            t: t2(9),
+            body: KrpcBody::Query {
+                q: "announce_peer",
+                args: Args {
+                    id: NodeId::random(&mut rng),
+                    info_hash: Some(ih),
+                    port: Some(6882),
+                    token: Some(token.clone()),
+                    implied_port: None,
+                    ..Default::default()
+                },
+            },
+        };
+        match node.handle_datagram(announcer, &encode(&ann), 5).unwrap() {
+            DatagramOutcome::Reply(_) => {}
+            _ => panic!("expected announce reply"),
+        }
+
+        // A querying node asks for peers of ih → gets the announcer back.
+        let q = KrpcMsg {
+            t: t2(10),
+            body: KrpcBody::Query {
+                q: "get_peers",
+                args: Args {
+                    id: NodeId::random(&mut rng),
+                    info_hash: Some(ih),
+                    ..Default::default()
+                },
+            },
+        };
+        let reply = match node
+            .handle_datagram(NetAddr::V4([10, 0, 0, 7], 7000), &encode(&q), 6)
+            .unwrap()
+        {
+            DatagramOutcome::Reply(b) => b,
+            _ => panic!("expected get_peers reply"),
+        };
+        let dec = decode(&reply).unwrap();
+        match dec.body {
+            KrpcBody::Response {
+                resp: Resp::GetPeers { values, .. },
+                ..
+            } => {
+                assert!(
+                    values.contains(&NetAddr::V4([10, 0, 0, 9], 6882)),
+                    "get_peers must return the announced peer, got {values:?}"
+                );
+            }
+            _ => panic!("expected get_peers response"),
+        }
+    }
+
+    #[test]
+    fn discovered_peers_survive_lookup_prune() {
+        let mut rng = Rng::from_seed([23u8; 32]);
+        let mut alice = Dht::new(NodeId::random(&mut rng), 6881, &mut rng);
+        let mut bob = Dht::new(NodeId::random(&mut rng), 6882, &mut rng);
+        let ih = [0x11u8; 20];
+        let bob_addr = NetAddr::V4([127, 0, 0, 1], 6882);
+        let alice_addr = NetAddr::V4([127, 0, 0, 1], 6881);
+        let seed_peer = NetAddr::V4([192, 168, 1, 50], 6883);
+
+        // bob learns alice (bootstrap ping).
+        alice.bootstrap(&[bob_addr], 1);
+        for (addr, payload) in alice.outgoing() {
+            if let Ok(DatagramOutcome::Reply(reply)) = bob.handle_datagram(addr, &payload, 1) {
+                alice.handle_datagram(alice_addr, &reply, 1).unwrap();
+            }
+        }
+        // alice stores a peer for ih (the seed announces to alice).
+        let token = alice.make_token(&seed_peer);
+        let ann = KrpcMsg {
+            t: t2(7),
+            body: KrpcBody::Query {
+                q: "announce_peer",
+                args: Args {
+                    id: NodeId::random(&mut rng),
+                    info_hash: Some(ih),
+                    port: Some(6883),
+                    token: Some(token),
+                    implied_port: None,
+                    ..Default::default()
+                },
+            },
+        };
+        alice.handle_datagram(seed_peer, &encode(&ann), 2).unwrap();
+
+        // bob starts a lookup and relays its queries to alice.
+        bob.get_peers(ih, 7777, 2);
+        bob.tick(3);
+        for (addr, payload) in bob.outgoing() {
+            if let Ok(DatagramOutcome::Reply(reply)) = alice.handle_datagram(addr, &payload, 3) {
+                bob.handle_datagram(addr, &reply, 3).unwrap();
+            }
+        }
+        assert!(
+            bob.discovered_peers(&ih).contains(&seed_peer),
+            "live lookup must surface the discovered peer"
+        );
+
+        // Let the lookup be pruned by timeout.
+        bob.tick(LOOKUP_TIMEOUT_MS + 10);
+        assert_eq!(bob.active_lookups(), 0, "lookup pruned by timeout");
+        // The peers survive in the persisted cache.
+        assert!(
+            bob.discovered_peers(&ih).contains(&seed_peer),
+            "discovered peers must survive lookup pruning"
+        );
     }
 }

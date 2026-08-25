@@ -10,10 +10,10 @@ use crate::error::{Error, Result};
 use crate::magnet::Magnet;
 use crate::metainfo::{InfoHash, Torrent};
 use crate::monitoring::DiscoverySource;
-use crate::platform::{ConnId, Host, NetAddr};
+use crate::platform::{ConnId, Host, LogLevel, NetAddr};
 use crate::portmap::{PortMapConfig, PortMapManager, PortMapPhase};
 use crate::ratelimit::TokenBucket;
-use crate::session::{FilePriority, SessionConfig, SessionCtx, TorrentSession};
+use crate::session::{FilePriority, SessionConfig, SessionCtx, TorrentSession, TrackerKind};
 use crate::socks::{ProxyConfig, Socks5Client, SocksStatus, SocksTarget};
 use crate::verify::VerifyPool;
 use crate::wire::Handshake;
@@ -78,6 +78,11 @@ impl Default for EngineConfig {
     }
 }
 
+/// How often the engine retries DHT bootstrap while the routing table is
+/// still empty (the construction-time seeds may have been sent before any
+/// network was up).
+const BOOTSTRAP_RETRY_MS: u64 = 30_000;
+
 /// The engine. Generic over the host.
 pub struct Engine<H: Host> {
     /// Host.
@@ -91,6 +96,12 @@ pub struct Engine<H: Host> {
     dht: Option<Dht>,
     events: Vec<EngineEvent>,
     udp_open: bool,
+    /// A UDP open attempt failed; DHT/UDP-trackers have been disabled.
+    udp_failed: bool,
+    /// Last time a (re-)bootstrap of the DHT was attempted (ms).
+    last_bootstrap_at: u64,
+    /// Whether the "no DHT router resolvable" notice was already emitted.
+    dht_no_seed_emitted: bool,
     /// Connections still establishing (outbound).
     connecting: Vec<ConnId>,
     /// Inbound connections whose handshake has not revealed an infohash.
@@ -211,6 +222,9 @@ impl<H: Host> Engine<H> {
             dht,
             events: Vec::new(),
             udp_open: false,
+            udp_failed: false,
+            last_bootstrap_at: now,
+            dht_no_seed_emitted: false,
             connecting: Vec::new(),
             inbound: BTreeMap::new(),
             socks: BTreeMap::new(),
@@ -278,7 +292,10 @@ impl<H: Host> Engine<H> {
     /// Start a torrent.
     pub fn start(&mut self, hash: &InfoHash) -> Result<()> {
         let now = self.host.now_ms();
-        self.ensure_udp(now)?;
+        // Open UDP only when it is actually needed (DHT / UDP trackers /
+        // port mapping). A failure here is non-fatal: the engine degrades
+        // to HTTP-tracker-only and the torrent still starts.
+        self.start_udp_if_needed(now);
         let mut ctx = SessionCtx {
             host: &mut self.host,
             cache: &mut self.cache,
@@ -586,9 +603,68 @@ impl<H: Host> Engine<H> {
         if !self.udp_open {
             self.host.udp_open(self.cfg.listen_port)?;
             self.udp_open = true;
-            let _ = now;
         }
+        let _ = now;
         Ok(())
+    }
+
+    /// Whether the engine currently needs a UDP socket: DHT enabled, port
+    /// mapping, or any live UDP tracker across the sessions. In proxy mode
+    /// the socket is never opened (outbound-only).
+    fn wants_udp(&self) -> bool {
+        if self.cfg.proxy.is_some() {
+            return false;
+        }
+        if self.cfg.dht_enabled || self.cfg.port_mapping {
+            return true;
+        }
+        self.sessions.values().any(|s| {
+            s.trackers
+                .iter()
+                .any(|t| t.kind == TrackerKind::Udp && t.fails < 3)
+        })
+    }
+
+    /// Open the UDP socket when it is actually needed. A failure here is
+    /// **not fatal** to torrents: the engine degrades to HTTP-tracker-only
+    /// operation (DHT and UDP trackers are disabled) and emits an
+    /// [`EngineEvent::Error`] so the host knows exactly why, instead of
+    /// surfacing a bare `-1`. Torrents with HTTP trackers keep working
+    /// without any UDP socket.
+    fn start_udp_if_needed(&mut self, now: u64) {
+        if self.cfg.proxy.is_some() || self.udp_open || self.udp_failed {
+            return;
+        }
+        if !self.wants_udp() {
+            return;
+        }
+        if self.ensure_udp(now).is_err() {
+            self.udp_failed = true;
+            // DHT and UDP trackers cannot work without the socket. Drop the
+            // DHT and park UDP trackers so the engine stays in a consistent,
+            // observable state; HTTP trackers and peer transport are
+            // unaffected.
+            self.dht = None;
+            self.cfg.dht_enabled = false;
+            for s in self.sessions.values_mut() {
+                for t in s.trackers.iter_mut() {
+                    if t.kind == TrackerKind::Udp {
+                        t.fails = t.fails.saturating_add(1).max(3);
+                        if t.failure.is_none() {
+                            t.failure = Some(String::from("udp unavailable"));
+                        }
+                    }
+                }
+            }
+            self.host.log(
+                LogLevel::Error,
+                "udp_open failed: DHT and UDP trackers disabled; HTTP trackers still work",
+            );
+            self.events.push(EngineEvent::Error {
+                code: 0,
+                detail: "udp_open_failed",
+            });
+        }
     }
 
     // ---------- main tick ----------
@@ -596,9 +672,9 @@ impl<H: Host> Engine<H> {
     /// Advance the whole engine. Call on a fixed cadence.
     pub fn tick(&mut self) -> Result<()> {
         let now = self.host.now_ms();
-        if (self.cfg.dht_enabled || self.cfg.port_mapping) && !self.udp_open {
-            self.ensure_udp(now)?;
-        }
+        // Open the UDP socket lazily (only when needed); a failure degrades
+        // the engine instead of failing the whole tick.
+        self.start_udp_if_needed(now);
         // Sweep dead connection bookkeeping: a peer dropped by its session
         // (timeout, ban, eviction, SOCKS failure…) must also leave
         // `conn_owner`/`socks`/`socks_target`, otherwise dead entries inflate
@@ -668,7 +744,43 @@ impl<H: Host> Engine<H> {
         if let Some(dht) = self.dht.as_mut() {
             dht.tick(now);
             for (addr, payload) in dht.outgoing() {
-                let _ = self.host.udp_send(&addr, &payload);
+                if let Err(e) = self.host.udp_send(&addr, &payload) {
+                    // Never fatal, but a dead UDP path must be visible in
+                    // the host log instead of failing silently.
+                    self.host.log(
+                        LogLevel::Debug,
+                        &alloc::format!("dht udp_send to {} failed: {}", addr, e),
+                    );
+                }
+            }
+            // Re-bootstrap on a cadence while the routing table is empty:
+            // the construction-time seeds may have failed (no connectivity
+            // yet, DNS temporarily down…). `bootstrap` is idempotent — it
+            // only pings and leaves an existing table untouched.
+            if dht.table().size() == 0
+                && now.saturating_sub(self.last_bootstrap_at) >= BOOTSTRAP_RETRY_MS
+            {
+                self.last_bootstrap_at = now;
+                let mut seeds: Vec<NetAddr> = Vec::new();
+                for (host, port) in crate::consts::DHT_BOOTSTRAP {
+                    if let Some(a) = self.host.resolve_host(host, *port) {
+                        seeds.push(a);
+                    }
+                }
+                if !seeds.is_empty() {
+                    dht.bootstrap(&seeds, now);
+                    self.dht_no_seed_emitted = false;
+                } else if !self.dht_no_seed_emitted {
+                    self.dht_no_seed_emitted = true;
+                    self.host.log(
+                        LogLevel::Warn,
+                        "DHT bootstrap: no router hostname resolvable",
+                    );
+                    self.events.push(EngineEvent::Error {
+                        code: 1,
+                        detail: "dht_no_seeds",
+                    });
+                }
             }
         }
         // 4) session logic
@@ -1297,7 +1409,12 @@ impl<H: Host> Engine<H> {
                             if let Ok(DatagramOutcome::Reply(reply)) =
                                 dht.handle_datagram(addr, payload, now)
                             {
-                                let _ = self.host.udp_send(&addr, &reply);
+                                if let Err(e) = self.host.udp_send(&addr, &reply) {
+                                    self.host.log(
+                                        LogLevel::Debug,
+                                        &alloc::format!("dht reply to {} failed: {}", addr, e),
+                                    );
+                                }
                             }
                         }
                     } else {
@@ -1439,9 +1556,187 @@ pub mod engine_events {
         },
         /// DHT node count changed.
         DhtNodeCount(usize),
+        /// A non-fatal engine-level failure that degraded operation (e.g.
+        /// the UDP socket could not be opened, so DHT and UDP trackers are
+        /// off). The engine keeps running — HTTP trackers and peer
+        /// transport still work — but the host should surface this to the
+        /// user instead of showing a silent `0 B/s`.
+        Error {
+            /// Stable machine-readable code: 0 = UDP open failed,
+            /// 1 = DHT bootstrap: no router resolvable.
+            code: u8,
+            /// Human-readable tag (e.g. `"udp_open_failed"`).
+            detail: &'static str,
+        },
     }
 }
 
 /// Marker so the module compiles cleanly when no sessions exist.
 #[allow(dead_code)]
 fn _assert_send<T: Send>(_: &T) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Sha1;
+    use crate::metainfo::Torrent;
+    use crate::platform::{ConnId, DiskId};
+    use alloc::string::String;
+
+    fn make_torrent() -> Torrent {
+        use crate::bencode::{bytes, dict, int};
+        let piece: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let sha1 = Sha1::digest(&piece);
+        let info = dict(vec![
+            (b"name", bytes("hello.bin")),
+            (b"piece length", int(16 * 1024)),
+            (b"length", int(piece.len() as i64)),
+            (b"pieces", bytes(sha1.to_vec())),
+        ]);
+        let data = crate::bencode::encode_to_vec(&dict(vec![(b"info", info)]));
+        Torrent::from_bytes(&data).expect("torrent")
+    }
+
+    /// A host whose UDP socket can never open but which can resolve the DHT
+    /// routers — exactly the FFI scenario reported: `udp_open` fails, but
+    /// DNS works. `start()` must degrade instead of failing the torrent.
+    struct UdpFailHost {
+        udp_open_calls: u32,
+    }
+
+    impl crate::platform::Host for UdpFailHost {
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+        fn fill_random(&mut self, b: &mut [u8]) {
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = (i as u8).wrapping_mul(7);
+            }
+        }
+        fn log(&mut self, _l: crate::platform::LogLevel, _m: &str) {}
+        fn http_get(
+            &mut self,
+            _u: &str,
+            _t: u64,
+            _o: &mut alloc::vec::Vec<u8>,
+        ) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn resolve_host(&self, host: &str, port: u16) -> Option<NetAddr> {
+            if crate::consts::DHT_BOOTSTRAP.iter().any(|(h, _)| *h == host) {
+                Some(NetAddr::V4([203, 0, 113, 1], port))
+            } else {
+                None
+            }
+        }
+        fn tcp_connect(&mut self, _a: &NetAddr) -> crate::error::Result<ConnId> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_connect_done(&mut self, _id: ConnId) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_send(&mut self, _id: ConnId, _d: &[u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_recv(&mut self, _id: ConnId, _b: &mut [u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn tcp_close(&mut self, _id: ConnId) {}
+        fn udp_open(&mut self, _p: u16) -> crate::error::Result<()> {
+            self.udp_open_calls += 1;
+            Err(crate::error::Error::Io)
+        }
+        fn udp_send(&mut self, _a: &NetAddr, _d: &[u8]) -> crate::error::Result<()> {
+            Err(crate::error::Error::Io)
+        }
+        fn udp_recv(&mut self, _b: &mut [u8]) -> crate::error::Result<(NetAddr, usize)> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn disk_open(&mut self, _p: &str) -> crate::error::Result<DiskId> {
+            Ok(1)
+        }
+        fn disk_read(
+            &mut self,
+            _id: DiskId,
+            _o: u64,
+            _b: &mut [u8],
+        ) -> crate::error::Result<usize> {
+            Ok(0)
+        }
+        fn disk_write(&mut self, _id: DiskId, _o: u64, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_prealloc(&mut self, _id: DiskId, _s: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_flush(&mut self, _id: DiskId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_close(&mut self, _id: DiskId) {}
+    }
+
+    #[test]
+    fn start_succeeds_when_udp_fails_and_emits_error_event() {
+        let host = UdpFailHost { udp_open_calls: 0 };
+        let cfg = EngineConfig {
+            dht_enabled: true,
+            cache_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let mut engine = Engine::new(host, cfg);
+        let t = make_torrent();
+        let hash = t.info_hash;
+        engine.add_torrent_obj(t, "/tmp").expect("add");
+
+        // Regression: `start()` used to fail hard (`Error::Io`) when the
+        // UDP socket could not be opened, so the frontend got a bare -1 and
+        // the torrent never started. It must degrade instead.
+        assert!(engine.start(&hash).is_ok(), "start must not fail on UDP");
+
+        // The DHT is disabled and the host is told exactly why.
+        assert!(
+            engine.dht().is_none(),
+            "DHT must be disabled after UDP failure"
+        );
+        let evs = engine.take_events();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::Error { code: 0, .. })),
+            "expected udp_open_failed event, got {evs:?}"
+        );
+
+        // The engine keeps ticking (HTTP trackers / peers still work).
+        assert!(engine.tick().is_ok());
+        // No repeated UDP-open attempts (degradation is sticky).
+        assert_eq!(engine.host.udp_open_calls, 1);
+    }
+
+    #[test]
+    fn http_only_start_never_touches_udp() {
+        let host = UdpFailHost { udp_open_calls: 0 };
+        let cfg = EngineConfig {
+            dht_enabled: false,
+            port_mapping: false,
+            cache_bytes: 1024 * 1024,
+            session: SessionConfig {
+                save_dir: String::from("/tmp"),
+                use_default_trackers: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut engine = Engine::new(host, cfg);
+        let t = make_torrent();
+        let hash = t.info_hash;
+        engine.add_torrent_obj(t, "/tmp").expect("add");
+
+        // No DHT, no UDP trackers, no port mapping → UDP must never be
+        // opened at all; the HTTP-only torrent starts cleanly.
+        assert!(engine.start(&hash).is_ok());
+        assert_eq!(
+            engine.host.udp_open_calls, 0,
+            "UDP must not be opened for an HTTP-only torrent"
+        );
+        assert!(engine.tick().is_ok());
+    }
+}

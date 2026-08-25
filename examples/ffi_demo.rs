@@ -37,11 +37,13 @@ struct HostCbs {
     disk_prealloc: extern "C" fn(*mut c_void, u32, u64) -> c_int,
     disk_flush: extern "C" fn(*mut c_void, u32) -> c_int,
     disk_close: extern "C" fn(*mut c_void, u32),
+    resolve_host: extern "C" fn(*mut c_void, *const c_char, u16, *mut u8, *mut u16) -> c_int,
 }
 
 const FFI_OK: c_int = 0;
 const FFI_ERR: c_int = -1;
 const FFI_WOULD_BLOCK: c_int = -2;
+const FFI_NOT_FOUND: c_int = -3;
 
 // ---------------------------------------------------------------------------
 // 2. The C entry points (re-declared so a foreign host knows the shape).
@@ -81,6 +83,8 @@ extern "C" {
 
 struct HostState {
     now: u64,
+    /// Open file handles (DiskId = index into this vec).
+    files: Vec<Option<std::fs::File>>,
 }
 
 extern "C" fn cb_now_ms(ctx: *mut c_void) -> u64 {
@@ -181,40 +185,140 @@ extern "C" fn cb_udp_recv(
     FFI_WOULD_BLOCK
 }
 
-extern "C" fn cb_disk_open(_ctx: *mut c_void, _path: *const c_char) -> c_int {
-    FFI_ERR
+extern "C" fn cb_disk_open(ctx: *mut c_void, path: *const c_char) -> c_int {
+    unsafe {
+        let state = &mut *(ctx as *mut HostState);
+        let p = std::ffi::CStr::from_ptr(path).to_string_lossy();
+        // The engine passes a relative path under save_dir; resolve it under
+        // the system temp dir so the demo actually persists bytes.
+        let dir = std::env::temp_dir().join("typebit-ffi-demo");
+        let _ = std::fs::create_dir_all(&dir);
+        let full = dir.join(p.trim_start_matches(['/', '\\'])); // Ensure the file's parent directories exist (the engine hands us
+                                                                // the raw save_dir-relative path; real hosts manage their own FS).
+        if let Some(parent) = full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&full)
+        {
+            Ok(f) => {
+                state.files.push(Some(f));
+                (state.files.len() - 1) as c_int
+            }
+            Err(_) => FFI_ERR,
+        }
+    }
 }
 
 extern "C" fn cb_disk_read(
-    _ctx: *mut c_void,
-    _id: u32,
-    _off: u64,
-    _buf: *mut u8,
-    _len: usize,
-    _n: *mut usize,
+    ctx: *mut c_void,
+    id: u32,
+    off: u64,
+    buf: *mut u8,
+    len: usize,
+    n: *mut usize,
 ) -> c_int {
-    FFI_ERR
+    unsafe {
+        let state = &mut *(ctx as *mut HostState);
+        let file = match state.files.get_mut(id as usize).and_then(|f| f.as_mut()) {
+            Some(f) => f,
+            None => return FFI_ERR,
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        if file.seek(SeekFrom::Start(off)).is_err() {
+            return FFI_ERR;
+        }
+        let slice = std::slice::from_raw_parts_mut(buf, len);
+        match file.read(slice) {
+            Ok(got) => {
+                *n = got;
+                FFI_OK
+            }
+            Err(_) => FFI_ERR,
+        }
+    }
 }
 
 extern "C" fn cb_disk_write(
-    _ctx: *mut c_void,
-    _id: u32,
-    _off: u64,
-    _d: *const u8,
-    _len: usize,
+    ctx: *mut c_void,
+    id: u32,
+    off: u64,
+    d: *const u8,
+    len: usize,
 ) -> c_int {
-    FFI_ERR
+    unsafe {
+        let state = &mut *(ctx as *mut HostState);
+        let file = match state.files.get_mut(id as usize).and_then(|f| f.as_mut()) {
+            Some(f) => f,
+            None => return FFI_ERR,
+        };
+        use std::io::{Seek, SeekFrom, Write};
+        if file.seek(SeekFrom::Start(off)).is_err() {
+            return FFI_ERR;
+        }
+        let slice = std::slice::from_raw_parts(d, len);
+        match file.write_all(slice) {
+            Ok(()) => FFI_OK,
+            Err(_) => FFI_ERR,
+        }
+    }
 }
 
-extern "C" fn cb_disk_prealloc(_ctx: *mut c_void, _id: u32, _size: u64) -> c_int {
-    FFI_ERR
+extern "C" fn cb_disk_prealloc(ctx: *mut c_void, id: u32, size: u64) -> c_int {
+    unsafe {
+        let state = &mut *(ctx as *mut HostState);
+        let file = match state.files.get_mut(id as usize).and_then(|f| f.as_mut()) {
+            Some(f) => f,
+            None => return FFI_ERR,
+        };
+        if file.set_len(size).is_ok() {
+            FFI_OK
+        } else {
+            FFI_ERR
+        }
+    }
 }
 
-extern "C" fn cb_disk_flush(_ctx: *mut c_void, _id: u32) -> c_int {
-    FFI_ERR
+extern "C" fn cb_disk_flush(ctx: *mut c_void, id: u32) -> c_int {
+    unsafe {
+        let state = &mut *(ctx as *mut HostState);
+        match state.files.get_mut(id as usize).and_then(|f| f.as_mut()) {
+            Some(f) => {
+                if f.sync_all().is_ok() {
+                    FFI_OK
+                } else {
+                    FFI_ERR
+                }
+            }
+            None => FFI_ERR,
+        }
+    }
 }
 
-extern "C" fn cb_disk_close(_ctx: *mut c_void, _id: u32) {}
+extern "C" fn cb_disk_close(ctx: *mut c_void, id: u32) {
+    unsafe {
+        let state = &mut *(ctx as *mut HostState);
+        if let Some(slot) = state.files.get_mut(id as usize) {
+            *slot = None;
+        }
+    }
+}
+
+extern "C" fn cb_resolve_host(
+    _ctx: *mut c_void,
+    _host: *const c_char,
+    _port: u16,
+    _out_ip: *mut u8,
+    _out_port: *mut u16,
+) -> c_int {
+    // This demo host has no DNS; a real host (Kotlin/Swift/C#) resolves the
+    // name here and returns FFI_OK with the IPv4 in `out_ip`.
+    FFI_NOT_FOUND
+}
 
 // ---------------------------------------------------------------------------
 // 4. Demo driver.
@@ -224,6 +328,7 @@ fn main() {
     // Host state the callbacks read (the `ctx` pointer).
     let mut state = HostState {
         now: 1_700_000_000_000,
+        files: Vec::new(),
     };
     let state_ptr = &mut state as *mut HostState as *mut c_void;
 
@@ -247,6 +352,7 @@ fn main() {
         disk_prealloc: cb_disk_prealloc,
         disk_flush: cb_disk_flush,
         disk_close: cb_disk_close,
+        resolve_host: cb_resolve_host,
     };
 
     // --- create engine -------------------------------------------------
@@ -331,6 +437,12 @@ fn describe_event(b: &[u8]) {
             println!("event: tracker announced peers={peers}");
         }
         8 => println!("event: dht node count"),
+        11 => {
+            let code = b.get(1).copied().unwrap_or(0);
+            let raw = String::from_utf8_lossy(&b[2..]);
+            let detail = raw.trim_end_matches('\0');
+            println!("event: engine error code={code} detail={detail}");
+        }
         other => println!("event: unknown kind={other}"),
     }
 }

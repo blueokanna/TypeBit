@@ -16,6 +16,11 @@ pub trait Host {
     fn http_get(&mut self, url: &str, timeout_ms: u64, out: &mut Vec<u8>)
         -> Result<()>;
 
+    // DNS: resolve a hostname for the DHT bootstrap routers (BEP-5).
+    // Optional — returning None disables DHT bootstrap (HTTP/UDP trackers
+    // still work). The FFI `HostCbs.resolve_host` is the C twin of this.
+    fn resolve_host(&self, host: &str, port: u16) -> Option<NetAddr>;
+
     // TCP (non-blocking)
     fn tcp_connect(&mut self, addr: &NetAddr) -> Result<ConnId>;
     fn tcp_connect_done(&mut self, id: ConnId) -> Result<()>;  // Ok=established
@@ -47,6 +52,13 @@ pub trait Host {
 - `http_get` may block up to `timeout_ms`; the engine uses it for trackers
   and web seeds.
 - Disk offsets are absolute within one file (per-file handles).
+- **UDP is optional, never fatal.** The engine opens the UDP socket lazily
+  and only when something needs it (DHT enabled, a UDP tracker, or port
+  mapping). If `udp_open` fails, `start()` still succeeds: DHT and UDP
+  trackers are disabled, an `EngineEvent::Error { code: 0 }` is emitted,
+  and HTTP trackers + peer transport keep working. To actually get DHT
+  working, implement `resolve_host` and real `udp_open`/`udp_send`/
+  `udp_recv`.
 
 ## A real (std) host in ~60 lines
 

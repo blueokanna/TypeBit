@@ -29,6 +29,12 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// How often a session re-issues its DHT `get_peers` lookup while running.
+/// `get_peers` is idempotent (it never duplicates an active lookup), so a
+/// lookup pruned early — e.g. started before the bootstrap populated the
+/// routing table — is re-created here once the DHT has something to ask.
+const DHT_ANNOUNCE_INTERVAL_MS: u64 = 60_000;
+
 /// Per-file download priority (selective download).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePriority {
@@ -333,6 +339,8 @@ pub struct TorrentSession {
     pub connect_queue: Vec<(NetAddr, DiscoverySource)>,
     /// DHT lookup started.
     dht_started: bool,
+    /// Last time a DHT `get_peers` lookup was issued (ms).
+    last_dht_announce: u64,
     /// Last PEX broadcast.
     last_pex_at: u64,
     /// Peers known for PEX.
@@ -457,6 +465,7 @@ impl TorrentSession {
             endgame: false,
             connect_queue: Vec::new(),
             dht_started: false,
+            last_dht_announce: 0,
             last_pex_at: 0,
             pex_known: Vec::new(),
             metadata: None,
@@ -525,6 +534,7 @@ impl TorrentSession {
             endgame: false,
             connect_queue: Vec::new(),
             dht_started: false,
+            last_dht_announce: 0,
             last_pex_at: 0,
             pex_known: Vec::new(),
             metadata: Some(MetadataFetch {
@@ -574,6 +584,7 @@ impl TorrentSession {
         if let Some(dht) = ctx.dht.as_mut() {
             dht.get_peers(self.tracker_hash, ctx.port, ctx.now);
             self.dht_started = true;
+            self.last_dht_announce = ctx.now;
         }
         Ok(())
     }
@@ -859,6 +870,17 @@ impl TorrentSession {
         // DHT lookup / peer pull
         if self.dht_started {
             if let Some(dht) = ctx.dht.as_mut() {
+                // Re-issue the lookup on a cadence. `get_peers` never
+                // duplicates an active lookup, so this is cheap while one is
+                // running; but a lookup that was pruned (timeout, or started
+                // before the bootstrap populated the table) is re-created
+                // here — otherwise a later-successful bootstrap would never
+                // be asked for this torrent again and the downloader would
+                // stay at 0 peers forever.
+                if ctx.now.saturating_sub(self.last_dht_announce) >= DHT_ANNOUNCE_INTERVAL_MS {
+                    self.last_dht_announce = ctx.now;
+                    dht.get_peers(self.tracker_hash, ctx.port, ctx.now);
+                }
                 let peers = dht.discovered_peers(&self.tracker_hash);
                 for p in peers {
                     self.enqueue_peer(p, DiscoverySource::Dht, ctx.now);
@@ -2199,8 +2221,16 @@ impl TorrentSession {
                             st.udp.tid = rand_u32(ctx.now);
                             st.udp.sent_at = ctx.now;
                             let req = tracker::udp::build_connect_request(st.udp.tid);
-                            let _ = ctx.host.udp_send(&a, &req);
-                            st.udp.phase = UdpPhase::ConnectSent;
+                            if ctx.host.udp_send(&a, &req).is_err() {
+                                // A send failure must be visible, not silent:
+                                // park this tracker so the announce loop moves
+                                // on to the next one instead of wedging here.
+                                st.fails = st.fails.saturating_add(1);
+                                st.failure = Some(String::from("udp send failed"));
+                                st.udp.phase = UdpPhase::Idle;
+                            } else {
+                                st.udp.phase = UdpPhase::ConnectSent;
+                            }
                         }
                     }
                     self.tracker_cursor = (idx + 1) % total;
@@ -2277,7 +2307,15 @@ impl TorrentSession {
                             };
                             let req = tracker::udp::build_announce_request(conn_id, st.udp.tid, &p);
                             if let Some(a) = st.udp.addr {
-                                let _ = ctx.host.udp_send(&a, &req);
+                                if ctx.host.udp_send(&a, &req).is_err() {
+                                    // Send failed: reset the handshake so the
+                                    // next announce retries, and record the
+                                    // failure instead of silently hanging in
+                                    // AnnounceSent.
+                                    st.udp.phase = UdpPhase::Idle;
+                                    st.fails = st.fails.saturating_add(1);
+                                    st.failure = Some(String::from("udp send failed"));
+                                }
                             }
                             self.announce_at = ctx.now + 15_000;
                             handled = true;

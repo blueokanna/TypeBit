@@ -23,6 +23,7 @@ use crate as typebit_core;
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_void};
@@ -35,6 +36,11 @@ use typebit_core::EngineEvent;
 /// Opaque engine handle.
 pub struct TypeBitEngine {
     engine: CoreEngine<HostBridge>,
+    /// Engine events already drained from the core but not yet handed to the
+    /// host. `typebit_engine_take_event` returns **one** event per call, so
+    /// without this buffer every call would discard all events except the
+    /// first. The queue keeps them until the host consumes each one.
+    pending_events: VecDeque<EngineEvent>,
 }
 
 // ---------- host bridge ----------
@@ -62,6 +68,14 @@ pub struct HostCbs {
     pub disk_prealloc: extern "C" fn(*mut c_void, u32, u64) -> c_int,
     pub disk_flush: extern "C" fn(*mut c_void, u32) -> c_int,
     pub disk_close: extern "C" fn(*mut c_void, u32),
+    /// Resolve a hostname to an IPv4 endpoint (used for the DHT bootstrap
+    /// routers, BEP-5). `host` is NUL-terminated. On success fill `out_ip`
+    /// (4 bytes, network order) and `*out_port`, then return `FFI_OK`;
+    /// return `FFI_NOT_FOUND` (or `FFI_ERR`) when the name cannot be
+    /// resolved. May be a null function pointer — the engine then treats
+    /// every hostname as unresolvable and the DHT stays dormant (HTTP and
+    /// UDP trackers are unaffected).
+    pub resolve_host: extern "C" fn(*mut c_void, *const c_char, u16, *mut u8, *mut u16) -> c_int,
 }
 
 /// Error codes returned across the FFI boundary.
@@ -173,8 +187,14 @@ impl Host for HostBridge {
                 &mut n,
             )
         };
-        let _ = rc;
-        Ok(n)
+        // The callback's return code is the authoritative error signal: a
+        // failed send must not be reported as a success of 0 bytes (which
+        // the engine would interpret as "connection closed").
+        match rc {
+            FFI_OK => Ok(n),
+            FFI_WOULD_BLOCK => Err(CoreError::WouldBlock),
+            _ => Err(CoreError::Io),
+        }
     }
     fn tcp_recv(&mut self, id: ConnId, buf: &mut [u8]) -> typebit_core::Result<usize> {
         let mut n = 0usize;
@@ -204,6 +224,33 @@ impl Host for HostBridge {
         } else {
             Ok(())
         }
+    }
+    fn resolve_host(&self, host: &str, port: u16) -> Option<NetAddr> {
+        let cbs = unsafe { self.cbs.as_ref()? };
+        let cb = cbs.resolve_host;
+        // The resolver is an optional capability: a host that did not
+        // install one (null pointer) simply cannot resolve any hostname.
+        if (cb as usize) == 0 {
+            return None;
+        }
+        let mut buf = Vec::with_capacity(host.len() + 1);
+        buf.extend_from_slice(host.as_bytes());
+        buf.push(0);
+        let mut ip = [0u8; 4];
+        let mut out_port = 0u16;
+        // `cb` is a safe `extern "C" fn`; only the raw-pointer deref above
+        // needs an unsafe block.
+        let rc = cb(
+            cbs.ctx,
+            buf.as_ptr() as *const c_char,
+            port,
+            ip.as_mut_ptr(),
+            &mut out_port,
+        );
+        if rc != FFI_OK {
+            return None;
+        }
+        Some(NetAddr::V4(ip, out_port))
     }
     fn udp_send(&mut self, addr: &NetAddr, data: &[u8]) -> typebit_core::Result<()> {
         let (ip, port) = match addr {
@@ -278,8 +325,11 @@ impl Host for HostBridge {
                 &mut n,
             )
         };
-        let _ = rc;
-        Ok(n)
+        match rc {
+            FFI_OK => Ok(n),
+            FFI_WOULD_BLOCK => Err(CoreError::WouldBlock),
+            _ => Err(CoreError::Io),
+        }
     }
     fn disk_write(&mut self, id: DiskId, offset: u64, data: &[u8]) -> typebit_core::Result<()> {
         let rc = unsafe {
@@ -343,7 +393,10 @@ pub unsafe extern "C" fn typebit_engine_new(
     };
     let bridge = HostBridge { cbs };
     let engine = CoreEngine::new(bridge, cfg);
-    Box::into_raw(Box::new(TypeBitEngine { engine }))
+    Box::into_raw(Box::new(TypeBitEngine {
+        engine,
+        pending_events: VecDeque::new(),
+    }))
 }
 
 /// Destroy an engine.
@@ -518,8 +571,14 @@ pub unsafe extern "C" fn typebit_engine_take_event(
     if e.is_null() || out.is_null() {
         return FFI_INVALID;
     }
-    let engine = &mut (*e).engine;
-    let ev = match engine.take_events().into_iter().next() {
+    let wrapper = &mut *e;
+    // Drain the core's event list into our pending queue only when it is
+    // empty, then pop exactly one event. Events are never dropped: a caller
+    // that drains one event per call sees every event, in order.
+    if wrapper.pending_events.is_empty() {
+        wrapper.pending_events.extend(wrapper.engine.take_events());
+    }
+    let ev = match wrapper.pending_events.pop_front() {
         Some(ev) => ev,
         None => return 0,
     };
@@ -597,6 +656,12 @@ pub unsafe extern "C" fn typebit_engine_take_event(
             let ext = external_port.unwrap_or(0);
             buf.extend_from_slice(&ext.to_be_bytes());
         }
+        EngineEvent::Error { code, detail } => {
+            buf.push(11);
+            buf.push(code);
+            buf.extend_from_slice(detail.as_bytes());
+            buf.push(0);
+        }
     }
     let n = core::cmp::min(buf.len(), out_cap);
     core::ptr::copy_nonoverlapping(buf.as_ptr(), out, n);
@@ -637,3 +702,224 @@ fn bytes_to_hash(p: *const u8, len: usize) -> Option<typebit_core::InfoHash> {
 
 // Re-exports so bindgen/headers can find types.
 pub use typebit_core::Engine;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Ctx {
+        now: u64,
+        resolved: Option<(String, u16)>,
+    }
+
+    extern "C" fn cb_now(ctx: *mut c_void) -> u64 {
+        unsafe { (*(ctx as *mut Ctx)).now }
+    }
+    extern "C" fn cb_rand(_: *mut c_void, buf: *mut u8, len: usize) {
+        unsafe {
+            for i in 0..len {
+                *buf.add(i) = (i as u8).wrapping_mul(13).wrapping_add(1);
+            }
+        }
+    }
+    extern "C" fn cb_log(_: *mut c_void, _l: c_int, _m: *const c_char) {}
+    extern "C" fn cb_http(
+        _: *mut c_void,
+        _u: *const c_char,
+        _t: u64,
+        _o: *mut u8,
+        _c: usize,
+        _n: *mut usize,
+    ) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_tcp_connect(_: *mut c_void, _ip: *const u8, _p: u16, _id: *mut u32) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_tcp_connect_done(_: *mut c_void, _id: u32) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_tcp_send(
+        _: *mut c_void,
+        _id: u32,
+        _d: *const u8,
+        _l: usize,
+        _n: *mut usize,
+    ) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_tcp_recv(
+        _: *mut c_void,
+        _id: u32,
+        _b: *mut u8,
+        _l: usize,
+        _n: *mut usize,
+    ) -> c_int {
+        FFI_WOULD_BLOCK
+    }
+    extern "C" fn cb_tcp_close(_: *mut c_void, _id: u32) {}
+    extern "C" fn cb_udp_open(_: *mut c_void, _p: u16) -> c_int {
+        FFI_OK
+    }
+    extern "C" fn cb_udp_send(
+        _: *mut c_void,
+        _ip: *const u8,
+        _p: u16,
+        _d: *const u8,
+        _l: usize,
+    ) -> c_int {
+        FFI_OK
+    }
+    extern "C" fn cb_udp_recv(
+        _: *mut c_void,
+        _b: *mut u8,
+        _l: usize,
+        _ip: *mut u8,
+        _p: *mut u16,
+        _n: *mut usize,
+    ) -> c_int {
+        FFI_WOULD_BLOCK
+    }
+    extern "C" fn cb_disk_open(_: *mut c_void, _p: *const c_char) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_disk_read(
+        _: *mut c_void,
+        _id: u32,
+        _o: u64,
+        _b: *mut u8,
+        _l: usize,
+        _n: *mut usize,
+    ) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_disk_write(
+        _: *mut c_void,
+        _id: u32,
+        _o: u64,
+        _d: *const u8,
+        _l: usize,
+    ) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_disk_prealloc(_: *mut c_void, _id: u32, _s: u64) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_disk_flush(_: *mut c_void, _id: u32) -> c_int {
+        FFI_ERR
+    }
+    extern "C" fn cb_disk_close(_: *mut c_void, _id: u32) {}
+    extern "C" fn cb_resolve_host(
+        ctx: *mut c_void,
+        host: *const c_char,
+        port: u16,
+        out_ip: *mut u8,
+        out_port: *mut u16,
+    ) -> c_int {
+        unsafe {
+            let h = core::ffi::CStr::from_ptr(host)
+                .to_string_lossy()
+                .into_owned();
+            let c = &mut *(ctx as *mut Ctx);
+            c.resolved = Some((h, port));
+            // "203.0.113.7"
+            *out_ip.add(0) = 203;
+            *out_ip.add(1) = 0;
+            *out_ip.add(2) = 113;
+            *out_ip.add(3) = 7;
+            *out_port = port;
+            FFI_OK
+        }
+    }
+
+    fn make_cbs(ctx: *mut c_void) -> HostCbs {
+        HostCbs {
+            ctx,
+            now_ms: cb_now,
+            fill_random: cb_rand,
+            log: cb_log,
+            http_get: cb_http,
+            tcp_connect: cb_tcp_connect,
+            tcp_connect_done: cb_tcp_connect_done,
+            tcp_send: cb_tcp_send,
+            tcp_recv: cb_tcp_recv,
+            tcp_close: cb_tcp_close,
+            udp_open: cb_udp_open,
+            udp_send: cb_udp_send,
+            udp_recv: cb_udp_recv,
+            disk_open: cb_disk_open,
+            disk_read: cb_disk_read,
+            disk_write: cb_disk_write,
+            disk_prealloc: cb_disk_prealloc,
+            disk_flush: cb_disk_flush,
+            disk_close: cb_disk_close,
+            resolve_host: cb_resolve_host,
+        }
+    }
+
+    #[test]
+    fn host_bridge_resolves_hostname() {
+        let mut ctx = Ctx {
+            now: 0,
+            resolved: None,
+        };
+        let cbs = make_cbs(&mut ctx as *mut Ctx as *mut c_void);
+        let bridge = HostBridge { cbs: &cbs };
+        let got = bridge.resolve_host("router.bittorrent.com", 6881);
+        assert_eq!(got, Some(NetAddr::V4([203, 0, 113, 7], 6881)));
+        assert_eq!(
+            ctx.resolved,
+            Some((String::from("router.bittorrent.com"), 6881))
+        );
+    }
+
+    #[test]
+    #[allow(invalid_value, clippy::transmute_null_to_fn)] // intentionally building a null fn pointer
+    fn host_bridge_resolve_host_null_returns_none() {
+        let mut ctx = Ctx {
+            now: 0,
+            resolved: None,
+        };
+        let mut cbs = make_cbs(&mut ctx as *mut Ctx as *mut c_void);
+        // A host that did not install a resolver (null fn pointer).
+        type Resolve = extern "C" fn(*mut c_void, *const c_char, u16, *mut u8, *mut u16) -> c_int;
+        cbs.resolve_host = unsafe { core::mem::transmute::<usize, Resolve>(0usize) };
+        let bridge = HostBridge { cbs: &cbs };
+        assert_eq!(bridge.resolve_host("router.bittorrent.com", 6881), None);
+    }
+
+    #[test]
+    fn take_event_does_not_drop_events() {
+        let mut ctx = Ctx {
+            now: 1_000_000,
+            resolved: None,
+        };
+        let cbs = make_cbs(&mut ctx as *mut Ctx as *mut c_void);
+        let engine = unsafe { typebit_engine_new(&cbs, 6881, 1024 * 1024, 1) };
+        assert!(!engine.is_null(), "engine_new failed");
+
+        // Three ticks produce three queued DHT node-count events.
+        for _ in 0..3 {
+            unsafe {
+                typebit_engine_tick(engine);
+            }
+        }
+
+        let mut buf = [0u8; 128];
+        // Regression: `take_events().into_iter().next()` used to drop every
+        // event except the first, so the second and third calls returned 0.
+        let n1 = unsafe { typebit_engine_take_event(engine, buf.as_mut_ptr(), buf.len()) };
+        assert!(n1 > 0, "first event lost");
+        assert_eq!(buf[0], 8, "first event must be DhtNodeCount");
+        let n2 = unsafe { typebit_engine_take_event(engine, buf.as_mut_ptr(), buf.len()) };
+        assert!(n2 > 0, "second event dropped by the queue bug");
+        assert_eq!(buf[0], 8);
+        let n3 = unsafe { typebit_engine_take_event(engine, buf.as_mut_ptr(), buf.len()) };
+        assert!(n3 > 0, "third event dropped by the queue bug");
+        assert_eq!(buf[0], 8);
+        let n4 = unsafe { typebit_engine_take_event(engine, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n4, 0, "queue must be drained after all events");
+
+        unsafe { typebit_engine_free(engine) };
+    }
+}
