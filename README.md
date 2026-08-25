@@ -146,6 +146,4 @@ src/
 
 ## License
 
-PolyForm Perimeter License 1.0.0
-
-<https://polyformproject.org/licenses/perimeter/1.0.0>
+[PolyForm Perimeter License 1.0.0](https://polyformproject.org/licenses/perimeter/1.0.0)
