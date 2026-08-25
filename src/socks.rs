@@ -362,10 +362,44 @@ pub fn socks_http_get<H: Host>(
     timeout_ms: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    socks_http_get_impl(host, cfg, url, None, timeout_ms, out)
+}
+
+/// Perform a blocking HTTP GET with a `Range: bytes=start-end` header
+/// *through* the SOCKS5 proxy. Used by web seeds (BEP-19) so piece data is
+/// never fetched from the real IP in proxy mode. The response body must be
+/// exactly `end - start + 1` bytes, otherwise `Err(Protocol)`.
+pub fn socks_http_get_range<H: Host>(
+    host: &mut H,
+    cfg: &ProxyConfig,
+    url: &str,
+    range_start: u64,
+    range_end: u64,
+    timeout_ms: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    socks_http_get_impl(
+        host,
+        cfg,
+        url,
+        Some((range_start, range_end)),
+        timeout_ms,
+        out,
+    )
+}
+
+fn socks_http_get_impl<H: Host>(
+    host: &mut H,
+    cfg: &ProxyConfig,
+    url: &str,
+    range: Option<(u64, u64)>,
+    timeout_ms: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let deadline = host.now_ms().saturating_add(timeout_ms);
     let parts = parse_http_url(url)?;
     let conn = host.tcp_connect(&cfg.socks5)?;
-    let result = run_http_get(host, conn, cfg, &parts, deadline, out);
+    let result = run_http_get(host, conn, cfg, &parts, range, deadline, out);
     host.tcp_close(conn);
     result
 }
@@ -383,6 +417,7 @@ fn run_http_get<H: Host>(
     conn: ConnId,
     cfg: &ProxyConfig,
     url: &HttpUrl,
+    range: Option<(u64, u64)>,
     deadline: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
@@ -415,7 +450,7 @@ fn run_http_get<H: Host>(
             Err(e) => return Err(e),
         }
     }
-    let req = build_http_get(&url.host, &url.path);
+    let req = build_http_get(&url.host, &url.path, range);
     let mut off = 0usize;
     while off < req.len() {
         if host.now_ms() > deadline {
@@ -445,7 +480,16 @@ fn run_http_get<H: Host>(
             Err(e) => return Err(e),
         }
     }
-    parse_http_body(&resp, out)
+    parse_http_body(&resp, out)?;
+    if let Some((start, end)) = range {
+        // A web seed MUST honor the range; a mismatched body would corrupt
+        // the piece, so refuse it instead of accepting wrong data.
+        let want = end.saturating_sub(start).saturating_add(1) as usize;
+        if out.len() != want {
+            return Err(Error::Protocol);
+        }
+    }
+    Ok(())
 }
 
 /// Split `http://host[:port]/path` into a parsed [`HttpUrl`].
@@ -481,16 +525,41 @@ fn parse_http_url(url: &str) -> Result<HttpUrl> {
     })
 }
 
-fn build_http_get(host: &[u8], path: &[u8]) -> Vec<u8> {
-    let mut req = Vec::with_capacity(64 + host.len() + path.len());
+fn build_http_get(host: &[u8], path: &[u8], range: Option<(u64, u64)>) -> Vec<u8> {
+    let mut req = Vec::with_capacity(96 + host.len() + path.len());
     req.extend_from_slice(b"GET ");
     req.extend_from_slice(path);
     req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
     req.extend_from_slice(host);
+    if let Some((start, end)) = range {
+        req.extend_from_slice(b"\r\nRange: bytes=");
+        push_u64(&mut req, start);
+        req.push(b'-');
+        push_u64(&mut req, end);
+    }
     req.extend_from_slice(
         b"\r\nUser-Agent: TypeBit/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n",
     );
     req
+}
+
+/// Append a u64 in decimal (no allocation, no `core` formatting dependency).
+fn push_u64(out: &mut Vec<u8>, mut v: u64) {
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while v > 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        out.push(tmp[i]);
+    }
 }
 
 /// Parse an HTTP/1.x response: status check (2xx), Content-Length or

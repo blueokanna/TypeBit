@@ -121,4 +121,4 @@ src/
 
 ## 许可
 
-AGPL-3.0-or-later
+PolyForm Perimeter License 1.0.0

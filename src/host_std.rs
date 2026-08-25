@@ -70,6 +70,42 @@ impl Host for StdHost {
         Ok(())
     }
 
+    fn http_get_range(
+        &mut self,
+        url: &str,
+        range_start: u64,
+        range_end: u64,
+        _timeout_ms: u64,
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> crate::Result<()> {
+        use courierust::courierust_body::Body;
+        use courierust::courierust_http::header::{HeaderName, HeaderValue};
+        use courierust::courierust_http::method::Method;
+        use courierust::courierust_http::request::Request;
+        // Web seeds (BEP-19): fetch one byte window via Range.
+        let mut req = Request::<Body>::new(Method::GET, "/");
+        let value = format!("bytes={}-{}", range_start, range_end);
+        req.headers.insert(
+            HeaderName::from_lowercase("range"),
+            HeaderValue::from_bytes(value.as_bytes()).map_err(|_| crate::Error::InvalidInput)?,
+        );
+        let resp = self.http.execute(url, req).map_err(|_| crate::Error::Io)?;
+        // 206 Partial Content for a fulfilled range; 200 if the server
+        // ignored the Range header (we still require the exact window).
+        let status = resp.status.as_u16();
+        if status != 200 && status != 206 {
+            return Err(crate::Error::Tracker);
+        }
+        let body = resp.body.collect().map_err(|_| crate::Error::Io)?;
+        // A web seed MUST honor the range (BEP-19). A body that does not
+        // match the requested window would corrupt the piece — refuse it.
+        if body.len() as u64 != range_end.saturating_sub(range_start) + 1 {
+            return Err(crate::Error::Protocol);
+        }
+        out.extend_from_slice(&body);
+        Ok(())
+    }
+
     fn tcp_connect(&mut self, _addr: &NetAddr) -> crate::Result<ConnId> {
         Err(crate::Error::NotSupported)
     }

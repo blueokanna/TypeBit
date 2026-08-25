@@ -225,6 +225,23 @@ pub trait Host {
         Err(Error::NotSupported)
     }
 
+    /// Perform a blocking HTTP GET with a `Range: bytes=start-end` header
+    /// and append the response body to `out`. Used by web seeds (BEP-19)
+    /// to fetch arbitrary byte ranges of a file. A host that cannot send
+    /// request headers leaves the default: [`Error::NotSupported`] (web
+    /// seeds are then disabled for that host). The body MUST be exactly
+    /// `end - start + 1` bytes; anything else is rejected by the engine.
+    fn http_get_range(
+        &mut self,
+        _url: &str,
+        _range_start: u64,
+        _range_end: u64,
+        _timeout_ms: u64,
+        _out: &mut alloc::vec::Vec<u8>,
+    ) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
     // ---------- network info (UPnP / NAT-PMP port mapping) ----------
 
     /// The default gateway address, when the platform can discover it.

@@ -7,8 +7,6 @@
 #![cfg_attr(not(feature = "ffi"), deny(unsafe_code))]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
-// Indexed loops in crypto / bit-twiddling hot paths read clearer (SHA,
-// Ed25519, bitfields) and match the reference implementations.
 #![allow(clippy::needless_range_loop)]
 
 #[macro_use]
@@ -40,6 +38,7 @@ pub mod socks;
 pub mod state;
 pub mod swarm;
 pub mod tracker;
+pub mod trackerlist;
 pub mod verify;
 pub mod wire;
 
@@ -79,25 +78,7 @@ pub mod consts {
     ];
     /// Source for the community tracker list (qBittorrent/BitComet
     /// compatible; the host refreshes it at runtime via `http_get`).
-    pub const TRACKERS_LIST_URL: &str = "https://cf.trackerslist.com/best.txt";
-    /// Built-in default trackers (stable public subset of the community
-    /// list). Session configs can override with `DEFAULT_TRACKERS`.
-    pub const DEFAULT_TRACKERS: &[&str] = &[
-        "udp://tracker.opentrackr.org:1337/announce",
-        "https://tracker.tamersunion.org:443/announce",
-        "udp://open.stealth.si:80/announce",
-        "udp://exodus.desync.com:6969/announce",
-        "udp://tracker.torrent.eu.org:451/announce",
-        "http://tracker.openbittorrent.com:80/announce",
-        "udp://tracker.moeking.me:6969/announce",
-        "udp://explodie.org:6969/announce",
-        "https://opentracker.i2p.rocks:443/announce",
-        "udp://tracker.tiny-vps.com:6969/announce",
-        "udp://open.demonii.com:1337/announce",
-        "udp://tracker.openbittorrent.com:6969/announce",
-        "https://tracker.nanoha.org:443/announce",
-        "http://tracker.gbitt.info:80/announce",
-    ];
+    pub const TRACKERS_LIST_URL: &str = "https://cf.trackerslist.com/all.txt";
     /// Maximum number of outstanding request blocks per peer connection.
     pub const REQUEST_PIPELINE: u32 = 256;
     /// Recommended write-back cache budget (bytes).

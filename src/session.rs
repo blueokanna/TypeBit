@@ -72,6 +72,44 @@ fn file_priority_from_u8(b: u8) -> FilePriority {
     }
 }
 
+/// Web-seed URL path for a file: percent-encoded path components joined
+/// with '/'.
+fn web_seed_path(f: &crate::metainfo::FileEntry) -> String {
+    let mut s = String::new();
+    for (i, c) in f.path.iter().enumerate() {
+        if i > 0 {
+            s.push('/');
+        }
+        s.push_str(&crate::magnet::percent_encode(c));
+    }
+    s
+}
+
+/// Web seed (BEP-19) download options.
+#[derive(Debug, Clone)]
+pub struct WebSeedConfig {
+    /// Enable fetching pieces from web seeds.
+    pub enabled: bool,
+    /// Per-block HTTP timeout (ms). Web seed blocks are fetched one per
+    /// engine tick through the blocking host HTTP seam.
+    pub timeout_ms: u64,
+    /// Consecutive failures before rotating to the next seed / backing off.
+    pub max_fails: u32,
+    /// Backoff after every seed failed (ms).
+    pub backoff_ms: u64,
+}
+
+impl Default for WebSeedConfig {
+    fn default() -> Self {
+        WebSeedConfig {
+            enabled: true,
+            timeout_ms: 10_000,
+            max_fails: 5,
+            backoff_ms: 60_000,
+        }
+    }
+}
+
 /// Per-torrent configuration.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -107,6 +145,8 @@ pub struct SessionConfig {
     /// outbound-only: it never advertises a reachable port, drops UDP
     /// trackers, and routes HTTP tracker announces through the proxy.
     pub proxy: Option<ProxyConfig>,
+    /// Web seed (BEP-19) options.
+    pub webseed: WebSeedConfig,
 }
 
 impl Default for SessionConfig {
@@ -122,6 +162,7 @@ impl Default for SessionConfig {
             node_secret: [0u8; 32],
             trackers: Vec::new(),
             proxy: None,
+            webseed: WebSeedConfig::default(),
             use_default_trackers: true,
             upload_limit_bps: 0,
             download_limit_bps: 0,
@@ -218,6 +259,30 @@ pub struct MetadataFetch {
     pub outstanding: u32,
 }
 
+/// One in-progress web-seed (BEP-19) piece fetch.
+///
+/// Web seeds are fetched one 16 KiB block per engine tick through the
+/// blocking host HTTP seam (`Host::http_get_range`, or the SOCKS5 path in
+/// proxy mode), so the engine never stalls for more than one small request
+/// and the memory footprint is a single piece.
+#[derive(Debug, Clone, Default)]
+pub struct WebSeedState {
+    /// Piece currently being fetched (None = idle).
+    pub piece: Option<u32>,
+    /// Next block index to request.
+    pub next_block: u16,
+    /// Total blocks in the current piece.
+    pub total_blocks: u16,
+    /// Assembled piece bytes (len == piece length).
+    pub data: Vec<u8>,
+    /// Index of the web seed currently in use (round robin).
+    pub seed_idx: usize,
+    /// Consecutive failures on the current seed.
+    pub fails: u32,
+    /// Backoff deadline (ms) before retrying after all seeds failed.
+    pub retry_at: u64,
+}
+
 /// The per-torrent session.
 pub struct TorrentSession {
     /// Parsed torrent (None until metadata arrives for magnets).
@@ -274,12 +339,10 @@ pub struct TorrentSession {
     pex_known: Vec<NetAddr>,
     /// Metadata fetch state.
     metadata: Option<MetadataFetch>,
-    /// Web seeds (BEP-19), reserved for direct HTTP piece download.
-    #[allow(dead_code)]
+    /// Web seeds (BEP-19) for direct HTTP piece download.
     web_seeds: Vec<String>,
-    /// Web-seed round robin.
-    #[allow(dead_code)]
-    webseed_cursor: usize,
+    /// Web-seed (BEP-19) fetch state.
+    webseed: WebSeedState,
     /// Monitor.
     pub monitor: SwarmMonitor,
     /// Receipt book.
@@ -402,7 +465,7 @@ impl TorrentSession {
                 .iter()
                 .map(|w| String::from_utf8_lossy(w).into_owned())
                 .collect(),
-            webseed_cursor: 0,
+            webseed: WebSeedState::default(),
             monitor,
             receipt_book: ReceiptBook::new(info_hash.full()),
             bans: BanManager::new(max_bans),
@@ -471,7 +534,7 @@ impl TorrentSession {
                 outstanding: 0,
             }),
             web_seeds: Vec::new(),
-            webseed_cursor: 0,
+            webseed: WebSeedState::default(),
             monitor,
             receipt_book: ReceiptBook::new(info_hash.full()),
             bans: BanManager::new(max_bans),
@@ -827,6 +890,8 @@ impl TorrentSession {
                 }
             }
         }
+        // web seeds (BEP-19): supplement peer downloads, one block per tick
+        self.drive_webseed(ctx);
         // flush cache when under pressure or on a slow cadence
         if ctx.cache.used() > ctx.cache.budget() / 2 {
             let _ = ctx.cache.flush(ctx.host);
@@ -846,6 +911,207 @@ impl TorrentSession {
         for (_, addr, d, u) in snapshot {
             self.monitor.record_rates(addr, d, u, now);
         }
+    }
+
+    // ---------- web seeds (BEP-19) ----------
+
+    /// Fetch pieces from web seeds: one 16 KiB block per tick through the
+    /// blocking host HTTP seam, assembled and handed to the existing
+    /// verification pipeline. Only pieces fully contained within a single
+    /// file are fetchable — a web seed serves each file as a separate
+    /// resource, so a piece straddling a file boundary cannot be requested.
+    ///
+    /// In proxy mode the block is fetched *through* the SOCKS proxy so the
+    /// real IP is never exposed to the web seed server.
+    fn drive_webseed<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
+        if !self.cfg.webseed.enabled || self.torrent.is_none() || self.web_seeds.is_empty() {
+            return;
+        }
+        if self.status != SessionStatus::Downloading {
+            return;
+        }
+        let now = ctx.now;
+        // (a) pick a piece when idle
+        if self.webseed.piece.is_none() {
+            if now < self.webseed.retry_at {
+                return;
+            }
+            let t = match self.torrent.as_ref() {
+                Some(t) => t,
+                None => return,
+            };
+            if let Some((p, len)) = self.pick_webseed_piece(t) {
+                self.webseed.piece = Some(p);
+                self.webseed.next_block = 0;
+                self.webseed.total_blocks = block_count_for(len);
+                self.webseed.data = vec![0u8; len as usize];
+            } else {
+                return; // nothing fetchable right now
+            }
+        }
+        let piece = match self.webseed.piece {
+            Some(p) => p,
+            None => return,
+        };
+        // (b) resolve this block's URL and byte window (immutable snapshot)
+        let (url, range_start, range_end, blen) = {
+            let t = match self.torrent.as_ref() {
+                Some(t) => t,
+                None => return,
+            };
+            match self.webseed_block(t, piece, self.webseed.next_block) {
+                Some(m) => m,
+                None => {
+                    self.abort_webseed_piece();
+                    return;
+                }
+            }
+        };
+        // (c) fetch one block through the (possibly proxied) HTTP seam
+        let timeout = self.cfg.webseed.timeout_ms;
+        let mut body = Vec::new();
+        let got = match &self.cfg.proxy {
+            Some(p) => socks_mod::socks_http_get_range(
+                ctx.host,
+                p,
+                &url,
+                range_start,
+                range_end,
+                timeout,
+                &mut body,
+            ),
+            None => ctx
+                .host
+                .http_get_range(&url, range_start, range_end, timeout, &mut body),
+        };
+        match got {
+            Ok(()) if body.len() as u64 == blen => {
+                let off = (self.webseed.next_block as u32 * BLOCK_LEN) as usize;
+                self.webseed.data[off..off + body.len()].copy_from_slice(&body);
+                self.downloaded_bytes += body.len() as u64;
+                self.monitor
+                    .record_piece_cover(NetAddr::V4([0, 0, 0, 0], 0), piece);
+                self.webseed.fails = 0;
+                self.webseed.next_block = self.webseed.next_block.saturating_add(1);
+            }
+            Ok(()) => {
+                // range not honored / truncated: the data is untrustworthy
+                self.webseed.fails = self.webseed.fails.saturating_add(1);
+            }
+            Err(_) => {
+                self.webseed.fails = self.webseed.fails.saturating_add(1);
+            }
+        }
+        // (d) failure handling: rotate seeds, then back off
+        if self.webseed.fails >= self.cfg.webseed.max_fails {
+            self.webseed.seed_idx = (self.webseed.seed_idx + 1) % self.web_seeds.len();
+            if self.web_seeds.len() <= 1 {
+                self.webseed.retry_at = now.saturating_add(self.cfg.webseed.backoff_ms);
+            }
+            self.abort_webseed_piece();
+            return;
+        }
+        // (e) piece complete → hand to the verification pipeline
+        if self.webseed.next_block >= self.webseed.total_blocks {
+            let buf = core::mem::take(&mut self.webseed.data);
+            self.pieces.set_in_flight(piece, true);
+            self.verifying
+                .insert(piece, self.webseed.total_blocks as u32);
+            self.pending_verify.insert(piece, buf);
+            self.webseed.piece = None;
+            self.webseed.next_block = 0;
+            self.webseed.total_blocks = 0;
+        }
+    }
+
+    /// Pick the next piece for a web seed: missing, not in flight, in a
+    /// selected file, and fully contained within one file. Rotates the
+    /// scan start for fairness.
+    fn pick_webseed_piece(&self, t: &Torrent) -> Option<(u32, u32)> {
+        let n = t.piece_count();
+        if n == 0 {
+            return None;
+        }
+        let start = (self.webseed.seed_idx as u64 % n as u64) as u32;
+        for k in 0..n {
+            let p = (start + k) % n;
+            if self.pieces.is_have(p) || self.pieces.is_in_flight(p) {
+                continue;
+            }
+            if self.piece_priorities.get(p as usize).copied().unwrap_or(1) <= 0 {
+                continue; // piece belongs only to skipped files
+            }
+            let (abs, len) = match (t.piece_abs_offset(p), t.piece_info(p)) {
+                (Ok(a), Ok(pi)) => (a, pi.len as u64),
+                _ => continue,
+            };
+            if !self.piece_in_single_file(t, abs, len) {
+                continue; // straddles a file boundary → not one resource
+            }
+            return Some((p, len as u32));
+        }
+        None
+    }
+
+    /// Resolve the next block's web-seed URL and byte window within the
+    /// containing file. Returns `(url, range_start, range_end, len)`.
+    ///
+    /// The Range is **relative to the file resource** (the web seed serves
+    /// each file as a separate URL): `pi.offset + begin`. Using the
+    /// absolute torrent offset here would request a wrong window for every
+    /// file that does not start at byte 0 of the torrent.
+    fn webseed_block(
+        &self,
+        t: &Torrent,
+        piece: u32,
+        block: u16,
+    ) -> Option<(String, u64, u64, u64)> {
+        let pi = t.piece_info(piece).ok()?;
+        let begin = (block as u32) * BLOCK_LEN;
+        if begin >= pi.len {
+            return None;
+        }
+        let blen = core::cmp::min(BLOCK_LEN, pi.len - begin) as u64;
+        let range_start = pi.offset + begin as u64;
+        let range_end = range_start + blen - 1;
+        let base = self
+            .web_seeds
+            .get(self.webseed.seed_idx % self.web_seeds.len())?
+            .clone();
+        let url = if t.files.len() == 1 {
+            // single-file torrent: the web seed URL points at the file
+            base
+        } else {
+            // multi-file: append the percent-encoded relative path
+            let mut u = String::from(base.trim_end_matches('/'));
+            u.push('/');
+            u.push_str(&web_seed_path(&t.files[pi.file as usize]));
+            u
+        };
+        Some((url, range_start, range_end, blen))
+    }
+
+    /// Whether the byte range `[abs, abs+len)` lies fully within one file.
+    fn piece_in_single_file(&self, t: &Torrent, abs: u64, len: u64) -> bool {
+        let mut off = 0u64;
+        for f in &t.files {
+            if f.length == 0 {
+                continue;
+            }
+            if abs >= off && abs.saturating_add(len) <= off.saturating_add(f.length) {
+                return true;
+            }
+            off += f.length;
+        }
+        false
+    }
+
+    /// Abandon the current web-seed piece (rotation or unrecoverable error).
+    fn abort_webseed_piece(&mut self) {
+        self.webseed.piece = None;
+        self.webseed.next_block = 0;
+        self.webseed.total_blocks = 0;
+        self.webseed.data.clear();
     }
 
     fn choke_pass<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
@@ -2809,7 +3075,7 @@ fn seed_trackers<I: IntoIterator<Item = Vec<u8>>>(
         push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
     }
     if out.is_empty() && cfg.use_default_trackers {
-        for url in crate::consts::DEFAULT_TRACKERS {
+        for url in crate::trackerlist::DEFAULT_TRACKERS {
             push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
         }
     }
@@ -2893,4 +3159,110 @@ pub fn pex_compact4(list: &[NetAddr]) -> Vec<u8> {
 /// Encode IPv6 peers as compact 18-byte entries (BEP-23).
 pub fn pex_compact6(list: &[NetAddr]) -> Vec<u8> {
     crate::wire::compact_peers6(list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metainfo::{FileEntry, Torrent, TorrentKind};
+
+    /// A 2-file v1 torrent: piece 0 lives in file 0, pieces 1–2 in file 1.
+    fn test_torrent() -> Torrent {
+        let pl = 256 * 1024u32;
+        Torrent {
+            name: String::from("ws"),
+            piece_length: pl,
+            total_size: pl as u64 * 2 + 100,
+            files: vec![
+                FileEntry {
+                    path: vec![b"dir".to_vec(), b"a.bin".to_vec()],
+                    length: pl as u64,
+                    root: None,
+                },
+                FileEntry {
+                    path: vec![b"b.bin".to_vec()],
+                    length: pl as u64 + 100,
+                    root: None,
+                },
+            ],
+            kind: TorrentKind::V1,
+            info_hash: InfoHash::v1([1u8; 20]),
+            v1_hashes: Some(vec![[0u8; 20]; 3]),
+            v2_hashes: None,
+            announce: None,
+            announce_list: Vec::new(),
+            web_seeds: vec![b"http://seed.example/base/".to_vec()],
+            private: false,
+            piece_layers: Vec::new(),
+            info_raw: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+        }
+    }
+
+    fn session() -> TorrentSession {
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            ..Default::default()
+        };
+        TorrentSession::from_torrent(test_torrent(), cfg, 0).expect("session")
+    }
+
+    #[test]
+    fn web_seed_path_percent_encodes() {
+        let f = FileEntry {
+            path: vec![b"a b".to_vec(), b"c%2Fd.txt".to_vec()],
+            length: 1,
+            root: None,
+        };
+        assert_eq!(web_seed_path(&f), "a%20b/c%252Fd.txt");
+    }
+
+    #[test]
+    fn webseed_picks_first_fetchable_piece() {
+        let s = session();
+        let t = test_torrent();
+        // piece 0 is whole within file 0; priorities all Normal.
+        assert_eq!(s.pick_webseed_piece(&t), Some((0, 256 * 1024)));
+        // nothing left once everything is have
+        let mut s = s;
+        for p in 0..3 {
+            s.pieces.mark_piece_have(p);
+        }
+        assert_eq!(s.pick_webseed_piece(&t), None);
+    }
+
+    #[test]
+    fn webseed_block_resolves_url_and_file_relative_range() {
+        let s = session();
+        let t = test_torrent();
+        // piece 0 → file "dir/a.bin", range relative to the file start (0).
+        let (url, start, end, len) = s.webseed_block(&t, 0, 0).unwrap();
+        assert_eq!(url, "http://seed.example/base/dir/a.bin");
+        assert_eq!(start, 0);
+        assert_eq!(end, (BLOCK_LEN - 1) as u64);
+        assert_eq!(len, BLOCK_LEN as u64);
+        // piece 2 (last partial, 100 B) → file "b.bin", range must be
+        // relative to THAT file, i.e. 256 KiB, NOT the absolute torrent
+        // offset 512 KiB.
+        let (url, start, end, len) = s.webseed_block(&t, 2, 0).unwrap();
+        assert_eq!(url, "http://seed.example/base/b.bin");
+        assert_eq!(start, 256 * 1024u64);
+        assert_eq!(end, 256 * 1024u64 + 99);
+        assert_eq!(len, 100);
+        // a block past the piece end is refused
+        assert!(s.webseed_block(&t, 2, 1).is_none());
+    }
+
+    #[test]
+    fn webseed_skips_cross_file_pieces() {
+        // a piece straddling two files cannot be fetched from one resource
+        let mut t = test_torrent();
+        t.files[0].length = BLOCK_LEN as u64 + 100; // piece 0 now spans files
+        t.total_size = t.files[0].length + t.files[1].length; // keep consistent
+        let s = session();
+        // piece 0 is rejected (spans files); piece 1 is whole in file 1
+        assert_eq!(s.pick_webseed_piece(&t), Some((1, 16584)));
+    }
 }

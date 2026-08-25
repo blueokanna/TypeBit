@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn default_trackers_are_valid() {
         // every built-in tracker must have a parseable scheme + port
-        for t in crate::consts::DEFAULT_TRACKERS {
+        for t in crate::trackerlist::DEFAULT_TRACKERS {
             let ok =
                 t.starts_with("udp://") || t.starts_with("http://") || t.starts_with("https://");
             assert!(ok, "bad default tracker: {t}");

@@ -97,7 +97,7 @@ cargo run --example ffi_demo --features ffi # drive the engine via the C ABI
 ## Trackers & DHT
 
 - Sessions merge the torrent's announce list, `SessionConfig::trackers` and —
-  when the torrent carries none — the built-in `consts::DEFAULT_TRACKERS`
+  when the torrent carries none — the built-in `trackerlist::DEFAULT_TRACKERS`
   (qBittorrent/BitComet compatible public list). Refresh the full community
   list at runtime from `consts::TRACKERS_LIST_URL` and feed it through
   `tracker::parse_tracker_list` into `SessionConfig::trackers`.
@@ -146,4 +146,6 @@ src/
 
 ## License
 
-AGPL-3.0-or-later
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`),
+matching the `license` field in `Cargo.toml`. The full text is published
+by the Free Software Foundation at <https://www.gnu.org/licenses/agpl-3.0.html>.
