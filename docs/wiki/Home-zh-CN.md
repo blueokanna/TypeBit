@@ -38,5 +38,6 @@ receipt、磁盘缓存）都在引擎里。
 
 ## 许可提醒
 
-TypeBit 是 AGPL-3.0。如果你把修改版作为网络服务运行，AGPL 要求你把修改后
-的源码提供给该网络的用户。详见 LICENSE。
+TypeBit 采用 PolyForm Perimeter License 1.0.0
+（<https://polyformproject.org/licenses/perimeter/1.0.0>）。许可证全文
+（含其 noncompete 条款）见 LICENSE。

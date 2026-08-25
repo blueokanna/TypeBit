@@ -39,5 +39,6 @@ implementation (in-memory) driving a real engine.
 
 ## License reminder
 
-TypeBit is AGPL-3.0. If you run a modified version as a network service, the
-AGPL requires you to offer its source to that network's users. See LICENSE.
+TypeBit is licensed under the PolyForm Perimeter License 1.0.0
+(<https://polyformproject.org/licenses/perimeter/1.0.0>). The full license
+text — including its noncompete clause — is in `LICENSE`.

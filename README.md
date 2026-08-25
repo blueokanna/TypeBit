@@ -146,6 +146,6 @@ src/
 
 ## License
 
-GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`),
-matching the `license` field in `Cargo.toml`. The full text is published
-by the Free Software Foundation at <https://www.gnu.org/licenses/agpl-3.0.html>.
+PolyForm Perimeter License 1.0.0
+
+<https://polyformproject.org/licenses/perimeter/1.0.0>
