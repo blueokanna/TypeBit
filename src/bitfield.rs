@@ -140,43 +140,57 @@ impl Bitfield {
     }
 
     /// Next clear bit at or after `from`.
+    ///
+    /// Word-level: a clear bit is found by inverting the word and taking
+    /// `trailing_zeros` (a constant-time bit-scan) instead of a per-bit
+    /// loop.
     pub fn next_clear_from(&self, from: u32) -> Option<u32> {
         if from >= self.len {
             return None;
         }
         let mut w = from as usize / 64;
-        let mut b = from % 64;
-        loop {
-            if w >= self.words.len() {
-                return None;
-            }
-            for i in b..64 {
-                let idx = (w * 64 + i as usize) as u32;
-                if idx >= self.len {
-                    return None;
-                }
-                if self.words[w] & (1u64 << i) == 0 {
-                    return Some(idx);
-                }
+        let b = from % 64;
+        // ignore bits below `b` in the first word: invert, THEN mask the
+        // low bits out (clear bits = `!word & mask`; `!(word & mask)`
+        // would resurrect the masked-off low bits via De Morgan).
+        let inv = !self.words[w] & !((1u64 << b) - 1);
+        if inv != 0 {
+            let tz = inv.trailing_zeros();
+            let idx = (w * 64 + tz as usize) as u32;
+            return if idx < self.len { Some(idx) } else { None };
+        }
+        w += 1;
+        while w < self.words.len() {
+            let inv = !self.words[w];
+            if inv != 0 {
+                let tz = inv.trailing_zeros();
+                let idx = (w * 64 + tz as usize) as u32;
+                return if idx < self.len { Some(idx) } else { None };
             }
             w += 1;
-            b = 0;
         }
+        None
     }
 
     /// Network-format bitfield bytes (MSB first, padded with zeros).
+    ///
+    /// Word-level: the peer-wire order is MSB-first *within each byte*, and
+    /// piece `p` lives at word bit `p % 64`. A network byte is therefore
+    /// the bit-reverse of the little-endian-positioned byte of the word;
+    /// bytes straddling a word boundary pull the low bits of the next word.
+    /// O(bytes) with shift+bit-reverse, no per-bit div/mod.
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = (self.len as usize).div_ceil(8);
         let mut out = vec![0u8; n];
         for i in 0..n {
-            let mut byte = 0u8;
-            for j in 0..8 {
-                let bit = i * 8 + j;
-                if bit < self.len as usize && self.get(bit as u32) {
-                    byte |= 1 << (7 - j);
-                }
+            let bit = i * 8;
+            let w = bit / 64;
+            let s = bit % 64;
+            let mut byte = (self.words[w] >> s) as u8;
+            if s > 56 && w + 1 < self.words.len() {
+                byte |= (self.words[w + 1] << (64 - s)) as u8;
             }
-            out[i] = byte;
+            out[i] = byte.reverse_bits();
         }
         out
     }
@@ -198,15 +212,32 @@ impl Bitfield {
         }
         self.len = count;
         self.words = vec![0u64; (count as usize).div_ceil(64)];
-        self.count = 0;
+        // Word-level load: reverse each network byte's bits, then place it
+        // at word bit offset `s`, with the high bits straddling into the
+        // next word when the byte crosses a word boundary.
         for (i, &byte) in bytes.iter().enumerate() {
-            for j in 0..8 {
-                let bit = i * 8 + j;
-                if bit < count as usize && byte & (1 << (7 - j)) != 0 {
-                    self.set(bit as u32);
-                }
+            let bit = i * 8;
+            let w = bit / 64;
+            let s = bit % 64;
+            let rb = byte.reverse_bits();
+            self.words[w] |= (rb as u64) << s;
+            if s > 56 && w + 1 < self.words.len() {
+                self.words[w + 1] |= (rb as u64) >> (64 - s);
             }
         }
+        // Mask any bits beyond `count` in the last word (defensive; padding
+        // bytes were validated above).
+        if !count.is_multiple_of(64) {
+            let last = self.words.len() - 1;
+            let bits = count % 64;
+            let mask = if bits == 0 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            self.words[last] &= mask;
+        }
+        self.count = self.words.iter().map(|w| w.count_ones()).sum();
         Ok(())
     }
 
@@ -231,15 +262,41 @@ impl Bitfield {
     }
 
     /// Number of set bits within `[from, to)`.
+    ///
+    /// Word-level: mask the boundary words and sum `count_ones` over the
+    /// range — O(range/64) instead of O(range).
     pub fn count_range(&self, from: u32, to: u32) -> u32 {
-        let mut n = 0;
-        let mut i = from;
-        while i < to {
-            if self.get(i) {
-                n += 1;
-            }
-            i += 1;
+        if from >= to || from >= self.len {
+            return 0;
         }
+        let to = to.min(self.len);
+        let w0 = from as usize / 64;
+        let w1 = (to - 1) as usize / 64;
+        if w0 == w1 {
+            let nbits = to - from;
+            let base = if nbits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << nbits) - 1
+            };
+            return (self.words[w0] & (base << (from % 64))).count_ones();
+        }
+        let mut n = 0u32;
+        // first word: bits `from % 64 .. 64`
+        let first_mask = !((1u64 << (from % 64)) - 1);
+        n += (self.words[w0] & first_mask).count_ones();
+        // middle words are fully in range
+        for w in (w0 + 1)..w1 {
+            n += self.words[w].count_ones();
+        }
+        // last word: bits `0 .. (to-1) % 64 + 1`
+        let last_bits = (to - 1) % 64 + 1;
+        let last_mask = if last_bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << last_bits) - 1
+        };
+        n += (self.words[w1] & last_mask).count_ones();
         n
     }
 
@@ -301,6 +358,46 @@ mod tests {
         // padding violation: last byte with a low bit set
         let bad = vec![0b1000_0001, 0b1000_0001];
         assert!(Bitfield::new(0).from_bytes(&bad, 10).is_err());
+    }
+
+    #[test]
+    fn byte_roundtrip_across_word_boundaries() {
+        // lengths that are not multiples of 8/64 exercise the partial-word
+        // and partial-byte paths of the word-level codec.
+        for len in [1u32, 7, 8, 9, 63, 64, 65, 127, 128, 129, 200, 1000] {
+            for step in 0..len {
+                let mut b = Bitfield::new(len);
+                b.set(step);
+                let bytes = b.to_bytes();
+                assert_eq!(bytes.len(), (len as usize).div_ceil(8));
+                let mut c = Bitfield::new(0);
+                c.from_bytes(&bytes, len).unwrap();
+                assert_eq!(c, b, "roundtrip failed for len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn count_range_matches_bruteforce() {
+        let mut b = Bitfield::new(150);
+        for i in (0..150).step_by(3) {
+            b.set(i);
+        }
+        for from in [0u32, 1, 63, 64, 65, 100] {
+            for to in [from, 63, 64, 65, 100, 128, 150] {
+                if to < from {
+                    continue;
+                }
+                let fast = b.count_range(from, to);
+                let mut slow = 0u32;
+                for i in from..to.min(150) {
+                    if b.get(i) {
+                        slow += 1;
+                    }
+                }
+                assert_eq!(fast, slow, "count_range [{from},{to})");
+            }
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod dht;
 pub mod disk_cache;
 pub mod engine;
 pub mod error;
+pub mod leech;
 pub mod links;
 pub mod magnet;
 pub mod metainfo;
@@ -30,12 +31,16 @@ pub mod pex;
 pub mod picker;
 pub mod piece;
 pub mod platform;
+pub mod portmap;
+pub mod ratelimit;
 pub mod receipt;
 pub mod scheduler;
 pub mod session;
+pub mod socks;
 pub mod state;
 pub mod swarm;
 pub mod tracker;
+pub mod verify;
 pub mod wire;
 
 // OS-backed host (feature "std") and C ABI bridge (feature "ffi") are

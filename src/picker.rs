@@ -24,13 +24,16 @@ impl Picker {
     /// Pick the best piece to request from `peer_have`.
     ///
     /// `utilities` comes from the scheduler; `availability` is the per-piece
-    /// peer count (used for rare-first tie-breaking). Pieces we already have
-    /// or (unless endgame) already have in flight are skipped.
+    /// peer count (used for rare-first tie-breaking); `priorities` carries
+    /// per-piece multipliers from the file priorities (0 = skipped file —
+    /// such pieces are never picked). Pieces we already have or (unless
+    /// endgame) already have in flight are skipped.
     pub fn pick_piece(
         tracker: &PieceTracker,
         utilities: &[i64],
         availability: &[u32],
         peer_have: &Bitfield,
+        priorities: &[i64],
         opts: PickOptions,
     ) -> Option<u32> {
         let n = tracker.piece_count();
@@ -46,10 +49,17 @@ impl Picker {
             if !peer_have.get(p) {
                 continue;
             }
+            let prio = priorities.get(p as usize).copied().unwrap_or(1);
+            if prio <= 0 {
+                continue; // piece belongs only to skipped files
+            }
             let util = utilities.get(p as usize).copied().unwrap_or(0);
             let rarity =
                 (max_avail as i64) - (availability.get(p as usize).copied().unwrap_or(0) as i64);
-            let score = util.saturating_mul(1024).saturating_add(rarity);
+            let score = util
+                .saturating_mul(prio)
+                .saturating_mul(1024)
+                .saturating_add(rarity);
             if let Some((bs, br, _)) = best {
                 if score > bs || (score == bs && rarity > br) {
                     best = Some((score, rarity, p));
@@ -109,7 +119,9 @@ mod tests {
         peer.set(5);
         let util = [0i64, 0, 0, 100, 0, 90, 0, 0];
         let avail = [0u32; 8];
-        let p = Picker::pick_piece(&t, &util, &avail, &peer, PickOptions::default()).unwrap();
+        let prio = [1i64; 8];
+        let p =
+            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
         assert_eq!(p, 3);
     }
 
@@ -122,7 +134,42 @@ mod tests {
         peer.set(1);
         let util = [0i64; 4];
         let avail = [0u32; 4];
-        let p = Picker::pick_piece(&t, &util, &avail, &peer, PickOptions::default()).unwrap();
+        let prio = [1i64; 4];
+        let p =
+            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
+        assert_eq!(p, 1);
+    }
+
+    #[test]
+    fn skips_disabled_pieces() {
+        let t = PieceTracker::new(4, 16 * 1024);
+        let mut peer = Bitfield::new(4);
+        peer.set_all();
+        let util = [0i64; 4];
+        let avail = [0u32; 4];
+        // piece 2 belongs to a skipped file
+        let prio = [1i64, 1, 0, 1];
+        let p =
+            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
+        assert_ne!(p, 2);
+        // all skipped → nothing to pick
+        let prio = [0i64; 4];
+        assert!(
+            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn high_priority_wins_tie() {
+        let t = PieceTracker::new(4, 16 * 1024);
+        let mut peer = Bitfield::new(4);
+        peer.set_all();
+        let util = [10i64, 10, 10, 10];
+        let avail = [0u32; 4];
+        // high-priority piece 1 beats equal-utility normal pieces
+        let prio = [1i64, 4, 1, 1];
+        let p =
+            Picker::pick_piece(&t, &util, &avail, &peer, &prio, PickOptions::default()).unwrap();
         assert_eq!(p, 1);
     }
 

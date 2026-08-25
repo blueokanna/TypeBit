@@ -22,6 +22,14 @@ pub struct TorrentState {
     pub added_at: i64,
     /// Paused flag.
     pub paused: bool,
+    /// Per-file priority bytes (0=Skip, 1=Normal, 2=High); empty = all Normal.
+    pub file_priorities: Vec<u8>,
+    /// Per-task upload limit (bytes/s; 0 = unlimited).
+    pub upload_limit_bps: u64,
+    /// Per-task download limit (bytes/s; 0 = unlimited).
+    pub download_limit_bps: u64,
+    /// Anti-leech reputation ledger (`leech::ReputationStore`, opaque bytes).
+    pub reputation: Vec<u8>,
 }
 
 /// Whole-session state.
@@ -73,6 +81,10 @@ mod tests {
                 partial: vec![(3, vec![0b1000_0000])],
                 added_at: 1_700_000_000,
                 paused: false,
+                file_priorities: vec![1, 0, 2],
+                upload_limit_bps: 0,
+                download_limit_bps: 1_000_000,
+                reputation: vec![1, 2, 3],
             }],
             dht_nodes: vec![vec![2u8; 26]],
         }

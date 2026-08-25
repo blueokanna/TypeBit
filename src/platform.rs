@@ -211,6 +211,34 @@ pub trait Host {
     fn http_get(&mut self, url: &str, timeout_ms: u64, out: &mut alloc::vec::Vec<u8>)
         -> Result<()>;
 
+    /// Perform a blocking HTTP POST with a request body. Used by UPnP IGD
+    /// SOAP control (`AddPortMapping`/`DeletePortMapping`). A platform that
+    /// cannot POST leaves the default: [`Error::NotSupported`] (the port
+    /// mapper then falls back to NAT-PMP only).
+    fn http_post(
+        &mut self,
+        _url: &str,
+        _body: &[u8],
+        _timeout_ms: u64,
+        _out: &mut alloc::vec::Vec<u8>,
+    ) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    // ---------- network info (UPnP / NAT-PMP port mapping) ----------
+
+    /// The default gateway address, when the platform can discover it.
+    /// Needed to reach NAT-PMP (RFC 6886) and as a fallback for SSDP.
+    fn default_gateway(&self) -> Option<NetAddr> {
+        None
+    }
+
+    /// A LAN address of this host (any interface). Required by UPnP IGD
+    /// `AddPortMapping` (`NewInternalClient`).
+    fn local_ip(&self) -> Option<NetAddr> {
+        None
+    }
+
     // ---------- TCP peers ----------
 
     /// Begin a non-blocking connect to `addr`. Returns a handle immediately.
@@ -242,6 +270,13 @@ pub trait Host {
 
     /// Send one datagram.
     fn udp_send(&mut self, addr: &NetAddr, data: &[u8]) -> Result<()>;
+
+    /// Send one datagram to a multicast group (used by SSDP discovery).
+    /// The default routes through [`Self::udp_send`]; platforms that need
+    /// multicast options (TTL/interface) override this.
+    fn udp_multicast_send(&mut self, addr: &NetAddr, data: &[u8]) -> Result<()> {
+        self.udp_send(addr, data)
+    }
 
     /// Receive one datagram (non-blocking). `Err(WouldBlock)` = none pending.
     fn udp_recv(&mut self, buf: &mut [u8]) -> Result<(NetAddr, usize)>;

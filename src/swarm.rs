@@ -1,12 +1,14 @@
-//! Peer connection state and swarm choking logic.
+//! Peer connection state and wire-level bookkeeping.
 //!
 //! A [`Peer`] owns everything about one TCP connection: phase, availability,
-//! extension state, rates, and the outgoing byte buffer. The choke/unchoke
-//! algorithm is rate-based with an optimistic unchoke slot (BEP-3), snub
-//! detection, and seeding-mode upload-rate scheduling.
+//! extension state, rates, reputation (anti-leech ledger), and the outgoing
+//! byte buffer. The choke/unchoke **algorithm** itself lives in
+//! [`crate::leech`] (reciprocity scoring, snubs, bans); this module only
+//! supplies the per-connection state it operates on.
 
 use crate::bitfield::Bitfield;
 use crate::consts::REQUEST_PIPELINE;
+use crate::leech::PeerReputation;
 use crate::monitoring::DiscoverySource;
 use crate::platform::{ConnId, NetAddr};
 use crate::wire::{ExtHandshake, Message, MessageStream};
@@ -86,6 +88,15 @@ pub struct Peer {
     pub optimistic: bool,
     /// Outstanding request count on this connection.
     pub requests_in_flight: u32,
+    /// Last time they requested a block from us (ms; 0 = never). Drives
+    /// the idle-slot (bandwidth squatting) detection.
+    pub last_request_at: u64,
+    /// Blocks we have served them on this connection.
+    pub served_requests: u32,
+    /// Cancels for blocks we never had outstanding to them (abuse signal).
+    pub spurious_cancels: u32,
+    /// Structurally invalid requests (abuse signal).
+    pub invalid_requests: u32,
     /// Outgoing byte buffer (engine drains via host).
     pub out: Vec<u8>,
     /// Incoming message stream.
@@ -94,6 +105,8 @@ pub struct Peer {
     pub handshake_buf: Vec<u8>,
     /// How this peer was found.
     pub source: DiscoverySource,
+    /// Anti-leech reputation ledger (client, corrupt blocks, violations).
+    pub rep: PeerReputation,
     /// Last PEX message sent.
     pub pex_sent_at: u64,
     /// Rate-sampling window accumulators.
@@ -137,10 +150,15 @@ impl Peer {
             snubbed: false,
             optimistic: false,
             requests_in_flight: 0,
+            last_request_at: 0,
+            served_requests: 0,
+            spurious_cancels: 0,
+            invalid_requests: 0,
             out: Vec::with_capacity(16 * 1024),
             msgs: MessageStream::new(),
             handshake_buf: Vec::new(),
             source,
+            rep: PeerReputation::default(),
             pex_sent_at: 0,
             window_down: 0,
             window_up: 0,
@@ -216,110 +234,16 @@ impl Peer {
         self.window_up += n as u64;
         self.last_active = now;
     }
-}
 
-/// Parameters for the choke/unchoke scheduler.
-#[derive(Debug, Clone, Copy)]
-pub struct ChokeConfig {
-    /// Upload slots when seeding.
-    pub seeding_slots: u32,
-    /// Unchoke slots when leeching.
-    pub leeching_slots: u32,
-    /// Optimistic unchoke rotation interval (ms).
-    pub optimistic_interval_ms: u64,
-    /// Snub timeout (ms).
-    pub snub_timeout_ms: u64,
-    /// Re-choke interval (ms).
-    pub interval_ms: u64,
-}
-
-impl Default for ChokeConfig {
-    fn default() -> Self {
-        ChokeConfig {
-            seeding_slots: 8,
-            leeching_slots: 8,
-            optimistic_interval_ms: 30_000,
-            snub_timeout_ms: 60_000,
-            interval_ms: 10_000,
-        }
-    }
-}
-
-/// A candidate for an unchoke slot with its score.
-struct Candidate {
-    id: ConnId,
-    rate: u32,
-    optimistic: bool,
-    snubbed: bool,
-}
-
-/// Compute which peers should be unchoked.
-/// `seeding` selects the algorithm (upload-rate vs download-rate).
-/// Returns the list of conn ids to unchoke.
-pub fn compute_unchoke_set<F>(
-    peers: &[&Peer],
-    seeding: bool,
-    cfg: &ChokeConfig,
-    is_optimistic: F,
-) -> Vec<ConnId>
-where
-    F: Fn(ConnId) -> bool,
-{
-    let slots = if seeding {
-        cfg.seeding_slots
-    } else {
-        cfg.leeching_slots
-    } as usize;
-    let mut candidates: Vec<Candidate> = peers
-        .iter()
-        .filter(|p| p.phase == PeerPhase::Ready)
-        .filter(|p| p.peer_interested || !seeding)
-        .map(|p| Candidate {
-            id: p.id,
-            rate: if seeding { p.up_rate } else { p.down_rate },
-            optimistic: is_optimistic(p.id),
-            snubbed: p.snubbed,
-        })
-        .collect();
-    // sort: non-snubbed first, then by rate descending
-    candidates.sort_by(|a, b| b.rate.cmp(&a.rate).then_with(|| a.snubbed.cmp(&b.snubbed)));
-    let mut unchoked: Vec<ConnId> = Vec::with_capacity(slots);
-    for c in &candidates {
-        if unchoked.len() >= slots {
-            break;
-        }
-        if c.snubbed {
-            continue;
-        }
-        unchoked.push(c.id);
-    }
-    // ensure the optimistic peer stays if slots remain and it's a peer
-    if unchoked.len() < slots {
-        for c in &candidates {
-            if c.optimistic && !unchoked.contains(&c.id) {
-                unchoked.push(c.id);
-                break;
-            }
-        }
-    }
-    unchoked
-}
-
-/// Update snub flags: mark peers snubbed when they owe us data but are
-/// quiet for too long.
-pub fn update_snubs<'a>(
-    peers: impl IntoIterator<Item = &'a mut Peer>,
-    now: u64,
-    cfg: &ChokeConfig,
-) {
-    for p in peers {
-        if p.phase == PeerPhase::Ready
-            && !p.peer_choking
-            && p.requests_in_flight > 0
-            && now.saturating_sub(p.last_data_in) > cfg.snub_timeout_ms
-        {
-            p.snubbed = true;
-        }
+    /// Refresh the snub flag: we are snubbed when we expect data from them
+    /// (they unchoked us and we have outstanding requests) but they stay
+    /// quiet for `timeout_ms`. The flag clears as soon as the situation
+    /// improves (data arrives or expectations end).
+    pub fn refresh_snub(&mut self, now: u64, timeout_ms: u64) {
+        self.snubbed = self.phase == PeerPhase::Ready
+            && !self.peer_choking
+            && self.requests_in_flight > 0
+            && now.saturating_sub(self.last_data_in) > timeout_ms;
     }
 }
 
@@ -327,7 +251,7 @@ pub fn update_snubs<'a>(
 mod tests {
     use super::*;
 
-    fn peer(id: ConnId, down: u32, interested: bool) -> Peer {
+    fn peer(id: ConnId) -> Peer {
         let mut p = Peer::new(
             id,
             NetAddr::V4([127, 0, 0, 1], 6881),
@@ -335,44 +259,30 @@ mod tests {
             DiscoverySource::Tracker,
         );
         p.phase = PeerPhase::Ready;
-        p.down_rate = down;
-        p.peer_interested = interested;
         p
     }
 
     #[test]
-    fn unchoke_picks_fastest() {
-        let peers: Vec<Peer> = vec![
-            peer(1, 100, true),
-            peer(2, 9000, true),
-            peer(3, 5000, false),
-        ];
-        let refs: Vec<&Peer> = peers.iter().collect();
-        let cfg = ChokeConfig {
-            leeching_slots: 2,
-            ..Default::default()
-        };
-        let set = compute_unchoke_set(&refs, false, &cfg, |_| false);
-        assert_eq!(set.len(), 2);
-        assert!(set.contains(&2));
-        assert!(set.contains(&3) || set.contains(&1));
-    }
-
-    #[test]
-    fn snub_detection() {
-        let cfg = ChokeConfig::default();
-        let mut p = peer(1, 100, true);
-        p.phase = PeerPhase::Ready;
+    fn snub_detection_and_clear() {
+        let mut p = peer(1);
         p.peer_choking = false;
         p.requests_in_flight = 2;
         p.last_data_in = 0;
-        update_snubs(core::slice::from_mut(&mut p), cfg.snub_timeout_ms + 1, &cfg);
+        p.refresh_snub(1000, 500);
         assert!(p.snubbed);
+        // data arrives → cleared
+        p.on_data_in(16, 1001);
+        assert!(!p.snubbed);
+        // no outstanding requests → never snubbed
+        p.requests_in_flight = 0;
+        p.last_data_in = 0;
+        p.refresh_snub(2000, 500);
+        assert!(!p.snubbed);
     }
 
     #[test]
     fn interested_detection() {
-        let mut p = peer(1, 0, false);
+        let mut p = peer(1);
         p.peer_choking = false;
         p.have.set(5);
         let mut ours = Bitfield::new(64);

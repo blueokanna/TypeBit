@@ -8,22 +8,69 @@ use crate::dht::Dht;
 use crate::disk_cache::DiskCache;
 use crate::engine::EngineEvent;
 use crate::error::{Error, Result};
+use crate::leech::{self, BanManager, BanReason, LeechConfig, PeerChokeView, ReputationStore};
 use crate::magnet::Magnet;
 use crate::metainfo::{InfoHash, Torrent};
 use crate::monitoring::{DiscoverySource, FailureCategory, SwarmMonitor};
 use crate::picker::{PickOptions, Picker};
 use crate::piece::{block_count_for, PieceTracker};
 use crate::platform::{ConnId, Host, NetAddr};
+use crate::ratelimit::TokenBucket;
 use crate::receipt::ReceiptBook;
 use crate::scheduler::{ContentGoal, Scheduler, SchedulerConfig};
-use crate::swarm::{compute_unchoke_set, update_snubs, ChokeConfig, Peer, PeerPhase};
+use crate::socks::{self as socks_mod, ProxyConfig};
+use crate::swarm::{Peer, PeerPhase};
 use crate::tracker::{self, AnnounceParams, Event as TrackerEvent, TrackerResponse};
+use crate::verify::{HashKind, VerifyJob};
 use crate::wire::{
     reserved as wire_reserved, ExtHandshake, Handshake, Message, MetadataMsg, PexMsg,
 };
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+
+/// Per-file download priority (selective download).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePriority {
+    /// Do not download this file (pieces touching only skipped files are
+    /// never requested; a torrent is complete once all *selected* pieces
+    /// verify).
+    Skip,
+    /// Default priority.
+    Normal,
+    /// Download before Normal (piece score multiplier).
+    High,
+}
+
+impl FilePriority {
+    /// Piece score multiplier (Skip → excluded from picking).
+    pub fn multiplier(self) -> i64 {
+        match self {
+            FilePriority::Skip => 0,
+            FilePriority::Normal => 1,
+            FilePriority::High => 4,
+        }
+    }
+
+    /// Stable byte for persistence (0=Skip, 1=Normal, 2=High).
+    pub fn to_byte(self) -> u8 {
+        match self {
+            FilePriority::Skip => 0,
+            FilePriority::Normal => 1,
+            FilePriority::High => 2,
+        }
+    }
+}
+
+/// Decode a persisted priority byte (unknown values degrade to Normal).
+fn file_priority_from_u8(b: u8) -> FilePriority {
+    match b {
+        0 => FilePriority::Skip,
+        1 => FilePriority::Normal,
+        2 => FilePriority::High,
+        _ => FilePriority::Normal,
+    }
+}
 
 /// Per-torrent configuration.
 #[derive(Debug, Clone)]
@@ -38,8 +85,8 @@ pub struct SessionConfig {
     pub endgame_pieces: u32,
     /// Enable content-aware scheduling (head/tail for video).
     pub smart_scheduling: bool,
-    /// Choke/unchoke parameters.
-    pub choke: ChokeConfig,
+    /// Anti-leech choke policy.
+    pub leech: LeechConfig,
     /// Scheduler weights.
     pub scheduler: SchedulerConfig,
     /// Wall-clock seed for receipts.
@@ -50,6 +97,16 @@ pub struct SessionConfig {
     /// Fall back to the built-in [`crate::consts::DEFAULT_TRACKERS`] when a
     /// torrent carries no announce URLs.
     pub use_default_trackers: bool,
+    /// Per-task upload limit in bytes/second (0 = unlimited).
+    pub upload_limit_bps: u64,
+    /// Per-task download limit in bytes/second (0 = unlimited).
+    pub download_limit_bps: u64,
+    /// Per-file priorities (index = file index). Missing entries = Normal.
+    pub file_priorities: Vec<FilePriority>,
+    /// SOCKS5 proxy (Tor / I2P) for this session. When set, the session is
+    /// outbound-only: it never advertises a reachable port, drops UDP
+    /// trackers, and routes HTTP tracker announces through the proxy.
+    pub proxy: Option<ProxyConfig>,
 }
 
 impl Default for SessionConfig {
@@ -60,11 +117,15 @@ impl Default for SessionConfig {
             request_pipeline: crate::consts::REQUEST_PIPELINE,
             endgame_pieces: 32,
             smart_scheduling: true,
-            choke: ChokeConfig::default(),
+            leech: LeechConfig::default(),
             scheduler: SchedulerConfig::default(),
             node_secret: [0u8; 32],
             trackers: Vec::new(),
+            proxy: None,
             use_default_trackers: true,
+            upload_limit_bps: 0,
+            download_limit_bps: 0,
+            file_priorities: Vec::new(),
         }
     }
 }
@@ -199,6 +260,8 @@ pub struct TorrentSession {
     last_unchoke_at: u64,
     /// Optimistic unchoke peer.
     optimistic: Option<ConnId>,
+    /// When the optimistic slot was assigned (ms).
+    optimistic_at: u64,
     /// Endgame active.
     pub endgame: bool,
     /// Peers queued for connection (drained by the engine).
@@ -221,6 +284,32 @@ pub struct TorrentSession {
     pub monitor: SwarmMonitor,
     /// Receipt book.
     pub receipt_book: ReceiptBook,
+    /// Anti-leech ban list.
+    pub bans: BanManager,
+    /// Persistent anti-leech reputation (across disconnects and sessions).
+    pub reputation: ReputationStore,
+    /// Last worst-peer eviction pass (ms).
+    last_evict_at: u64,
+    /// Per-task upload rate bucket (0 = unlimited).
+    pub upload_limit: TokenBucket,
+    /// Per-task download rate bucket (0 = unlimited).
+    pub download_limit: TokenBucket,
+    /// Per-tick upload allowance granted by the engine (global slice).
+    pub tick_up_allowance: u64,
+    /// Per-tick remaining download allowance granted by the engine.
+    pub tick_down_remaining: u64,
+    /// Per-piece priority multiplier (0 = skipped).
+    piece_priorities: Vec<i64>,
+    /// Number of pieces selected for download (skipped pieces excluded).
+    selected_piece_count: u32,
+    /// Piece index → supplier connection ids (corrupt-block attribution).
+    piece_suppliers: BTreeMap<u32, Vec<ConnId>>,
+    /// Assembled pieces handed to the verifier (piece → bytes), drained by
+    /// the engine each tick.
+    pending_verify: BTreeMap<u32, Vec<u8>>,
+    /// Pieces currently being verified (piece → total blocks); keeps the
+    /// picker away until the result lands.
+    verifying: BTreeMap<u32, u32>,
     /// Config.
     pub cfg: SessionConfig,
 }
@@ -246,6 +335,9 @@ pub struct SessionCtx<'a, H: Host> {
 impl TorrentSession {
     /// Cap on remembered PEX endpoints (flood bound).
     const MAX_PEX_KNOWN: usize = 2048;
+    /// Cap on the per-peer outgoing byte buffer (memory + upload-fairness
+    /// bound under throttling).
+    const MAX_PEER_OUT_BUF: usize = 512 * 1024;
 
     /// Create a session from a parsed torrent.
     pub fn from_torrent(torrent: Torrent, cfg: SessionConfig, now: u64) -> Result<TorrentSession> {
@@ -273,6 +365,11 @@ impl TorrentSession {
             now,
             torrent.total_size.max(1),
         );
+        let (piece_priorities, selected_piece_count) =
+            compute_piece_priorities(&torrent, &cfg.file_priorities);
+        let max_bans = cfg.leech.max_bans;
+        let upload_limit = TokenBucket::new(cfg.upload_limit_bps, now);
+        let download_limit = TokenBucket::new(cfg.download_limit_bps, now);
         Ok(TorrentSession {
             info_hash,
             tracker_hash,
@@ -293,6 +390,7 @@ impl TorrentSession {
             uploaded_bytes: 0,
             last_unchoke_at: 0,
             optimistic: None,
+            optimistic_at: 0,
             endgame: false,
             connect_queue: Vec::new(),
             dht_started: false,
@@ -307,6 +405,18 @@ impl TorrentSession {
             webseed_cursor: 0,
             monitor,
             receipt_book: ReceiptBook::new(info_hash.full()),
+            bans: BanManager::new(max_bans),
+            reputation: ReputationStore::new(cfg.leech.rep_store_cap, cfg.leech.rep_ttl_ms),
+            last_evict_at: 0,
+            upload_limit,
+            download_limit,
+            tick_up_allowance: 0,
+            tick_down_remaining: 0,
+            piece_priorities,
+            selected_piece_count,
+            piece_suppliers: BTreeMap::new(),
+            pending_verify: BTreeMap::new(),
+            verifying: BTreeMap::new(),
             torrent: Some(torrent),
             cfg,
         })
@@ -324,6 +434,9 @@ impl TorrentSession {
             cfg.scheduler,
         );
         let monitor = SwarmMonitor::new(info_hash.to_hex(), 0, now, 1);
+        let max_bans = cfg.leech.max_bans;
+        let upload_limit = TokenBucket::new(cfg.upload_limit_bps, now);
+        let download_limit = TokenBucket::new(cfg.download_limit_bps, now);
         Ok(TorrentSession {
             torrent: None,
             info_hash,
@@ -345,6 +458,7 @@ impl TorrentSession {
             uploaded_bytes: 0,
             last_unchoke_at: 0,
             optimistic: None,
+            optimistic_at: 0,
             endgame: false,
             connect_queue: Vec::new(),
             dht_started: false,
@@ -360,6 +474,18 @@ impl TorrentSession {
             webseed_cursor: 0,
             monitor,
             receipt_book: ReceiptBook::new(info_hash.full()),
+            bans: BanManager::new(max_bans),
+            reputation: ReputationStore::new(cfg.leech.rep_store_cap, cfg.leech.rep_ttl_ms),
+            last_evict_at: 0,
+            upload_limit,
+            download_limit,
+            tick_up_allowance: 0,
+            tick_down_remaining: 0,
+            piece_priorities: Vec::new(),
+            selected_piece_count: 0,
+            piece_suppliers: BTreeMap::new(),
+            pending_verify: BTreeMap::new(),
+            verifying: BTreeMap::new(),
             cfg,
         })
     }
@@ -371,11 +497,15 @@ impl TorrentSession {
         }
         self.status = if self.torrent.is_none() {
             SessionStatus::FetchingMetadata
+        } else if self.selected_piece_count == 0 {
+            // Everything is skipped: nothing left to download.
+            SessionStatus::Seeding
         } else {
             SessionStatus::Downloading
         };
         self.started_at = ctx.now;
         self.announce_at = ctx.now;
+        self.refresh_completion();
         self.open_files(ctx)?;
         self.announce_to_tracker(ctx, TrackerEvent::Started);
         if let Some(dht) = ctx.dht.as_mut() {
@@ -383,6 +513,29 @@ impl TorrentSession {
             self.dht_started = true;
         }
         Ok(())
+    }
+
+    /// Re-evaluate completion: once every *selected* piece is verified we
+    /// are seeding. No-op unless the session is in an active download state.
+    fn refresh_completion(&mut self) {
+        if self.torrent.is_some()
+            && matches!(
+                self.status,
+                SessionStatus::Downloading | SessionStatus::Seeding
+            )
+            && self.pieces.have_count() >= self.selected_piece_count
+        {
+            self.status = SessionStatus::Seeding;
+        }
+    }
+
+    /// Whether the session is running and consuming rate-limit budgets
+    /// (not stopped, paused, or failed).
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.status,
+            SessionStatus::Downloading | SessionStatus::Seeding | SessionStatus::FetchingMetadata
+        )
     }
 
     /// Pause.
@@ -403,6 +556,7 @@ impl TorrentSession {
             return;
         }
         self.status = SessionStatus::Downloading;
+        self.refresh_completion();
         self.announce_at = ctx.now;
         self.announce_to_tracker(ctx, TrackerEvent::Started);
     }
@@ -448,16 +602,157 @@ impl TorrentSession {
         p
     }
 
-    /// Progress ratio (0.0..=1.0).
+    /// Number of pieces selected for download (skipped files excluded).
+    pub fn selected_piece_count(&self) -> u32 {
+        self.selected_piece_count
+    }
+
+    /// Progress ratio (0.0..=1.0) relative to the *selected* pieces.
     pub fn progress(&self) -> f64 {
-        if self.pieces.piece_count() == 0 {
+        let sel = self.selected_piece_count;
+        if sel == 0 {
             return if self.status == SessionStatus::Seeding {
                 1.0
             } else {
                 0.0
             };
         }
-        self.pieces.have_count() as f64 / self.pieces.piece_count() as f64
+        self.pieces.have_count() as f64 / sel as f64
+    }
+
+    // ---------- task management ----------
+
+    /// Set the download priority of one file (selective download). Returns
+    /// `Err(Range)` when the file index is out of bounds or the torrent
+    /// metadata has not arrived yet.
+    pub fn set_file_priority(&mut self, file: u32, prio: FilePriority) -> Result<()> {
+        match &self.torrent {
+            Some(t) => {
+                if file as usize >= t.files.len() {
+                    return Err(Error::Range);
+                }
+            }
+            None => return Err(Error::NotFound),
+        }
+        let idx = file as usize;
+        if self.cfg.file_priorities.len() <= idx {
+            self.cfg
+                .file_priorities
+                .resize(idx + 1, FilePriority::Normal);
+        }
+        self.cfg.file_priorities[idx] = prio;
+        self.recompute_priorities();
+        Ok(())
+    }
+
+    /// The priority of one file (`Normal` when unset).
+    pub fn file_priority(&self, file: u32) -> FilePriority {
+        self.cfg
+            .file_priorities
+            .get(file as usize)
+            .copied()
+            .unwrap_or(FilePriority::Normal)
+    }
+
+    /// All file priorities (index-aligned with the torrent's file list).
+    pub fn file_priorities(&self) -> &[FilePriority] {
+        &self.cfg.file_priorities
+    }
+
+    /// Change the per-task upload limit (bytes/second; 0 = unlimited).
+    pub fn set_upload_limit(&mut self, bps: u64, now: u64) {
+        self.cfg.upload_limit_bps = bps;
+        self.upload_limit.set_rate(bps, now);
+    }
+
+    /// Change the per-task download limit (bytes/second; 0 = unlimited).
+    pub fn set_download_limit(&mut self, bps: u64, now: u64) {
+        self.cfg.download_limit_bps = bps;
+        self.download_limit.set_rate(bps, now);
+    }
+
+    /// Restore persisted state onto a freshly re-created session (smart
+    /// resume): verified/partial pieces, per-file priorities, per-task rate
+    /// limits, and the anti-leech reputation ledger. Call right after
+    /// construction and before `start`.
+    #[allow(clippy::too_many_arguments)] // single restore entry point, engine-only call
+    pub fn apply_saved_state(
+        &mut self,
+        have: &[u8],
+        partial: &[(u32, Vec<u8>)],
+        priorities: &[u8],
+        upload_limit_bps: u64,
+        download_limit_bps: u64,
+        reputation: &[u8],
+        now: u64,
+    ) -> Result<()> {
+        self.pieces.restore(have, partial)?;
+        if !priorities.is_empty() {
+            let t = match &self.torrent {
+                Some(t) => t.clone(),
+                None => return Err(Error::NotFound),
+            };
+            let n = core::cmp::min(priorities.len(), t.files.len());
+            self.cfg.file_priorities.clear();
+            self.cfg
+                .file_priorities
+                .extend(priorities[..n].iter().map(|b| file_priority_from_u8(*b)));
+            self.recompute_priorities();
+        }
+        // anti-leech: restore the persistent reputation ledger so repeat
+        // offenders start pre-penalized. Malformed blobs are ignored.
+        if !reputation.is_empty() {
+            if let Some(r) = ReputationStore::decode(reputation) {
+                self.reputation = r;
+                self.reputation.sweep(now);
+            }
+        }
+        self.set_upload_limit(upload_limit_bps, now);
+        self.set_download_limit(download_limit_bps, now);
+        self.refresh_completion();
+        Ok(())
+    }
+
+    /// Manually add a tracker URL (deduped). Returns `true` if added.
+    pub fn add_tracker(&mut self, url: &str) -> bool {
+        let b = url.as_bytes().to_vec();
+        let before = self.trackers.len();
+        push_tracker(&mut self.trackers, b);
+        self.trackers.len() > before
+    }
+
+    /// Manually remove a tracker URL. Returns `true` if removed.
+    pub fn remove_tracker(&mut self, url: &str) -> bool {
+        let b = url.as_bytes();
+        let before = self.trackers.len();
+        self.trackers.retain(|t| t.url != b);
+        self.trackers.len() < before
+    }
+
+    /// Current tracker URLs (in announce order).
+    pub fn tracker_urls(&self) -> Vec<String> {
+        self.trackers
+            .iter()
+            .map(|t| String::from_utf8_lossy(&t.url).into_owned())
+            .collect()
+    }
+
+    /// Recompute the per-piece priority multipliers from the file
+    /// priorities, and refresh the selected-piece bookkeeping.
+    fn recompute_priorities(&mut self) {
+        let t = match &self.torrent {
+            Some(t) => t.clone(),
+            None => {
+                self.piece_priorities.clear();
+                self.selected_piece_count = 0;
+                return;
+            }
+        };
+        let (prio, selected) = compute_piece_priorities(&t, &self.cfg.file_priorities);
+        self.piece_priorities = prio;
+        self.selected_piece_count = selected;
+        // the selection may have shrunk below what we already have
+        self.refresh_completion();
     }
 
     // ---------- tick ----------
@@ -472,14 +767,31 @@ impl TorrentSession {
         if ctx.now >= self.announce_at {
             self.announce_to_tracker(ctx, TrackerEvent::None);
         }
-        // endgame detection
-        if !self.endgame && self.pieces.piece_count() > 0 {
-            self.endgame = Picker::should_endgame(&self.pieces, self.cfg.endgame_pieces);
+        // anti-leech: expire bans, keep the list bounded
+        self.bans.sweep(ctx.now);
+        // anti-leech: age out stale reputation entries
+        self.reputation.sweep(ctx.now);
+        // endgame detection (relative to the selected pieces)
+        if !self.endgame && self.selected_piece_count > 0 {
+            let outstanding = self
+                .selected_piece_count
+                .saturating_sub(self.pieces.have_count());
+            self.endgame = outstanding <= self.cfg.endgame_pieces;
         }
         // choke/unchoke pass
-        if ctx.now.saturating_sub(self.last_unchoke_at) >= self.cfg.choke.interval_ms {
+        if ctx.now.saturating_sub(self.last_unchoke_at) >= self.cfg.leech.rechoke_interval_ms {
             self.choke_pass(ctx);
             self.last_unchoke_at = ctx.now;
+        }
+        // anti-leech: when near capacity with candidates waiting, evict the
+        // worst peers so better candidates can connect. This keeps the
+        // swarm fresh instead of letting bad peers occupy slots forever.
+        if self.peers.len() as u32 >= self.cfg.max_peers.saturating_mul(3) / 4
+            && !self.connect_queue.is_empty()
+            && ctx.now.saturating_sub(self.last_evict_at) >= self.cfg.leech.rechoke_interval_ms
+        {
+            self.last_evict_at = ctx.now;
+            self.evict_worst(ctx);
         }
         // DHT lookup / peer pull
         if self.dht_started {
@@ -537,43 +849,58 @@ impl TorrentSession {
     }
 
     fn choke_pass<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
-        update_snubs(self.peers.values_mut(), ctx.now, &self.cfg.choke);
-        // rotate optimistic unchoke
+        // 1. refresh snub flags
+        for p in self.peers.values_mut() {
+            p.refresh_snub(ctx.now, self.cfg.leech.snub_timeout_ms);
+        }
+        // 2. rotate the optimistic slot fairly: newcomers get a chance to
+        //    prove reciprocity before we pick permanent favorites.
         let rotate = match self.optimistic {
             Some(c) => self
                 .peers
                 .get(&c)
-                .map(|p| {
-                    ctx.now.saturating_sub(p.connected_at) > self.cfg.choke.optimistic_interval_ms
+                .map(|_| {
+                    ctx.now.saturating_sub(self.optimistic_at)
+                        >= self.cfg.leech.optimistic_interval_ms
                 })
                 .unwrap_or(true),
             None => true,
         };
         if rotate {
-            let ids: Vec<ConnId> = self.peers.keys().copied().collect();
-            if !ids.is_empty() {
-                let idx = (ctx.now as usize) % ids.len();
-                self.optimistic = Some(ids[idx]);
-            } else {
-                self.optimistic = None;
-            }
+            self.optimistic = self.pick_optimistic();
+            self.optimistic_at = ctx.now;
         }
+        // 3. build the choke views for ready peers (merging any stored
+        //    reputation so repeat offenders are scored from the start)
+        let views: Vec<PeerChokeView> = self
+            .peers
+            .values()
+            .filter(|p| p.phase == PeerPhase::Ready)
+            .map(|p| self.peer_choke_view(p, ctx.now))
+            .collect();
         let seeding = self.status == SessionStatus::Seeding;
-        let refs: Vec<&Peer> = self.peers.values().collect();
-        let unchoke = compute_unchoke_set(&refs, seeding, &self.cfg.choke, |id| {
-            self.optimistic == Some(id)
-        });
+        let unchoke = leech::select_unchoke_set(
+            &views,
+            seeding,
+            &self.cfg.leech,
+            |id| self.peers.get(&id).map(|p| !p.am_choking).unwrap_or(false),
+            self.optimistic,
+        );
+        // 4. apply choke / unchoke transitions
         let cur: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in cur {
-            let (was_choking, is_choking) = {
-                let p = self.peers.get_mut(&c).unwrap();
-                let is_choking = !unchoke.contains(&c);
+            let (was, now_choking) = {
+                let p = match self.peers.get_mut(&c) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let now_choking = !unchoke.contains(&c);
                 let was = p.am_choking;
-                p.am_choking = is_choking;
-                (was, is_choking)
+                p.am_choking = now_choking;
+                (was, now_choking)
             };
-            if was_choking != is_choking {
-                let m = if is_choking {
+            if was != now_choking {
+                let m = if now_choking {
                     Message::Choke
                 } else {
                     Message::Unchoke
@@ -583,21 +910,21 @@ impl TorrentSession {
                 }
             }
         }
-        // send interested / not interested
+        // 5. interested / not interested
         let conns: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in conns {
-            let (want, choked) = {
+            let want = {
                 let p = match self.peers.get(&c) {
                     Some(p) => p,
                     None => continue,
                 };
-                (
-                    p.should_be_interested(self.pieces.have_bitfield()),
-                    p.peer_choking,
-                )
+                p.should_be_interested(self.pieces.have_bitfield())
             };
             let send = {
-                let p = self.peers.get_mut(&c).unwrap();
+                let p = match self.peers.get_mut(&c) {
+                    Some(p) => p,
+                    None => continue,
+                };
                 let send = want != p.am_interested && p.phase == PeerPhase::Ready;
                 p.am_interested = want;
                 if send {
@@ -607,15 +934,109 @@ impl TorrentSession {
                         p.send(&Message::NotInterested);
                     }
                 }
-                let _ = choked;
                 send
             };
             let _ = send;
         }
-        // roll rate windows
+        // 6. roll rate windows
         for p in self.peers.values_mut() {
             p.roll_window(ctx.now);
         }
+    }
+
+    /// Build the choke/eviction view for one peer, merging any reputation
+    /// the peer carries from previous connections (or previous sessions)
+    /// into its corrupt ledger so repeat offenders are scored correctly
+    /// from the very first choke pass.
+    fn peer_choke_view(&self, p: &Peer, now: u64) -> PeerChokeView {
+        let stored = p
+            .peer_id
+            .as_ref()
+            .and_then(|pid| self.reputation.stored_for(pid))
+            .or_else(|| self.reputation.stored_addr(&p.addr))
+            .unwrap_or((0, 0));
+        let age_ms = now.saturating_sub(p.connected_at);
+        let idle_ms = if p.last_request_at == 0 {
+            age_ms
+        } else {
+            now.saturating_sub(p.last_request_at)
+        };
+        PeerChokeView {
+            id: p.id,
+            client: p.rep.client,
+            given: p.down_total,
+            taken: p.up_total,
+            rate_up: p.down_rate,
+            rate_down: p.up_rate,
+            corrupt: p.rep.corrupt_blocks.saturating_add(stored.0),
+            snubbed: p.snubbed,
+            interested: p.peer_interested,
+            age_ms,
+            idle_ms,
+            served_requests: p.served_requests,
+        }
+    }
+
+    /// Evict the single worst ready peer to make room for a queued
+    /// candidate. Hard negatives (corrupt suppliers, snubs) go first; the
+    /// optimistic slot is protected. Hard-negative evictions are recorded
+    /// in the reputation store so the peer cannot simply rejoin and squat.
+    fn evict_worst<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
+        let views: Vec<PeerChokeView> = self
+            .peers
+            .values()
+            .filter(|p| p.phase == PeerPhase::Ready)
+            .map(|p| self.peer_choke_view(p, ctx.now))
+            .collect();
+        if views.is_empty() {
+            return;
+        }
+        let seeding = self.status == SessionStatus::Seeding;
+        let keep: Vec<ConnId> = Vec::new();
+        let Some(id) =
+            leech::pick_eviction(&views, seeding, &self.cfg.leech, self.optimistic, &keep)
+        else {
+            return;
+        };
+        let (addr, peer_id, hard) = {
+            let p = match self.peers.get(&id) {
+                Some(p) => p,
+                None => return,
+            };
+            (p.addr, p.peer_id, p.rep.corrupt_blocks > 0 || p.snubbed)
+        };
+        if hard {
+            self.reputation
+                .note_violation(addr, peer_id.as_ref(), ctx.now);
+        }
+        self.drop_peer(id, FailureCategory::Timeout, ctx);
+    }
+
+    /// Pick the next optimistic-unchoke candidate: among ready peers that
+    /// are currently choked (i.e. not already holding a slot), the one
+    /// connected the longest. Falls back to any ready peer.
+    fn pick_optimistic(&self) -> Option<ConnId> {
+        let ready: Vec<ConnId> = self
+            .peers
+            .values()
+            .filter(|p| p.phase == PeerPhase::Ready)
+            .map(|p| p.id)
+            .collect();
+        if ready.is_empty() {
+            return None;
+        }
+        let choked: Vec<ConnId> = ready
+            .iter()
+            .copied()
+            .filter(|c| self.peers.get(c).map(|p| p.am_choking).unwrap_or(true))
+            .collect();
+        let pool = if choked.is_empty() { &ready } else { &choked };
+        pool.iter().copied().min_by_key(|c| {
+            self.peers
+                .get(c)
+                .map(|p| p.connected_at)
+                .unwrap_or(u64::MAX)
+        })
     }
 
     // ---------- peer lifecycle ----------
@@ -629,6 +1050,11 @@ impl TorrentSession {
         source: DiscoverySource,
         ctx: &'_ mut SessionCtx<'_, H>,
     ) {
+        // anti-leech: never accept a banned address
+        if self.bans.is_banned(&addr, ctx.now) {
+            ctx.host.tcp_close(conn);
+            return;
+        }
         let pc = self.pieces.piece_count();
         let mut peer = Peer::new(conn, addr, pc, source);
         peer.connected_at = ctx.now;
@@ -668,11 +1094,58 @@ impl TorrentSession {
         their: Handshake,
         ctx: &'_ mut SessionCtx<'_, H>,
     ) -> Result<()> {
-        let peer = self.peers.get_mut(&conn).ok_or(Error::NotFound)?;
         if their.info_hash != self.tracker_hash {
             return Err(Error::Handshake);
         }
-        peer.peer_id = Some(their.peer_id);
+        // anti-leech: a peer id we banned cannot reconnect under a new conn
+        if self.bans.peer_id_banned(&their.peer_id, ctx.now) {
+            return Err(Error::Handshake);
+        }
+        // anti-leech: one peer id must not appear from two endpoints at
+        // once — that is identity spoofing / shared-client abuse. Reject
+        // the newcomer and record the offense.
+        let dup = self.peers.values().any(|q| {
+            q.id != conn && q.phase != PeerPhase::Closed && q.peer_id == Some(their.peer_id)
+        });
+        if dup {
+            let addr = self
+                .peers
+                .get(&conn)
+                .map(|p| p.addr)
+                .unwrap_or(NetAddr::V4([0, 0, 0, 0], 0));
+            self.reputation
+                .note_violation(addr, Some(&their.peer_id), ctx.now);
+            return Err(Error::Handshake);
+        }
+        // anti-leech: seed this connection with the identity's *stored*
+        // reputation (from earlier connections / sessions). A repeat
+        // corrupt offender is re-banned immediately instead of getting a
+        // clean slate, and its choke score starts depressed.
+        let (addr, stored_corrupt) = {
+            let peer = self.peers.get_mut(&conn).ok_or(Error::NotFound)?;
+            peer.rep.client = Some(leech::fingerprint(&their.peer_id));
+            peer.peer_id = Some(their.peer_id);
+            let addr = peer.addr;
+            let corrupt = self
+                .reputation
+                .stored_for(&their.peer_id)
+                .map(|(c, v)| {
+                    peer.rep.corrupt_blocks = peer.rep.corrupt_blocks.saturating_add(c);
+                    peer.rep.protocol_violations = peer.rep.protocol_violations.saturating_add(v);
+                    c
+                })
+                .unwrap_or(0);
+            (addr, corrupt)
+        };
+        if stored_corrupt >= self.cfg.leech.corrupt_ban_threshold {
+            self.reputation
+                .note_violation(addr, Some(&their.peer_id), ctx.now);
+            self.ban_peer(conn, addr, BanReason::Corrupt, ctx);
+            return Err(Error::Handshake);
+        }
+        self.reputation
+            .note_handshake(addr, &their.peer_id, ctx.now);
+        let peer = self.peers.get_mut(&conn).ok_or(Error::NotFound)?;
         peer.reserved = their.reserved;
         peer.fast = their.has_fast();
         peer.supports_dht = their.has_dht();
@@ -701,7 +1174,13 @@ impl TorrentSession {
             if let Some(t) = &self.torrent {
                 ext.metadata_size = Some(t.info_raw.len() as u32);
             }
-            ext.p = Some(ctx.port as u32);
+            // Proxy mode: we accept no inbound connections, so never
+            // advertise a reachable listen port to peers.
+            ext.p = Some(if self.cfg.proxy.is_some() {
+                0
+            } else {
+                ctx.port as u32
+            });
             peer.send(&Message::Extended {
                 id: 0,
                 payload: ext.encode(),
@@ -781,16 +1260,60 @@ impl TorrentSession {
                     Ok(Some(m)) => m,
                     Ok(None) => break,
                     Err(_) => {
-                        self.drop_peer(conn, FailureCategory::Timeout, ctx);
+                        self.note_protocol_violation(conn, ctx);
                         return;
                     }
                 }
             };
             if self.dispatch(conn, msg, ctx).is_err() {
-                self.drop_peer(conn, FailureCategory::Timeout, ctx);
+                self.note_protocol_violation(conn, ctx);
                 return;
             }
         }
+    }
+
+    /// Record a protocol violation; ban the peer once it crosses the
+    /// configured threshold.
+    fn note_protocol_violation<H: Host>(&mut self, conn: ConnId, ctx: &'_ mut SessionCtx<'_, H>) {
+        let mut ban = false;
+        if let Some(p) = self.peers.get_mut(&conn) {
+            p.rep.protocol_violations = p.rep.protocol_violations.saturating_add(1);
+            ban = p.rep.protocol_violations >= self.cfg.leech.protocol_ban_threshold;
+        }
+        if ban {
+            let (addr, peer_id) = {
+                let p = match self.peers.get(&conn) {
+                    Some(p) => p,
+                    None => return,
+                };
+                (p.addr, p.peer_id)
+            };
+            // remember the offense across disconnects / sessions.
+            self.reputation
+                .note_violation(addr, peer_id.as_ref(), ctx.now);
+            self.ban_peer(conn, addr, BanReason::Protocol, ctx);
+        } else {
+            self.drop_peer(conn, FailureCategory::Timeout, ctx);
+        }
+    }
+
+    /// Ban a peer (address + peer id) and disconnect it.
+    fn ban_peer<H: Host>(
+        &mut self,
+        conn: ConnId,
+        addr: NetAddr,
+        reason: BanReason,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) {
+        let peer_id = self.peers.get(&conn).and_then(|p| p.peer_id);
+        let ttl = self.cfg.leech.ban_ttl_ms;
+        self.bans.ban(addr, peer_id.as_ref(), ttl, reason, ctx.now);
+        ctx.events.push(EngineEvent::PeerBanned {
+            info_hash: self.info_hash,
+            addr,
+            reason,
+        });
+        self.drop_peer(conn, FailureCategory::Timeout, ctx);
     }
 
     /// Peer disconnected: release its state.
@@ -944,7 +1467,7 @@ impl TorrentSession {
                 self.on_piece(conn, index, begin, data, ctx)?;
             }
             Message::Cancel { index, begin, .. } => {
-                self.cancel_peer_request(conn, index, begin);
+                self.cancel_peer_request(conn, index, begin, ctx)?;
             }
             Message::Port(p) => {
                 // peer advertises its DHT port
@@ -1172,8 +1695,13 @@ impl TorrentSession {
         self.availability = vec![0; piece_count as usize];
         self.scheduler = Scheduler::new(&t, self.cfg.scheduler);
         self.torrent = Some(t.clone());
+        self.recompute_priorities();
         self.metadata = None;
-        self.status = SessionStatus::Downloading;
+        if self.selected_piece_count == 0 {
+            self.status = SessionStatus::Seeding;
+        } else {
+            self.status = SessionStatus::Downloading;
+        }
         self.monitor = SwarmMonitor::new(
             self.info_hash.to_hex(),
             t.total_size,
@@ -1257,7 +1785,13 @@ impl TorrentSession {
         let params = AnnounceParams {
             tracker_hash: self.tracker_hash,
             peer_id: ctx.peer_id,
-            port: ctx.port,
+            // In proxy mode we accept no inbound connections; announce port
+            // 0 so peers do not try to reach our (unreachable) listen port.
+            port: if self.cfg.proxy.is_some() {
+                0
+            } else {
+                ctx.port
+            },
             uploaded: self.uploaded_bytes,
             downloaded: self.downloaded_bytes,
             left,
@@ -1283,7 +1817,13 @@ impl TorrentSession {
                         &params,
                     );
                     let mut body = Vec::new();
-                    match ctx.host.http_get(&url, 15_000, &mut body) {
+                    // Proxy mode: run the HTTP GET *through* the SOCKS proxy
+                    // (domain handed to the proxy, no cleartext DNS).
+                    let got = match &self.cfg.proxy {
+                        Some(p) => socks_mod::socks_http_get(ctx.host, p, &url, 15_000, &mut body),
+                        None => ctx.host.http_get(&url, 15_000, &mut body),
+                    };
+                    match got {
                         Ok(()) => match tracker::parse_tracker_response(&body) {
                             Ok(resp) => {
                                 if let Some(f) = resp.failure {
@@ -1315,6 +1855,18 @@ impl TorrentSession {
                             }
                         },
                         Err(_) => {
+                            // Defensive: UDP trackers are dropped at load time in
+                            // proxy mode; if one slipped in via add_tracker, skip it
+                            // instead of leaking the real IP.
+                            if self.cfg.proxy.is_some() {
+                                self.trackers[idx].fails =
+                                    self.trackers[idx].fails.saturating_add(1);
+                                self.trackers[idx].failure =
+                                    Some(String::from("udp disabled in proxy mode"));
+                                attempt += 1;
+                                self.tracker_cursor = (self.tracker_cursor + 1) % total;
+                                continue;
+                            }
                             self.trackers[idx].failure = Some(String::from("http error"));
                             self.trackers[idx].fails = self.trackers[idx].fails.saturating_add(1);
                         }
@@ -1449,6 +2001,15 @@ impl TorrentSession {
     // ---------- peer queue / discovery ----------
 
     fn enqueue_peer(&mut self, addr: NetAddr, source: DiscoverySource, now: u64) {
+        // anti-leech: never connect to a banned address
+        if self.bans.is_banned(&addr, now) {
+            return;
+        }
+        // anti-leech: cap concurrent peers per /24 (IPv4) /64 (IPv6) so a
+        // tracker/DHT flood of one address range cannot dominate the budget.
+        if self.subnet_count(&addr) >= self.cfg.leech.max_peers_per_subnet {
+            return;
+        }
         // absolute cap on queued candidates (flood bound)
         if self.connect_queue.len() >= 4 * self.cfg.max_peers.max(1) as usize {
             return;
@@ -1467,6 +2028,23 @@ impl TorrentSession {
         self.connect_queue.push((addr, source));
         self.monitor.record_discovery(source);
         let _ = now;
+    }
+
+    /// Count of connected + queued peers sharing `addr`'s subnet.
+    fn subnet_count(&self, addr: &NetAddr) -> u32 {
+        let key = subnet_key(addr);
+        let mut n = 0u32;
+        for p in self.peers.values() {
+            if subnet_key(&p.addr) == key {
+                n += 1;
+            }
+        }
+        for (a, _) in &self.connect_queue {
+            if subnet_key(a) == key {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Drain connect queue (engine calls).
@@ -1556,7 +2134,7 @@ impl TorrentSession {
 
     // ---------- request pipeline ----------
 
-    fn fill_pipeline<H: Host>(&mut self, conn: ConnId, _ctx: &'_ mut SessionCtx<'_, H>) {
+    fn fill_pipeline<H: Host>(&mut self, conn: ConnId, ctx: &'_ mut SessionCtx<'_, H>) {
         let mut guard = 0u32;
         while guard < 512 {
             guard += 1;
@@ -1583,6 +2161,7 @@ impl TorrentSession {
                     self.scheduler.utilities(),
                     &self.availability,
                     &peer.have,
+                    &self.piece_priorities,
                     opts,
                 )
             };
@@ -1608,6 +2187,17 @@ impl TorrentSession {
                 let len = core::cmp::min(BLOCK_LEN, pi.len - begin);
                 (b, begin, len, total_blocks)
             };
+            // download rate budget: never issue requests past what the
+            // per-task bucket and the per-tick global slice permit.
+            let avail = self.download_limit.available(ctx.now);
+            if avail < len as u64 {
+                break;
+            }
+            if self.tick_down_remaining < len as u64 {
+                break;
+            }
+            self.download_limit.consume(len as u64, ctx.now);
+            self.tick_down_remaining -= len as u64;
             // mark globally requested
             self.pieces.mark_block_requested(piece, block, total_blocks);
             self.requested_by
@@ -1633,7 +2223,7 @@ impl TorrentSession {
         index: u32,
         begin: u32,
         data: Vec<u8>,
-        ctx: &'_ mut SessionCtx<'_, H>,
+        _ctx: &'_ mut SessionCtx<'_, H>,
     ) -> Result<()> {
         let t = match &self.torrent {
             Some(t) => t.clone(),
@@ -1676,6 +2266,8 @@ impl TorrentSession {
         if !newly {
             return Ok(());
         }
+        // anti-leech: remember who supplied this block (for corrupt-blame)
+        self.piece_suppliers.entry(index).or_default().push(conn);
         // assemble
         let entry = self
             .assembling
@@ -1687,56 +2279,186 @@ impl TorrentSession {
         self.downloaded_bytes += data.len() as u64;
         self.monitor.record_piece_cover(self.peer_addr(conn), index);
         if self.pieces.piece_data_complete(index, total_blocks) {
-            // verify
-            let buf = match self.assembling.remove(&index) {
-                Some(b) => b,
-                None => return Ok(()),
-            };
-            match t.verify_piece(index, &buf) {
-                Ok(()) => {
-                    // write to disk cache (piece may span files)
-                    let abs = t.piece_abs_offset(index)?;
-                    self.write_abs(ctx, abs, &buf)?;
-                    self.pieces.mark_piece_have(index);
-                    // broadcast have
-                    let conns: Vec<ConnId> = self.peers.keys().copied().collect();
-                    for c in conns {
-                        if let Some(p) = self.peers.get_mut(&c) {
-                            if p.phase == PeerPhase::Ready {
-                                p.send(&Message::Have(index));
-                            }
-                        }
-                    }
-                    // receipt book + monitor
-                    self.receipt_book.record_range(abs, abs + buf.len() as u64);
-                    let sample = crate::crypto::Sha256::digest(&buf[..buf.len().min(4096)]);
-                    self.receipt_book.record_sample(abs, sample);
-                    ctx.events.push(EngineEvent::PieceVerified {
-                        info_hash: self.info_hash,
-                        piece: index,
-                    });
-                    if self.pieces.have_count() == self.pieces.piece_count() {
-                        self.status = SessionStatus::Seeding;
-                        self.announce_at = ctx.now;
-                        self.announce_to_tracker(ctx, TrackerEvent::Completed);
-                        ctx.events.push(EngineEvent::TorrentComplete {
-                            info_hash: self.info_hash,
-                        });
-                    }
-                }
-                Err(_) => {
-                    // hash failure: reset piece, penalize sender
-                    self.pieces.reset_piece(index);
-                    self.monitor.record_hash_failure(index);
-                    self.scheduler.mark_suspicious(index);
-                    ctx.events.push(EngineEvent::HashFailure {
-                        info_hash: self.info_hash,
-                        piece: index,
-                    });
-                }
+            // Hand the assembled piece to the verifier (worker pool or
+            // inline, decided by the engine). It stays out of the picker
+            // until the result lands: re-mark in-flight and record it.
+            if let Some(buf) = self.assembling.remove(&index) {
+                self.pieces.set_in_flight(index, true);
+                self.verifying.insert(index, total_blocks as u32);
+                self.pending_verify.insert(index, buf);
             }
         }
         Ok(())
+    }
+
+    /// Drain pieces that finished assembling and await verification
+    /// (engine calls once per tick).
+    pub fn take_pending_verify(&mut self) -> BTreeMap<u32, Vec<u8>> {
+        core::mem::take(&mut self.pending_verify)
+    }
+
+    /// Build a verification job for an assembled piece (reads the torrent).
+    /// Returns the bytes back when the job cannot be built, so the caller
+    /// can fall back to inline verification.
+    pub fn build_verify_job(&self, piece: u32, data: Vec<u8>) -> (Option<VerifyJob>, Vec<u8>) {
+        let t = match self.torrent.as_ref() {
+            Some(t) => t,
+            None => return (None, data),
+        };
+        let pi = match t.piece_info(piece) {
+            Ok(pi) => pi,
+            Err(_) => return (None, data),
+        };
+        let expect = match t.piece_hash(piece) {
+            Some(h) => h.to_vec(),
+            None => return (None, data),
+        };
+        let job = VerifyJob {
+            torrent: self.info_hash,
+            piece,
+            len: pi.len,
+            kind: HashKind::from(t.kind),
+            expect,
+            data,
+        };
+        (Some(job), Vec::new())
+    }
+
+    /// Verify a piece inline (single-threaded fallback; shares the same
+    /// pure checker as the worker pool).
+    pub fn verify_inline(&self, piece: u32, data: Vec<u8>) -> (bool, Vec<u8>) {
+        let t = match &self.torrent {
+            Some(t) => t,
+            None => return (false, data),
+        };
+        let ok = match (t.piece_info(piece), t.piece_hash(piece)) {
+            (Ok(pi), Some(expect)) => {
+                crate::verify::verify_piece(HashKind::from(t.kind), pi.len, &data, expect)
+            }
+            _ => false,
+        };
+        (ok, data)
+    }
+
+    /// Apply a verification outcome (from the pool or inline).
+    pub fn on_verified<H: Host>(
+        &mut self,
+        piece: u32,
+        ok: bool,
+        data: Vec<u8>,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) -> Result<()> {
+        let total_blocks = match self.verifying.remove(&piece) {
+            Some(tb) => tb,
+            None => return Ok(()), // unknown / already settled
+        };
+        let t = match &self.torrent {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+        if ok {
+            self.complete_piece_verified(piece, data, &t, ctx)
+        } else {
+            self.complete_piece_failed(piece, total_blocks, ctx);
+            Ok(())
+        }
+    }
+
+    /// Success path for a verified piece: write, mark have, announce.
+    fn complete_piece_verified<H: Host>(
+        &mut self,
+        index: u32,
+        buf: Vec<u8>,
+        t: &Torrent,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) -> Result<()> {
+        // write to disk cache (piece may span files)
+        let abs = t.piece_abs_offset(index)?;
+        self.write_abs(ctx, abs, &buf)?;
+        self.pieces.mark_piece_have(index);
+        self.piece_suppliers.remove(&index);
+        // broadcast have
+        let conns: Vec<ConnId> = self.peers.keys().copied().collect();
+        for c in conns {
+            if let Some(p) = self.peers.get_mut(&c) {
+                if p.phase == PeerPhase::Ready {
+                    p.send(&Message::Have(index));
+                }
+            }
+        }
+        // receipt book + monitor
+        self.receipt_book.record_range(abs, abs + buf.len() as u64);
+        let sample = crate::crypto::Sha256::digest(&buf[..buf.len().min(4096)]);
+        self.receipt_book.record_sample(abs, sample);
+        ctx.events.push(EngineEvent::PieceVerified {
+            info_hash: self.info_hash,
+            piece: index,
+        });
+        if self.pieces.have_count() >= self.selected_piece_count {
+            self.status = SessionStatus::Seeding;
+            self.announce_at = ctx.now;
+            self.announce_to_tracker(ctx, TrackerEvent::Completed);
+            ctx.events.push(EngineEvent::TorrentComplete {
+                info_hash: self.info_hash,
+            });
+        }
+        Ok(())
+    }
+
+    /// Failure path for a piece: reset, attribute blame, penalize/ban.
+    fn complete_piece_failed<H: Host>(
+        &mut self,
+        index: u32,
+        total_blocks: u32,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) {
+        // hash failure: reset the piece, attribute blame to the peers that
+        // supplied its blocks, ban repeat offenders.
+        self.pieces.reset_piece(index);
+        self.monitor.record_hash_failure(index);
+        self.scheduler.mark_suspicious(index);
+        self.punish_corrupt_suppliers(index, total_blocks, ctx);
+        ctx.events.push(EngineEvent::HashFailure {
+            info_hash: self.info_hash,
+            piece: index,
+        });
+    }
+
+    /// Attribute a failed piece to its suppliers, penalize them, and ban
+    /// peers that cross the corruption threshold.
+    fn punish_corrupt_suppliers<H: Host>(
+        &mut self,
+        piece: u32,
+        total_blocks: u32,
+        ctx: &'_ mut SessionCtx<'_, H>,
+    ) {
+        let sups = match self.piece_suppliers.remove(&piece) {
+            Some(s) => s,
+            None => return,
+        };
+        let mut counts: BTreeMap<ConnId, u32> = BTreeMap::new();
+        for c in sups {
+            *counts.entry(c).or_insert(0) += 1;
+        }
+        let penalties = leech::attribute_corruption(&counts, total_blocks);
+        let threshold = self.cfg.leech.corrupt_ban_threshold;
+        let mut to_ban: Vec<(ConnId, NetAddr)> = Vec::new();
+        for (c, pen) in penalties {
+            if let Some(p) = self.peers.get_mut(&c) {
+                p.rep.corrupt_blocks = p.rep.corrupt_blocks.saturating_add(pen);
+                let pid = p.peer_id;
+                // remember the offense across disconnects / sessions so the
+                // peer starts pre-penalized next time it connects.
+                self.reputation
+                    .note_corrupt(p.addr, pid.as_ref(), pen, ctx.now);
+                if p.rep.corrupt_blocks >= threshold {
+                    to_ban.push((c, p.addr));
+                }
+            }
+        }
+        for (c, addr) in to_ban {
+            self.ban_peer(c, addr, BanReason::Corrupt, ctx);
+        }
     }
 
     /// Serving: a peer requests a block from us.
@@ -1748,6 +2470,52 @@ impl TorrentSession {
         length: u32,
         ctx: &'_ mut SessionCtx<'_, H>,
     ) -> Result<()> {
+        let t = match &self.torrent {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+        // anti-leech: structurally invalid requests are unambiguous protocol
+        // violations (zero-length, misaligned, oversized, past the piece end,
+        // or a piece that does not exist). A single one can be a buggy peer,
+        // so we count them and only treat repeat offenders as violators.
+        let structurally_bad = match t.piece_info(index) {
+            Ok(pi) => {
+                length == 0
+                    || length > BLOCK_LEN
+                    || !begin.is_multiple_of(BLOCK_LEN)
+                    || (begin as u64) + (length as u64) > pi.len as u64
+            }
+            Err(_) => true,
+        };
+        if structurally_bad {
+            let spam = {
+                let p = match self.peers.get_mut(&conn) {
+                    Some(p) => p,
+                    None => return Ok(()),
+                };
+                p.invalid_requests += 1;
+                p.invalid_requests >= self.cfg.leech.invalid_request_threshold
+            };
+            if spam {
+                return Err(Error::Protocol);
+            }
+            // politely reject (fast extension) and stay connected
+            if let Some(p) = self.peers.get_mut(&conn) {
+                if p.fast {
+                    p.send(&Message::Reject {
+                        index,
+                        begin,
+                        length,
+                    });
+                }
+            }
+            return Ok(());
+        }
+        // anti-leech: any *valid* request shows intent — remember when they
+        // last asked (drives the idle-slot detection).
+        if let Some(p) = self.peers.get_mut(&conn) {
+            p.last_request_at = ctx.now;
+        }
         let (have, am_choking) = {
             let peer = match self.peers.get(&conn) {
                 Some(p) => p,
@@ -1768,14 +2536,21 @@ impl TorrentSession {
             }
             return Ok(());
         }
-        let t = match &self.torrent {
-            Some(t) => t.clone(),
-            None => return Ok(()),
-        };
-        let pi = t.piece_info(index)?;
-        // Bound length and guard against u32 overflow in begin + length.
-        if length > BLOCK_LEN || (begin as u64) + (length as u64) > pi.len as u64 {
-            return Err(Error::Protocol);
+        // anti-leech: bound the per-peer outgoing queue so a fast requester
+        // cannot balloon memory or monopolize upload when throttled.
+        if let Some(p) = self.peers.get(&conn) {
+            if p.out.len() >= Self::MAX_PEER_OUT_BUF {
+                if p.fast {
+                    if let Some(p) = self.peers.get_mut(&conn) {
+                        p.send(&Message::Reject {
+                            index,
+                            begin,
+                            length,
+                        });
+                    }
+                }
+                return Ok(());
+            }
         }
         // read the block from disk cache (absolute offset)
         let abs = t.piece_abs_offset(index)? + begin as u64;
@@ -1786,6 +2561,7 @@ impl TorrentSession {
         }
         self.uploaded_bytes += n as u64;
         if let Some(p) = self.peers.get_mut(&conn) {
+            p.served_requests = p.served_requests.saturating_add(1);
             p.on_data_out(n, ctx.now);
             p.send(&Message::Piece {
                 index,
@@ -1796,8 +2572,36 @@ impl TorrentSession {
         Ok(())
     }
 
-    fn cancel_peer_request(&mut self, conn: ConnId, index: u32, begin: u32) {
+    fn cancel_peer_request<H: Host>(
+        &mut self,
+        conn: ConnId,
+        index: u32,
+        begin: u32,
+        _ctx: &'_ mut SessionCtx<'_, H>,
+    ) -> Result<()> {
         let block = (begin / BLOCK_LEN) as u16;
+        let outstanding = self
+            .requested_by
+            .get(&(index, block))
+            .map(|reqs| reqs.contains(&conn))
+            .unwrap_or(false);
+        if !outstanding {
+            // anti-leech: a cancel for a block we never asked this peer for
+            // is spurious (cancel/piece races aside). Count them; repeated
+            // spurious cancels earn a protocol violation.
+            let spam = {
+                let p = match self.peers.get_mut(&conn) {
+                    Some(p) => p,
+                    None => return Ok(()),
+                };
+                p.spurious_cancels += 1;
+                p.spurious_cancels >= self.cfg.leech.cancel_spam_threshold
+            };
+            if spam {
+                return Err(Error::Protocol);
+            }
+            return Ok(());
+        }
         if let Some(reqs) = self.requested_by.get_mut(&(index, block)) {
             if let Some(pos) = reqs.iter().position(|c| *c == conn) {
                 reqs.remove(pos);
@@ -1811,6 +2615,7 @@ impl TorrentSession {
         if let Some(p) = self.peers.get_mut(&conn) {
             p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
         }
+        Ok(())
     }
 
     // ---------- disk helpers ----------
@@ -1911,6 +2716,58 @@ impl TorrentSession {
 
 // ---------- free helpers ----------
 
+/// Map per-file priorities onto per-piece priority multipliers.
+///
+/// Returns `(piece_priorities, selected_piece_count)`. A piece is *selected*
+/// (multiplier > 0) when it overlaps at least one non-skipped file. For v1
+/// torrents a piece may straddle file boundaries; downloading it is then
+/// still required to satisfy the wanted file, so Skip only ever wins when
+/// *every* overlapping file is skipped. The multiplier is the maximum of the
+/// overlapping files (High = 4, Normal = 1).
+fn compute_piece_priorities(t: &Torrent, file_priorities: &[FilePriority]) -> (Vec<i64>, u32) {
+    let n = t.piece_count() as usize;
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    let pl = t.piece_length as u64;
+    let mut need = vec![false; n];
+    let mut high = vec![false; n];
+    let mut abs = 0u64;
+    for (fi, f) in t.files.iter().enumerate() {
+        let fp = file_priorities
+            .get(fi)
+            .copied()
+            .unwrap_or(FilePriority::Normal);
+        // piece range [first, last) overlapping [abs, abs + len)
+        let first = (abs / pl) as usize;
+        let last = ((abs + f.length).div_ceil(pl)) as usize;
+        for p in first.min(n)..last.min(n) {
+            match fp {
+                FilePriority::Skip => {}
+                FilePriority::Normal => need[p] = true,
+                FilePriority::High => high[p] = true,
+            }
+        }
+        abs = abs.saturating_add(f.length);
+    }
+    let mut prio = Vec::with_capacity(n);
+    let mut selected = 0u32;
+    for p in 0..n {
+        let m = if high[p] {
+            4
+        } else if need[p] {
+            1
+        } else {
+            0
+        };
+        if m > 0 {
+            selected += 1;
+        }
+        prio.push(m);
+    }
+    (prio, selected)
+}
+
 /// 20-byte tracker/DHT hash from an infohash (v2 truncated).
 pub fn tracker_hash_of(ih: &InfoHash) -> [u8; 20] {
     let mut h = [0u8; 20];
@@ -1955,19 +2812,29 @@ fn seed_trackers<I: IntoIterator<Item = Vec<u8>>>(
     from: I,
     cfg: &SessionConfig,
 ) -> Vec<TrackerState> {
+    // Proxy mode is outbound-only: UDP trackers would announce from the
+    // real IP and leak it, so they are dropped at load time.
+    let anonymous = cfg.proxy.is_some();
     let mut out: Vec<TrackerState> = Vec::new();
     for url in from {
-        push_tracker(&mut out, url);
+        push_tracker_if_allowed(&mut out, url, anonymous);
     }
     for url in &cfg.trackers {
-        push_tracker(&mut out, url.as_bytes().to_vec());
+        push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
     }
     if out.is_empty() && cfg.use_default_trackers {
         for url in crate::consts::DEFAULT_TRACKERS {
-            push_tracker(&mut out, url.as_bytes().to_vec());
+            push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
         }
     }
     out
+}
+
+fn push_tracker_if_allowed(out: &mut Vec<TrackerState>, url: Vec<u8>, anonymous: bool) {
+    if anonymous && detect_tracker_kind(&url) == TrackerKind::Udp {
+        return;
+    }
+    push_tracker(out, url);
 }
 
 fn push_tracker(out: &mut Vec<TrackerState>, url: Vec<u8>) {
@@ -1990,6 +2857,23 @@ fn with_port(a: NetAddr, port: u16) -> NetAddr {
     match a {
         NetAddr::V4(ip, _) => NetAddr::V4(ip, port),
         NetAddr::V6(ip, _) => NetAddr::V6(ip, port),
+    }
+}
+
+/// Canonical subnet key: the /24 prefix for IPv4, the /64 prefix for IPv6.
+/// Used to bound how many peers from one address range we admit.
+fn subnet_key(addr: &NetAddr) -> [u8; 8] {
+    match *addr {
+        NetAddr::V4(ip, _) => {
+            let mut k = [0u8; 8];
+            k[..3].copy_from_slice(&ip[..3]);
+            k
+        }
+        NetAddr::V6(ip, _) => {
+            let mut k = [0u8; 8];
+            k.copy_from_slice(&ip[..8]);
+            k
+        }
     }
 }
 

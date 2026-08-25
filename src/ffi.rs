@@ -568,6 +568,35 @@ pub unsafe extern "C" fn typebit_engine_take_event(
             buf.push(8);
             buf.extend_from_slice(&(n as u32).to_be_bytes());
         }
+        EngineEvent::PeerBanned {
+            info_hash,
+            addr,
+            reason,
+        } => {
+            buf.push(9);
+            buf.extend_from_slice(&info_hash.full());
+            let (ip, port) = match addr {
+                NetAddr::V4(ip, p) => (ip, p),
+                NetAddr::V6(_, p) => ([0; 4], p),
+            };
+            buf.extend_from_slice(&ip);
+            buf.extend_from_slice(&port.to_be_bytes());
+            let rc = match reason {
+                crate::leech::BanReason::Corrupt => 1u8,
+                crate::leech::BanReason::Protocol => 2u8,
+                crate::leech::BanReason::FreeRide => 3u8,
+            };
+            buf.push(rc);
+        }
+        EngineEvent::PortMapping {
+            phase,
+            external_port,
+        } => {
+            buf.push(10);
+            buf.push(phase.code());
+            let ext = external_port.unwrap_or(0);
+            buf.extend_from_slice(&ext.to_be_bytes());
+        }
     }
     let n = core::cmp::min(buf.len(), out_cap);
     core::ptr::copy_nonoverlapping(buf.as_ptr(), out, n);
