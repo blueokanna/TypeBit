@@ -39,11 +39,14 @@ const DHT_ANNOUNCE_INTERVAL_MS: u64 = 60_000;
 /// interaction (piece request/data) within this window — harvesters/dead conns must not squat capacity.
 const METADATA_SERVED_IDLE_TIMEOUT_MS: u64 = 10_000;
 
-/// HTTP announce in-flight window: no second HTTP connection for a tracker within it.
-/// How long before the same HTTP tracker may be re-announced (pending
-/// guard). 5 s keeps a multi-tracker rotation fast while still bounding the
-/// concurrency the shared async HTTP worker sees.
+/// HTTP announce in-flight window: no second HTTP connection for a tracker
+/// within it. 5 s keeps a multi-tracker rotation fast while still bounding
+/// the concurrency the shared async HTTP worker sees.
 const HTTP_ANNOUNCE_PENDING_MS: u64 = 5_000;
+
+/// HTTP tracker request timeout. Kept generous (15 s) — a slow-but-working
+/// tracker must not be parked just because the rotation is fast.
+const HTTP_ANNOUNCE_TIMEOUT_MS: u64 = 15_000;
 
 /// How many HTTP trackers one announce call fires at once (bounded by the
 /// async worker's concurrency). Batched announce means a magnet (metadata
@@ -2347,7 +2350,7 @@ impl TorrentSession {
                     // worker; the result is applied by on_http_job_done. Proxy mode has no
                     // async seam, so it falls back to the synchronous SOCKS GET.
                     let job_id = if self.cfg.proxy.is_none() {
-                        ctx.host.http_get_async(&url, HTTP_ANNOUNCE_PENDING_MS)
+                        ctx.host.http_get_async(&url, HTTP_ANNOUNCE_TIMEOUT_MS)
                     } else {
                         0
                     };
@@ -2369,10 +2372,10 @@ impl TorrentSession {
                             ctx.host,
                             p,
                             &url,
-                            HTTP_ANNOUNCE_PENDING_MS,
+                            HTTP_ANNOUNCE_TIMEOUT_MS,
                             &mut body,
                         ),
-                        None => ctx.host.http_get(&url, HTTP_ANNOUNCE_PENDING_MS, &mut body),
+                        None => ctx.host.http_get(&url, HTTP_ANNOUNCE_TIMEOUT_MS, &mut body),
                     };
                     match got {
                         Ok(()) => match tracker::parse_tracker_response(&body) {
