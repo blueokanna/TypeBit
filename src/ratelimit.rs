@@ -1,15 +1,12 @@
-//! Token-bucket byte rate limiting.
+//! Token-bucket byte rate limiting. One bucket per throttle point: the
+//! engine keeps global upload/download buckets, each
+//! [`TorrentSession`](crate::session::TorrentSession) keeps per-task
+//! buckets. `0` = unlimited. Refill from wall time (`now_ms`) so buckets
+//! stay correct at any tick cadence.
 //!
-//! One bucket per throttle point: the engine keeps **global** upload /
-//! download buckets, and every [`TorrentSession`](crate::session::TorrentSession)
-//! keeps its own per-task buckets. A rate of `0` means *unlimited*. Buckets
-//! refill from wall time (`now_ms`), so they stay correct across any tick
-//! cadence and never lose burst capacity during long stalls.
-//!
-//! Enforcement happens at the two natural choke points of the engine:
-//! the upload path drains each peer's outgoing buffer through the buckets
-//! in [`Engine::pump_connection`](crate::engine::Engine), and the download
-//! path caps how many request blocks `fill_pipeline` may issue per tick.
+//! Enforced at the two choke points: upload drains peer buffers through
+//! the buckets ([`Engine::pump_connection`](crate::engine::Engine));
+//! download caps requests per tick (`fill_pipeline`).
 
 use core::cmp;
 

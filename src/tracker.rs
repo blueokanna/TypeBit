@@ -1,13 +1,7 @@
-//! Tracker protocol codecs.
-//!
-//! * **HTTP tracker (BEP-3)**: announce/scrape URL construction and
-//!   bencoded response parsing (compact + dict peer lists).
-//! * **UDP tracker (BEP-15)**: connect/announce/scrape request builders and
-//!   response parsers.
-//!
-//! The actual HTTP transport is delegated to the host ([`crate::platform::Host::http_get`],
-//! implemented with `courierust` on the std host); UDP transport goes
-//! through [`crate::platform::Host::udp_send`]/`udp_recv`.
+//! Tracker protocol codecs: HTTP (BEP-3) announce/scrape URL construction
+//! and bencoded parsing (compact + dict peer lists); UDP (BEP-15)
+//! connect/announce/scrape builders and parsers. Transport is delegated to
+//! the [`crate::platform::Host`] seam (`http_get` / `udp_send` / `udp_recv`).
 
 use crate::bencode::BVal;
 use crate::error::{Error, Result};

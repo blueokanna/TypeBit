@@ -1024,13 +1024,10 @@ impl Dht {
             .cloned()
             .collect();
         if to_query.is_empty() {
-            // Nothing to query right now. If we never even queried a single
-            // node, the routing table is empty because the bootstrap pings
-            // are still in flight — the lookup must NOT die here: each tick
-            // refreshes `closest` from the table, so once a bootstrap node
-            // answers, the lookup starts querying it. Only a lookup that has
-            // actually exhausted its candidate set is finished. (A never-
-            // populated table is still bounded by LOOKUP_TIMEOUT_MS above.)
+            // If nothing was ever queried, the bootstrap pings are still in
+            // flight: keep the lookup alive (`closest` refreshes each tick)
+            // until the candidate set is truly exhausted (bounded by
+            // LOOKUP_TIMEOUT_MS above).
             if self.lookups[idx].queried.is_empty() {
                 return false;
             }

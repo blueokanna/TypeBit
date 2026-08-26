@@ -86,6 +86,28 @@ impl Default for EngineConfig {
 /// recovers quickly if the table is ever evicted to zero.
 const BOOTSTRAP_RETRY_MS: u64 = 5_000;
 
+/// Snapshot of engine-wide counters, surfaced to the UI (qBittorrent-style
+/// stats dialog). Every field is a real counter — nothing is fabricated.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineStats {
+    /// Disk-cache counters (read hits, read/write ops, …).
+    pub cache: crate::disk_cache::CacheStats,
+    /// Total bytes buffered in the disk cache (dirty + clean).
+    pub cache_bytes: u64,
+    /// Disk-cache byte budget.
+    pub cache_budget: u64,
+    /// Bytes in the clean read-through LRU.
+    pub cache_clean: u64,
+    /// Clean read-through LRU budget (for the read-overload ratio).
+    pub cache_clean_budget: u64,
+    /// Dirty blocks awaiting flush (write-back queue depth).
+    pub cache_dirty_entries: usize,
+    /// Payload bytes received but discarded this session.
+    pub discarded_bytes: u64,
+    /// Live peer connections across all sessions (non-Closed).
+    pub connected_peers: usize,
+}
+
 /// The engine. Generic over the host.
 pub struct Engine<H: Host> {
     /// Host.
@@ -141,6 +163,8 @@ pub struct Engine<H: Host> {
     /// Piece-verification worker pool (real threads under `std`; `None`
     /// means inline verification).
     verify_pool: Option<VerifyPool>,
+    /// BEP-29 uTP transport — shares the UDP socket with DHT/LSD.
+    utp: crate::utp::UtpManager,
 }
 
 /// An inbound connection before we know its infohash.
@@ -247,6 +271,7 @@ impl<H: Host> Engine<H> {
             last_dht_find_node: now,
             dht_refresh_serial: 0,
             verify_pool,
+            utp: crate::utp::UtpManager::new(),
         }
     }
 
@@ -496,6 +521,14 @@ impl<H: Host> Engine<H> {
             .unwrap_or(0)
     }
 
+    /// Bytes uploaded for a torrent.
+    pub fn uploaded(&self, hash: &InfoHash) -> u64 {
+        self.sessions
+            .get(hash)
+            .map(|s| s.uploaded_bytes)
+            .unwrap_or(0)
+    }
+
     /// Whether a torrent has completed.
     pub fn is_complete(&self, hash: &InfoHash) -> bool {
         self.sessions
@@ -606,6 +639,37 @@ impl<H: Host> Engine<H> {
             &st.reputation,
             now,
         )
+    }
+
+    /// Install previously-fetched metadata into a magnet session. This is
+    /// the persistence path: the bridge stores the raw info dict when the
+    /// metadata arrives and re-installs it on restart, so a magnet NEVER has
+    /// to re-fetch metadata (qBittorrent parity). Idempotent — a session
+    /// that already has metadata is left untouched.
+    pub fn install_metadata(&mut self, hash: &InfoHash, info_raw: &[u8]) -> Result<()> {
+        if info_raw.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        let t = crate::metainfo::Torrent::from_info(info_raw)?;
+        if t.info_hash != *hash {
+            return Err(Error::HashMismatch);
+        }
+        let now = self.host.now_ms();
+        let s = self.sessions.get_mut(hash).ok_or(Error::NotFound)?;
+        if s.torrent.is_some() {
+            return Ok(()); // already has metadata
+        }
+        let mut ctx = SessionCtx {
+            host: &mut self.host,
+            cache: &mut self.cache,
+            peer_id: self.peer_id,
+            port: self.cfg.listen_port,
+            now,
+            dht: self.dht.as_mut(),
+            events: &mut self.events,
+        };
+        s.install_torrent(t, &mut ctx);
+        Ok(())
     }
 
     /// Best-effort removal of the active NAT/firewall port mapping.
@@ -819,6 +883,28 @@ impl<H: Host> Engine<H> {
         }
         self.drive_tcp(now);
         self.drive_udp(now);
+        // uTP transport (BEP-29): retransmits, delayed ACKs, LEDBAT window
+        // updates, timeouts, and inbound SYN acceptance. It shares the UDP
+        // socket with DHT/LSD; packets are demultiplexed in `drive_udp`.
+        if self.udp_open {
+            let now_us = now.saturating_mul(1000);
+            self.utp.tick(&mut self.host, now_us);
+            for (conn, addr) in self.utp.take_accepted() {
+                self.inbound.insert(
+                    conn,
+                    InboundPeer {
+                        addr,
+                        buf: Vec::new(),
+                    },
+                );
+            }
+            for conn in self.utp.take_reaped() {
+                // Connecting peers (uTP handshake never finished) fall back
+                // to TCP; established ones are just dropped.
+                let was_connecting = self.connecting.contains(&conn);
+                self.cleanup_utp_conn(conn, now, was_connecting);
+            }
+        }
         // Compute the spontaneous-refresh target BEFORE borrowing `dht` mutably (borrow rules).
         // Snowball diffusion: a small table refreshes 4x as often, so a few bootstrap nodes
         // snowball into the wider network quickly even with zero active torrents.
@@ -982,6 +1068,30 @@ impl<H: Host> Engine<H> {
             if self.ip_count(&addr) >= self.cfg.max_connections_per_ip {
                 continue;
             }
+            // Prefer uTP (BEP-29) when the UDP socket is up: modern peers
+            // almost always listen on uTP, and LEDBAT keeps our traffic
+            // background-friendly. TCP is the fallback when the uTP
+            // handshake times out (see `cleanup_utp_conn`).
+            if !self.cfg.proxy.is_some() && self.udp_open {
+                let conn = self.utp.connect(addr, now.saturating_mul(1000));
+                self.conn_owner.insert(conn, hash);
+                self.connecting.push(conn);
+                self.connect_deadline
+                    .insert(conn, now.saturating_add(self.cfg.connect_timeout_ms));
+                let mut ctx = SessionCtx {
+                    host: &mut self.host,
+                    cache: &mut self.cache,
+                    peer_id: self.peer_id,
+                    port: self.cfg.listen_port,
+                    now,
+                    dht: self.dht.as_mut(),
+                    events: &mut self.events,
+                };
+                if let Some(s) = self.sessions.get_mut(&hash) {
+                    s.attach_peer(conn, addr, true, source, &mut ctx);
+                }
+                continue;
+            }
             // In proxy mode we dial the proxy; the real peer endpoint is
             // remembered for the SOCKS CONNECT and the session bookkeeping.
             let dial = match &proxy {
@@ -1067,6 +1177,38 @@ impl<H: Host> Engine<H> {
                 Some(h) => *h,
                 None => continue,
             };
+            // uTP handshakes are driven by the transport manager; here we
+            // only observe completion and enforce the connect deadline.
+            if crate::utp::is_utp_handle(conn) {
+                if self.utp.is_connected(conn) {
+                    self.connect_deadline.remove(&conn);
+                    let mut ctx = SessionCtx {
+                        host: &mut self.host,
+                        cache: &mut self.cache,
+                        peer_id: self.peer_id,
+                        port: self.cfg.listen_port,
+                        now,
+                        dht: self.dht.as_mut(),
+                        events: &mut self.events,
+                    };
+                    if let Some(s) = self.sessions.get_mut(&hash) {
+                        s.on_connect_done(conn, &mut ctx);
+                    }
+                } else {
+                    let deadline = self
+                        .connect_deadline
+                        .get(&conn)
+                        .copied()
+                        .unwrap_or(u64::MAX);
+                    if now > deadline {
+                        self.connect_deadline.remove(&conn);
+                        self.cleanup_utp_conn(conn, now, true); // TCP fallback
+                    } else {
+                        still_connecting.push(conn);
+                    }
+                }
+                continue;
+            }
             match self.host.tcp_connect_done(conn) {
                 Err(Error::WouldBlock) => {
                     // enforce the connect deadline: a dead proxy or a host
@@ -1278,7 +1420,7 @@ impl<H: Host> Engine<H> {
     fn pump_connection(&mut self, conn: ConnId, hash: InfoHash, now: u64) {
         let mut recv_buf = [0u8; 16 * 1024];
         loop {
-            match self.host.tcp_recv(conn, &mut recv_buf) {
+            match self.stream_recv(conn, &mut recv_buf) {
                 Ok(0) => {
                     // Orderly EOF: the peer closed the connection. Release
                     // the slot (and any in-flight block bookkeeping) instead
@@ -1374,7 +1516,7 @@ impl<H: Host> Engine<H> {
                     chunk
                 };
                 let want = core::cmp::min(chunk.len(), allowance as usize);
-                match self.host.tcp_send(conn, &chunk[..want]) {
+                match self.stream_send(conn, &chunk[..want]) {
                     Ok(n) => {
                         // account the sent bytes against the rate budgets
                         if let Some(s) = self.sessions.get_mut(&hash) {
@@ -1445,11 +1587,90 @@ impl<H: Host> Engine<H> {
         }
     }
 
+    // -------- transport routing (TCP vs uTP) --------
+
+    /// Non-blocking read from either transport (TCP host or uTP manager).
+    fn stream_recv(&mut self, conn: ConnId, buf: &mut [u8]) -> Result<usize> {
+        if crate::utp::is_utp_handle(conn) {
+            if !self.utp.is_live(conn) {
+                return Ok(0); // reaped/closed → EOF
+            }
+            self.utp.recv(conn, buf)
+        } else {
+            self.host.tcp_recv(conn, buf)
+        }
+    }
+
+    /// Non-blocking write to either transport.
+    fn stream_send(&mut self, conn: ConnId, data: &[u8]) -> Result<usize> {
+        if crate::utp::is_utp_handle(conn) {
+            if !self.utp.is_live(conn) {
+                return Err(Error::NotFound);
+            }
+            self.utp.send(conn, data)
+        } else {
+            self.host.tcp_send(conn, data)
+        }
+    }
+
+    /// Close either transport.
+    fn stream_close(&mut self, conn: ConnId) {
+        if crate::utp::is_utp_handle(conn) {
+            self.utp.close(conn);
+        } else {
+            self.host.tcp_close(conn);
+        }
+    }
+
+    /// Tear down a uTP connection (timeout / reap). With `tcp_fallback`, a
+    /// peer whose uTP handshake never completed is retried over TCP.
+    fn cleanup_utp_conn(&mut self, conn: ConnId, now: u64, tcp_fallback: bool) {
+        self.connect_deadline.remove(&conn);
+        self.connecting.retain(|&c| c != conn);
+        self.inbound.remove(&conn);
+        let hash = self.conn_owner.remove(&conn);
+        if let Some(hash) = hash {
+            let peer_info = self
+                .sessions
+                .get(&hash)
+                .and_then(|s| s.peers.get(&conn))
+                .map(|p| (p.addr, p.source));
+            // TCP fallback connect happens before the session is borrowed
+            // (borrow order: host, then ctx, then the session).
+            let fallback_conn = if tcp_fallback && !self.cfg.proxy.is_some() {
+                peer_info.and_then(|(addr, _)| self.host.tcp_connect(&addr).ok())
+            } else {
+                None
+            };
+            let mut ctx = SessionCtx {
+                host: &mut self.host,
+                cache: &mut self.cache,
+                peer_id: self.peer_id,
+                port: self.cfg.listen_port,
+                now,
+                dht: self.dht.as_mut(),
+                events: &mut self.events,
+            };
+            if let Some(s) = self.sessions.get_mut(&hash) {
+                s.drop_peer(conn, crate::monitoring::FailureCategory::Timeout, &mut ctx);
+                if let Some(tcp_conn) = fallback_conn {
+                    self.conn_owner.insert(tcp_conn, hash);
+                    self.connecting.push(tcp_conn);
+                    self.connect_deadline
+                        .insert(tcp_conn, now.saturating_add(self.cfg.connect_timeout_ms));
+                    if let Some((addr, source)) = peer_info {
+                        s.attach_peer(tcp_conn, addr, true, source, &mut ctx);
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle an inbound connection until its handshake reveals the hash.
     fn pump_inbound(&mut self, conn: ConnId, now: u64) {
         let mut recv_buf = [0u8; 16 * 1024];
         loop {
-            match self.host.tcp_recv(conn, &mut recv_buf) {
+            match self.stream_recv(conn, &mut recv_buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     let overflow = self
@@ -1458,7 +1679,7 @@ impl<H: Host> Engine<H> {
                         .is_some_and(|p| p.buf.len() + n > Self::MAX_INBOUND_BUF);
                     if overflow {
                         self.inbound.remove(&conn);
-                        self.host.tcp_close(conn);
+                        self.stream_close(conn);
                         return;
                     }
                     if let Some(p) = self.inbound.get_mut(&conn) {
@@ -1468,7 +1689,7 @@ impl<H: Host> Engine<H> {
                 Err(Error::WouldBlock) => break,
                 Err(_) => {
                     self.inbound.remove(&conn);
-                    self.host.tcp_close(conn);
+                    self.stream_close(conn);
                     return;
                 }
             }
@@ -1492,7 +1713,7 @@ impl<H: Host> Engine<H> {
                 }
                 Err(_) => {
                     self.inbound.remove(&conn);
-                    self.host.tcp_close(conn);
+                    self.stream_close(conn);
                     return;
                 }
             }
@@ -1514,7 +1735,7 @@ impl<H: Host> Engine<H> {
             None => {
                 // unknown torrent: drop
                 self.inbound.remove(&conn);
-                self.host.tcp_close(conn);
+                self.stream_close(conn);
                 return;
             }
         };
@@ -1572,6 +1793,17 @@ impl<H: Host> Engine<H> {
                     // LSD (BEP-14) announces start with "BT-SEARCH".
                     if payload.starts_with(b"BT-SEARCH") {
                         self.handle_lsd_datagram(addr, payload, now);
+                        continue;
+                    }
+                    // uTP (BEP-29) packets share the same UDP socket; they
+                    // are demultiplexed by the transport version nibble.
+                    if crate::utp::is_utp_datagram(payload) {
+                        self.utp.handle_datagram(
+                            &mut self.host,
+                            addr,
+                            payload,
+                            now.saturating_mul(1000),
+                        );
                         continue;
                     }
                     // DHT messages are bencoded dicts ('d' prefix)
@@ -1778,6 +2010,30 @@ impl<H: Host> Engine<H> {
         self.sessions.get(hash).and_then(|s| s.torrent.as_ref())
     }
 
+    /// Aggregate engine statistics for the UI stats dialog.
+    pub fn stats(&self) -> EngineStats {
+        let mut discarded = 0u64;
+        let mut peers = 0usize;
+        for s in self.sessions.values() {
+            discarded = discarded.saturating_add(s.discarded_bytes);
+            peers += s
+                .peers
+                .values()
+                .filter(|p| p.phase != crate::swarm::PeerPhase::Closed)
+                .count();
+        }
+        EngineStats {
+            cache: self.cache.stats,
+            cache_bytes: self.cache.total_buffered(),
+            cache_budget: self.cache.budget(),
+            cache_clean: self.cache.clean_used(),
+            cache_clean_budget: crate::disk_cache::DiskCache::CLEAN_BUDGET,
+            cache_dirty_entries: self.cache.dirty_entries(),
+            discarded_bytes: discarded,
+            connected_peers: peers,
+        }
+    }
+
     /// Flush dirty pieces to disk so every verified piece actually reaches
     /// stable storage. Call right before persisting resume state — the saved
     /// `have` bitfield must only claim pieces whose bytes are really on disk,
@@ -1807,6 +2063,13 @@ impl<H: Host> Engine<H> {
                 upload_limit_bps: s.cfg.upload_limit_bps,
                 download_limit_bps: s.cfg.download_limit_bps,
                 reputation: s.reputation.encode(),
+                // Persist the raw info dict so a magnet never needs to
+                // re-fetch metadata after a restart (qBittorrent parity).
+                info_raw: s
+                    .torrent
+                    .as_ref()
+                    .map(|t| t.info_raw.clone())
+                    .unwrap_or_default(),
             });
         }
         if let Some(d) = &self.dht {

@@ -40,6 +40,7 @@ pub mod state;
 pub mod swarm;
 pub mod tracker;
 pub mod trackerlist;
+pub mod utp;
 pub mod verify;
 pub mod wire;
 

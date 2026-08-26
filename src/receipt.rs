@@ -1,6 +1,5 @@
 //! Provable download & availability receipts.
 //!
-//! This is the research-grade "prove you downloaded and hold it" layer.
 //! A receipt is a signature over a canonical commitment binding:
 //!
 //! ```text
@@ -8,17 +7,12 @@
 //! ```
 //!
 //! * `content_root` — the torrent's infohash (v2: SHA-256 Merkle root, BEP-52).
-//! * `range` — the byte range the node attests to having fetched.
-//! * `epoch` — a wall-clock window, produced from `tzcraft::Ticks`.
-//! * `bytes` — the effective received byte count inside the range.
-//! * `challenge_digest` — commitment to an external challenge (auditor,
-//!   coordinator, or random beacon), so progress cannot be fabricated.
-//! * `data_proof` — a hash over *sampled real blocks* the node actually
-//!   holds, so the receipt is evidence of holding, not just claiming.
+//! * `range` / `epoch` / `bytes` — attested byte range, wall-clock window, byte count.
+//! * `challenge_digest` — commitment to an external challenge (no fabricated progress).
+//! * `data_proof` — hash over *sampled real blocks* actually held (evidence of holding).
 //!
-//! The [`ReceiptBook`] accumulates real coverage as pieces verify; a
-//! receipt can only be built for ranges the node genuinely covered, which
-//! prevents proxy-download and fake-progress attacks at the protocol level.
+//! [`ReceiptBook`] accumulates real coverage as pieces verify; receipts can
+//! only be built for genuinely covered ranges, blocking proxy/fake progress.
 
 use crate::crypto::{ed25519, Rng, Sha256};
 use crate::error::{Error, Result};

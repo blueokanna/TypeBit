@@ -1,18 +1,10 @@
-//! Port mapping (firewall / NAT traversal) for the engine's listen port:
-//! **NAT-PMP (RFC 6886)** with **UPnP IGD** (SSDP discovery + SOAP control)
-//! fallback.
-//!
-//! Pure, allocation-bounded protocol codecs plus a time-driven state
-//! machine the engine pumps once per tick. Transport comes from the
-//! [`Host`] seam (UDP datagrams, HTTP GET/POST); the default gateway comes
-//! from [`Host::default_gateway`]. NAT-PMP needs no HTTP at all; UPnP
-//! additionally requires [`Host::http_post`] and [`Host::local_ip`], which
-//! a platform may leave unsupported — the manager then records a clear
-//! failure instead of guessing.
-//!
-//! NAT-PMP responses and SSDP discovery replies arrive as unicast UDP
-//! datagrams on the engine's existing socket and are routed here by
-//! [`PortMapManager::handle_datagram`].
+//! Port mapping for the listen port: **NAT-PMP (RFC 6886)** with **UPnP IGD**
+//! (SSDP discovery + SOAP control) fallback. Allocation-bounded codecs plus
+//! a time-driven state machine pumped once per tick; transport via the
+//! [`Host`] seam. NAT-PMP needs no HTTP; UPnP needs
+//! [`Host::http_post`]/[`Host::local_ip`] (a platform may leave them
+//! unsupported → clear failure, not guessing). Replies arrive as unicast
+//! UDP on the engine socket, routed here by [`PortMapManager::handle_datagram`].
 
 use crate::error::{Error, Result};
 use crate::platform::{Host, NetAddr};

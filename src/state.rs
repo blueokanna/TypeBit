@@ -30,6 +30,11 @@ pub struct TorrentState {
     pub download_limit_bps: u64,
     /// Anti-leech reputation ledger (`leech::ReputationStore`, opaque bytes).
     pub reputation: Vec<u8>,
+    /// Raw bencoded `info` dict of the torrent (empty for magnets that have
+    /// not fetched metadata yet). Persisted so a magnet never re-fetches
+    /// metadata after a restart.
+    #[njson(default)]
+    pub info_raw: Vec<u8>,
 }
 
 /// Whole-session state.
@@ -85,6 +90,7 @@ mod tests {
                 upload_limit_bps: 0,
                 download_limit_bps: 1_000_000,
                 reputation: vec![1, 2, 3],
+                info_raw: vec![4, 5, 6],
             }],
             dht_nodes: vec![vec![2u8; 26]],
         }

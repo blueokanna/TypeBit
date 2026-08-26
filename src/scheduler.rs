@@ -5,10 +5,9 @@
 //! ```
 //!
 //! `U_task` is content-aware (video: head+tail; archives: tail then head;
-//! weights: head), `U_availability` rewards rarity (rarest-first),
-//! `C_network` penalizes pieces far from the frontier, `R_integrity` pieces
-//! touched by suspicious peers. Produces a per-piece integer utility vector
-//! consumed by [`crate::picker::Picker`].
+//! weights: head); `U_availability` rewards rarity; `C_network` penalizes
+//! frontier distance; `R_integrity` penalizes pieces touched by suspicious
+//! peers. Output: a per-piece utility vector for [`crate::picker::Picker`].
 
 use crate::metainfo::Torrent;
 use alloc::vec::Vec;

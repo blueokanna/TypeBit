@@ -1,18 +1,10 @@
-//! Anti-leech engine: peer-client fingerprinting, per-peer reputation,
-//! reciprocity-aware choke scoring (tit-for-tat), snub handling,
-//! corrupt-block accountability with escalating bans, the optimistic
-//! unchoke rotation, and an anti-flap (hysteresis) rule.
+//! Anti-leech engine: client fingerprinting, per-peer reputation,
+//! reciprocity-aware choke scoring (tit-for-tat), snub handling, corrupt
+//! accountability with bans, optimistic unchoke rotation, anti-flap.
 //!
-//! The design is deliberately **behavior-first**: client identity is only
-//! a *soft* signal (a `-`-prefixed code from the peer id); hard consequences
-//! (bans, disconnects) come exclusively from measured misbehavior —
-//! repeated corrupt blocks or protocol violations. This avoids both
-//! false-positive bans of legitimate peers and the "feed the leecher"
-//! failure mode of rate-only choke algorithms.
-//!
-//! Module dependencies point one way: `leech` depends only on
-//! [`crate::platform`]; it never reaches into `swarm` or `session`, so the
-//! algorithms are unit-testable in isolation.
+//! Behavior-first: client identity is a *soft* signal; hard consequences
+//! (bans, disconnects) come only from measured misbehavior. Depends only
+//! on [`crate::platform`], so algorithms are unit-testable in isolation.
 
 use crate::platform::{ConnId, NetAddr};
 use alloc::collections::BTreeMap;
@@ -767,23 +759,14 @@ fn permyriad(numer: u64, denom: u64) -> u32 {
 
 /// Anti-leech choke score for one peer. Higher = more deserving of a slot.
 ///
-/// * **Seeding** (we have everything): reward peers that return data to us
-///   (ratio health / good citizens); penalize free-riders, snubs, corrupt
-///   senders, idle slot squatters, and known aggressive clients. This is
-///   the fix for the old "feed the fastest downloader" behavior.
-/// * **Leeching** (we still download): reward peers that upload to us fast;
-///   penalize peers that drain our upload without ever giving back
-///   (tit-for-tat), plus the same behavior penalties.
+/// Seeding: reward peers that return data, penalize free-riders, snubs,
+/// corrupt senders, idle squatters, aggressive clients. Leeching: reward
+/// fast uploaders, penalize non-reciprocators (tit-for-tat).
 ///
-/// Two guards keep the scale sane:
-/// * **Grace period** — the tit-for-tat / free-rider / idle penalties only
-///   apply once the peer has been connected for [`LeechConfig::recip_grace_ms`],
-///   so a legitimate newcomer has time to warm up its upload pipeline
-///   before it can be labeled a leech.
-/// * **Clamped reward** — the positive reciprocity term is capped at
-///   [`LeechConfig::max_reciprocity_reward`], so lifetime bytes can never
-///   shield a peer from behavioral penalties (corruption, snubbing, free
-///   riding, idle squatting).
+/// Guards: a **grace period** ([`LeechConfig::recip_grace_ms`]) delays
+/// reciprocity penalties so newcomers can warm up; the reward is
+/// **clamped** ([`LeechConfig::max_reciprocity_reward`]) so lifetime bytes
+/// never shield behavioral penalties.
 pub fn choke_score(cfg: &LeechConfig, seeding: bool, v: &PeerChokeView) -> i64 {
     let mut s: i64 = 0;
     // Penalties that describe *current misbehavior* only apply after the
@@ -839,16 +822,11 @@ pub fn choke_score(cfg: &LeechConfig, seeding: bool, v: &PeerChokeView) -> i64 {
 
 /// Select the peers to unchoke.
 ///
-/// Selection rules:
-/// 1. When seeding, only peers interested in us are eligible (serving
-///    someone uninterested is pointless); when leeching, all ready peers
-///    are eligible so the swarm stays connected.
-/// 2. The optimistic peer (BEP-3) reserves one slot up front so new peers
-///    always get a chance to prove reciprocity.
-/// 3. Currently-unchoked peers keep their slot (anti-flap stickiness).
-/// 4. Remaining slots go to the best-scoring newcomers; a newcomer only
-///    displaces an incumbent when it beats the weakest holder by
-///    `anti_flap_threshold`.
+/// Rules: (1) seeding → only interested peers eligible; leeching → all
+/// ready peers. (2) The optimistic peer (BEP-3) reserves one slot for
+/// newcomers. (3) Unchoked peers keep their slot (anti-flap). (4) Remaining
+/// slots go to best-scoring newcomers, displacing incumbents only when they
+/// beat the weakest holder by `anti_flap_threshold`.
 pub fn select_unchoke_set<F>(
     views: &[PeerChokeView],
     seeding: bool,

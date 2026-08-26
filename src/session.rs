@@ -40,7 +40,16 @@ const DHT_ANNOUNCE_INTERVAL_MS: u64 = 60_000;
 const METADATA_SERVED_IDLE_TIMEOUT_MS: u64 = 10_000;
 
 /// HTTP announce in-flight window: no second HTTP connection for a tracker within it.
-const HTTP_ANNOUNCE_PENDING_MS: u64 = 15_000;
+/// How long before the same HTTP tracker may be re-announced (pending
+/// guard). 5 s keeps a multi-tracker rotation fast while still bounding the
+/// concurrency the shared async HTTP worker sees.
+const HTTP_ANNOUNCE_PENDING_MS: u64 = 5_000;
+
+/// How many HTTP trackers one announce call fires at once (bounded by the
+/// async worker's concurrency). Batched announce means a magnet (metadata
+/// fetch) reaches its full tracker set quickly instead of one tracker per
+/// 15-second window.
+const HTTP_ANNOUNCE_BATCH: usize = 4;
 
 /// Per-file download priority (selective download).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +407,8 @@ pub struct TorrentSession {
     pub downloaded_bytes: u64,
     /// Bytes uploaded (payload).
     pub uploaded_bytes: u64,
+    /// Bytes received but discarded (duplicate blocks, oversized frames).
+    pub discarded_bytes: u64,
     /// Last choke pass time.
     last_unchoke_at: u64,
     /// Optimistic unchoke peer.
@@ -538,6 +549,7 @@ impl TorrentSession {
             started_at: 0,
             downloaded_bytes: 0,
             uploaded_bytes: 0,
+            discarded_bytes: 0,
             last_unchoke_at: 0,
             optimistic: None,
             optimistic_at: 0,
@@ -609,6 +621,7 @@ impl TorrentSession {
             started_at: 0,
             downloaded_bytes: 0,
             uploaded_bytes: 0,
+            discarded_bytes: 0,
             last_unchoke_at: 0,
             optimistic: None,
             optimistic_at: 0,
@@ -1166,13 +1179,9 @@ impl TorrentSession {
             }
         }
         // (d) failure handling: rotate seeds, then back off after ALL seeds
-        // have failed in this round. `fails` is per-seed: without resetting
-        // it on rotation, the first failure of the next seed immediately
-        // re-triggers the rotation, and with more than one web seed the
-        // `len <= 1` guard meant NO backoff ever fired — an unreachable set
-        // of web seeds retried every tick forever, hammering DNS and
-        // starving the shared async HTTP worker (tracker announces queue
-        // behind the endless web-seed fetches, so downloads stall).
+        // failed this round. `fails` is per-seed and reset on rotation, else
+        // the first failure of the next seed re-triggers rotation and no
+        // backoff ever fires (unreachable seeds retry forever).
         if self.webseed.fails >= self.cfg.webseed.max_fails {
             self.webseed.fails = 0;
             self.webseed.seed_idx = (self.webseed.seed_idx + 1) % self.web_seeds.len();
@@ -1648,12 +1657,8 @@ impl TorrentSession {
         if self.torrent.is_none() && peer.ext_metadata.is_none() && their.has_metadata() {
             // request will be triggered once we learn their ut_metadata id
         }
-        // Interest is NOT decided here: their availability (bitfield /
-        // have_all / have_none) always follows the handshake, so we derive
-        // it from `sync_interest` as soon as `dispatch` processes those
-        // messages — and again on every `have`. That keeps a seed that
-        // unchokes only interested peers from deadlocking us (see
-        // `Peer::should_be_interested`).
+        // Interest is derived from their availability messages via
+        // `sync_interest` (see `Peer::should_be_interested`), not here.
         // record peer id in monitor (no-op), log via event
         self.monitor.record_rates(peer.addr, 0, 0, ctx.now);
         ctx.events.push(EngineEvent::PeerConnected {
@@ -1702,15 +1707,11 @@ impl TorrentSession {
             Some(p) => p,
             None => return,
         };
-        // If this call consumed the handshake, its bytes (and only the
-        // bytes *after* it) were already routed above: the handshake went
-        // into `handshake_buf` and the leftover into `msgs`. Re-feeding
-        // `data` here would inject the raw handshake bytes into the message
-        // stream — its leading 4 bytes (`0x13 'B' 'i' 't'`) parse as a
-        // ~323 MB frame, so every peer would be dropped as a "protocol
-        // violator" the instant its handshake + first messages (bitfield,
-        // unchoke…) arrive in one TCP segment. Only feed `data` when the
-        // peer was already Ready before this call.
+        // If this call consumed the handshake, only the bytes after it were
+        // routed above. Re-feeding `data` would inject the raw handshake —
+        // its leading 4 bytes (`0x13 'B' 'i' 't'`) parse as a ~323 MB frame,
+        // dropping every peer as a "protocol violator". Feed `data` only
+        // when the peer was already Ready before this call.
         if !just_handshook && peer.phase == PeerPhase::Ready && peer.handshake_buf.is_empty() {
             peer.msgs.feed(data);
         }
@@ -2206,7 +2207,7 @@ impl TorrentSession {
         }
     }
 
-    fn install_torrent<H: Host>(&mut self, t: Torrent, ctx: &'_ mut SessionCtx<'_, H>) {
+    pub(crate) fn install_torrent<H: Host>(&mut self, t: Torrent, ctx: &'_ mut SessionCtx<'_, H>) {
         let piece_count = t.piece_count();
         self.pieces = PieceTracker::new(piece_count, t.piece_length);
         self.availability = vec![0; piece_count as usize];
@@ -2278,7 +2279,7 @@ impl TorrentSession {
             }
         }
         // keep the peer discovery flowing for metadata-only sessions
-        if ctx.now.saturating_sub(self.announce_at) >= 15_000 {
+        if ctx.now.saturating_sub(self.announce_at) >= 8_000 {
             self.announce_at = ctx.now;
             self.announce_to_tracker(ctx, TrackerEvent::Started);
         }
@@ -2317,6 +2318,7 @@ impl TorrentSession {
         };
         let mut attempt = 0;
         let mut pending_skipped = false;
+        let mut http_fired = 0usize;
         let total = self.trackers.len();
         while attempt < total {
             let idx = self.tracker_cursor % total;
@@ -2351,9 +2353,14 @@ impl TorrentSession {
                     };
                     if job_id != 0 {
                         self.trackers[idx].http_job_id = job_id;
+                        http_fired += 1;
+                        attempt += 1;
                         self.tracker_cursor = (self.tracker_cursor + 1) % total;
-                        self.announce_at = ctx.now + HTTP_ANNOUNCE_PENDING_MS;
-                        return;
+                        if http_fired >= HTTP_ANNOUNCE_BATCH {
+                            self.announce_at = ctx.now + HTTP_ANNOUNCE_PENDING_MS;
+                            return;
+                        }
+                        continue; // fire the next tracker in the batch
                     }
                     // Sync fallback (host without an async worker, or proxy mode).
                     let mut body = Vec::new();
@@ -3044,6 +3051,8 @@ impl TorrentSession {
             .pieces
             .mark_block_received(index, block as u16, total_blocks);
         if !newly {
+            // Duplicate / out-of-window block: the bytes are discarded.
+            self.discarded_bytes = self.discarded_bytes.saturating_add(data.len() as u64);
             return Ok(());
         }
         self.piece_suppliers.entry(index).or_default().push(conn);
@@ -3053,6 +3062,9 @@ impl TorrentSession {
             .or_insert_with(|| vec![0u8; pi.len as usize]);
         if begin as usize + data.len() <= entry.len() {
             entry[begin as usize..begin as usize + data.len()].copy_from_slice(&data);
+        } else {
+            // Oversized / unaligned frame: untrustworthy, discard.
+            self.discarded_bytes = self.discarded_bytes.saturating_add(data.len() as u64);
         }
         self.downloaded_bytes += data.len() as u64;
         self.monitor.record_piece_cover(self.peer_addr(conn), index);

@@ -1,12 +1,8 @@
 //! Piece hash verification, optionally offloaded to a `std` worker pool so
-//! the engine event loop keeps pumping peer I/O while SHA-1 / SHA-256 runs
-//! on other cores.
-//!
-//! Under `no_std` (embedded targets) [`VerifyPool`] is a no-op handle and
-//! verification stays inline — the single-core model is the correct one
-//! there, and the crate remains fully `no_std`-compatible. Both paths share
-//! the pure [`verify_piece`] function, so pooled and inline results are
-//! guaranteed identical.
+//! the engine loop keeps pumping I/O while SHA-1 / SHA-256 runs on other
+//! cores. Under `no_std`, [`VerifyPool`] is a no-op handle (inline
+//! verification). Both paths share the pure [`verify_piece`] function, so
+//! pooled and inline results are guaranteed identical.
 
 use crate::metainfo::{InfoHash, TorrentKind};
 use alloc::vec::Vec;

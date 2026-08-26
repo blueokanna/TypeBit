@@ -23,16 +23,11 @@ pub struct Picker;
 impl Picker {
     /// Pick the best piece to request from a peer.
     ///
-    /// `utilities` comes from the scheduler; `availability` is the per-piece
-    /// peer count (used for rare-first tie-breaking); `peer_have` is the
-    /// peer's piece bitfield and `peer_has_all` whether it declared
-    /// `have_all` (fast extension, BEP-6) — a `have_all` seed owns every
-    /// piece while its bitfield stays empty, so the picker MUST NOT consult
-    /// `peer_have` for it or it would refuse to pick anything and stall the
-    /// download at 0% against seeds. `priorities` carries per-piece
-    /// multipliers from the file priorities (0 = skipped file — such pieces
-    /// are never picked). Pieces we already have or (unless endgame) already
-    /// have in flight are skipped.
+    /// `availability` (peer count) breaks rarity ties; `peer_has_all`
+    /// (BEP-6) means the seed owns every piece while its bitfield is empty,
+    /// so `peer_have` MUST NOT be consulted for it. `priorities` are
+    /// per-piece multipliers (0 = skipped). Pieces we have, or (unless
+    /// endgame) have in flight, are skipped.
     pub fn pick_piece(
         tracker: &PieceTracker,
         utilities: &[i64],

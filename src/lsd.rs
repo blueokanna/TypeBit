@@ -1,11 +1,8 @@
-//! Local Service Discovery (LSD, BEP-14).
+//! Local Service Discovery (LSD, BEP-14): announce our presence in active
+//! swarms to LAN neighbours over UDP multicast, and answer their announces
+//! — no internet tracker or DHT needed.
 //!
-//! Announces our presence in active swarms to neighbours on the same LAN
-//! over UDP multicast, and answers their announces. This is the standard
-//! way LAN-local peers (same office / home network / campus) find each
-//! other without any internet tracker or DHT.
-//!
-//! Protocol (from the BEP):
+//! Protocol:
 //! ```text
 //! BT-SEARCH * HTTP/1.1\r\n
 //! Host: <multicast group>\r\n
@@ -14,12 +11,8 @@
 //! cookie: <opaque hex, optional>\r\n
 //! \r\n
 //! ```
-//! A client that has the announced torrent replies with the same shape
-//! (its own `Port`, the same infohash) sent **unicast** to the source
-//! address of the announce. The peer address is `source IP : Port header`.
-//!
-//! Usage rules we follow: at most one announce per minute, round-robin the
-//! active torrents so each is re-announced every ~5 minutes.
+//! A client that has the torrent replies **unicast** to the announce source.
+//! We announce at most once per minute, round-robining torrents (~5 min each).
 
 use alloc::string::String;
 use alloc::string::ToString;

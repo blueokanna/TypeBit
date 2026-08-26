@@ -30,17 +30,10 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
-/// A write-back cache keyed by (disk handle, absolute offset), plus a
-/// small bounded **read-through LRU** for seeding/upload reads.
-///
-/// Read amplification problem being solved: the write-back cache only
-/// serves reads while a block is still *dirty* (buffered before flush).
-/// As soon as a piece is flushed to disk it leaves the dirty map, so every
-/// subsequent upload read for that block hits the disk again — and with
-/// many peers requesting overlapping blocks the disk is read far faster
-/// than the upload can drain, i.e. disk read speed ≫ upload speed. The
-/// clean LRU keeps recently-read/flushed blocks resident so repeated
-/// upload reads are served from RAM.
+/// Write-back cache keyed by (disk handle, offset), plus a small bounded
+/// **read-through LRU** for seeding/upload reads: flushed pieces leave the
+/// dirty map, so the LRU keeps them resident and repeated upload reads
+/// (disk speed ≫ upload speed) are served from RAM instead of disk.
 #[derive(Debug)]
 pub struct DiskCache {
     budget: u64,
@@ -61,7 +54,7 @@ impl DiskCache {
     /// Cap on the clean read cache (1 MiB, kept deliberately modest — it
     /// exists to absorb upload read amplification, not to hold the whole
     /// piece set).
-    const CLEAN_BUDGET: u64 = 1 << 20;
+    pub const CLEAN_BUDGET: u64 = 1 << 20;
     /// Cap on clean entries (bounds eviction scans under pathological
     /// block-splitting).
     const CLEAN_MAX_ENTRIES: usize = 4096;
@@ -95,6 +88,21 @@ impl DiskCache {
             .range((disk, 0)..=(disk, u64::MAX))
             .map(|(_, v)| v.len() as u64)
             .sum()
+    }
+
+    /// Bytes held in the clean read-through LRU.
+    pub fn clean_used(&self) -> u64 {
+        self.clean_used
+    }
+
+    /// Number of dirty blocks awaiting flush (the write-back queue depth).
+    pub fn dirty_entries(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// Total bytes buffered (dirty + clean).
+    pub fn total_buffered(&self) -> u64 {
+        self.used.saturating_add(self.clean_used)
     }
 
     /// Buffer a write. Flushes oldest data first when over budget.

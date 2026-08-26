@@ -1,13 +1,10 @@
 //! OS-backed [`Host`] for desktop/server builds (feature `std`).
 //!
-//! This is a **complete, runnable** host for a standalone client: HTTP via
-//! `courierust` (tracker announces, web seeds), **non-blocking TCP** peer
-//! connections (the engine drives hundreds from one thread), a **UDP**
-//! socket (DHT + UDP trackers) and **file-backed disk** I/O. Every socket
-//! is put in non-blocking mode so the single engine thread never stalls;
-//! the engine's `Err(WouldBlock)` contract maps onto
-//! `io::ErrorKind::WouldBlock` (plus the Windows `ConnectionReset` quirk on
-//! UDP, which is transient).
+//! Complete runnable host: HTTP via `courierust` (tracker, web seeds),
+//! non-blocking TCP peers, a UDP socket (DHT + UDP trackers), file-backed
+//! disk I/O. All sockets non-blocking so the engine thread never stalls;
+//! `Err(WouldBlock)` maps to `io::ErrorKind::WouldBlock` (plus the
+//! transient Windows UDP `ConnectionReset` quirk).
 
 use crate::platform::{ConnId, DiskId};
 use crate::{Error, Host, LogLevel, NetAddr};

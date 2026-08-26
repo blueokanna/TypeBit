@@ -1,8 +1,6 @@
-//! In-tree cryptography for the TypeBit core.
-//!
-//! The engine may only link the four ecosystem crates; all cryptographic
-//! primitives therefore live here, implemented from scratch, `no_std`,
-//! `unsafe`-free, and pinned against standard test vectors:
+//! In-tree cryptography (the engine may only link the four ecosystem
+//! crates). Implemented from scratch, `no_std`, `unsafe`-free, pinned
+//! against standard test vectors:
 //!
 //! - [`sha1`] — FIPS 180-1 (BitTorrent v1)
 //! - [`sha256`] — FIPS 180-4 (BitTorrent v2 / BEP-52, receipts)

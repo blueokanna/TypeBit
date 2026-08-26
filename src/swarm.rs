@@ -192,14 +192,10 @@ impl Peer {
 
     /// Whether we should be interested (they have something we lack).
     ///
-    /// Interest is deliberately **independent of choke state**: it answers
-    /// "do they have at least one piece we want?", while whether we may
-    /// *request* from them is governed by `peer_choking`. Gating interest on
-    /// `peer_choking` deadlocks fresh downloads — a seed that only unchokes
-    /// peers who already declared `Interested` would never unchoke us,
-    /// because we would never declare interest while choked. We therefore
-    /// send `Interested` as soon as their availability shows a wanted piece,
-    /// choked or not.
+    /// Deliberately **independent of choke state**: gating interest on
+    /// `peer_choking` deadlocks fresh downloads (a seed unchokes only
+    /// interested peers, but we'd never declare interest while choked).
+    /// Send `Interested` as soon as their availability shows a wanted piece.
     pub fn should_be_interested(&self, our_have: &Bitfield) -> bool {
         if self.have_none {
             return false;

@@ -1,20 +1,13 @@
-//! SOCKS5 (RFC 1928) + username/password auth (RFC 1929) transport layer.
+//! SOCKS5 (RFC 1928) + username/password auth (RFC 1929) transport — the
+//! anonymity seam for **Tor** (SOCKS5h :9050) and **I2P** (SOCKS :4444).
+//! `no_std`, depends only on [`crate::platform`] + [`crate::error`].
 //!
-//! This is the anonymity seam for **Tor** (SOCKS5h on 127.0.0.1:9050) and
-//! **I2P** (SOCKS interface, commonly 127.0.0.1:4444). Everything here is
-//! `no_std` and depends only on [`crate::platform`] + [`crate::error`].
+//! Two entry points, one codec: [`Socks5Client`] — a non-blocking handshake
+//! state machine for every outbound peer; [`socks_http_get`] — a blocking
+//! HTTP GET through the proxy (domain resolved by the proxy) for trackers.
 //!
-//! Two entry points, sharing one codec:
-//!
-//! * [`Socks5Client`] — a **non-blocking** handshake state machine the
-//!   engine drives for every outbound peer connection.
-//! * [`socks_http_get`] — a **blocking** HTTP/1.1 GET executed *through*
-//!   the proxy (domain name sent to the proxy, so the client's resolver is
-//!   never involved). Used for HTTP tracker announces when proxied.
-//!
-//! Anonymity invariants enforced by the engine when a proxy is configured:
-//! no inbound connections, no DHT, no UDP trackers, no port mapping, and
-//! the advertised listen port is 0.
+//! When a proxy is configured the engine enforces: no inbound, no DHT, no
+//! UDP trackers, no port mapping, listen port 0.
 
 use crate::error::{Error, Result};
 use crate::platform::{ConnId, Host, NetAddr};
