@@ -4595,7 +4595,10 @@ mod tests {
         drive_then_fail(&mut s, &mut host);
         assert_eq!(s.webseed.seed_idx, 1, "rotated to seed 1");
         assert_eq!(s.webseed.fails, 0, "fails reset per seed");
-        assert_eq!(s.webseed.retry_at, 0, "no backoff after only one seed tried");
+        assert_eq!(
+            s.webseed.retry_at, 0,
+            "no backoff after only one seed tried"
+        );
 
         // Failure 3: first failure on seed 1.
         prime_piece(&mut s);
