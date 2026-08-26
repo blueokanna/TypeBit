@@ -1165,10 +1165,18 @@ impl TorrentSession {
                 self.webseed.fails = self.webseed.fails.saturating_add(1);
             }
         }
-        // (d) failure handling: rotate seeds, then back off
+        // (d) failure handling: rotate seeds, then back off after ALL seeds
+        // have failed in this round. `fails` is per-seed: without resetting
+        // it on rotation, the first failure of the next seed immediately
+        // re-triggers the rotation, and with more than one web seed the
+        // `len <= 1` guard meant NO backoff ever fired — an unreachable set
+        // of web seeds retried every tick forever, hammering DNS and
+        // starving the shared async HTTP worker (tracker announces queue
+        // behind the endless web-seed fetches, so downloads stall).
         if self.webseed.fails >= self.cfg.webseed.max_fails {
+            self.webseed.fails = 0;
             self.webseed.seed_idx = (self.webseed.seed_idx + 1) % self.web_seeds.len();
-            if self.web_seeds.len() <= 1 {
+            if self.webseed.seed_idx == 0 {
                 self.webseed.retry_at = now.saturating_add(self.cfg.webseed.backoff_ms);
             }
             self.abort_webseed_piece();
@@ -4508,6 +4516,122 @@ mod tests {
         assert!(
             s.webseed.data[..blen].iter().all(|&b| b == 0x42),
             "block bytes applied"
+        );
+    }
+
+    /// Regression: with MULTIPLE web seeds that all fail, the session must
+    /// back off once every seed has been tried. Previously the backoff only
+    /// fired when `web_seeds.len() <= 1` (and `fails` was never reset on
+    /// rotation), so an unreachable set of web seeds retried every tick
+    /// forever — hammering DNS and starving the shared async HTTP worker
+    /// that tracker announces depend on.
+    #[test]
+    fn webseed_backs_off_after_all_seeds_fail() {
+        let mut s = session();
+        s.status = SessionStatus::Downloading;
+        s.web_seeds = vec![
+            String::from("http://seed1.example/a/"),
+            String::from("http://seed2.example/b/"),
+        ];
+        s.cfg.webseed.max_fails = 2;
+        s.cfg.webseed.backoff_ms = 60_000;
+
+        let prime_piece = |s: &mut TorrentSession| {
+            s.webseed.piece = Some(0);
+            s.webseed.next_block = 0;
+            s.webseed.total_blocks = block_count_for(256 * 1024);
+            s.webseed.data = vec![0u8; 256 * 1024];
+        };
+        let mut host = AsyncHttpHost {
+            next_job: 0,
+            urls: Vec::new(),
+            done: Vec::new(),
+        };
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+
+        // Drive one fetch, then fail it (returns through on_range_job_done).
+        let mut drive_then_fail = |s: &mut TorrentSession, host: &mut AsyncHttpHost| {
+            {
+                let mut ctx = SessionCtx {
+                    host: &mut *host,
+                    cache: &mut cache,
+                    peer_id: [7u8; 20],
+                    port: 6881,
+                    now: 1_000_000,
+                    dht: None,
+                    events: &mut events,
+                };
+                s.drive_webseed(&mut ctx);
+            }
+            assert_ne!(s.webseed.job_id, 0, "a job must be in flight");
+            let job_id = s.webseed.job_id;
+            host.done.push((job_id, Err(crate::error::Error::Io)));
+            let jobs = host.http_take_done();
+            {
+                let mut ctx = SessionCtx {
+                    host: &mut *host,
+                    cache: &mut cache,
+                    peer_id: [7u8; 20],
+                    port: 6881,
+                    now: 1_000_000,
+                    dht: None,
+                    events: &mut events,
+                };
+                for (id, res) in jobs {
+                    s.on_range_job_done(id, res, &mut ctx);
+                }
+            }
+        };
+
+        // Failure 1: counted on seed 0, no rotation.
+        prime_piece(&mut s);
+        drive_then_fail(&mut s, &mut host);
+        assert_eq!(s.webseed.fails, 1, "first failure counted");
+        assert_eq!(s.webseed.seed_idx, 0, "still on seed 0");
+        assert_eq!(s.webseed.retry_at, 0, "no backoff after one failure");
+
+        // Failure 2: seed 0 hits max_fails -> rotate to seed 1 (no backoff yet).
+        drive_then_fail(&mut s, &mut host);
+        assert_eq!(s.webseed.seed_idx, 1, "rotated to seed 1");
+        assert_eq!(s.webseed.fails, 0, "fails reset per seed");
+        assert_eq!(s.webseed.retry_at, 0, "no backoff after only one seed tried");
+
+        // Failure 3: first failure on seed 1.
+        prime_piece(&mut s);
+        drive_then_fail(&mut s, &mut host);
+        assert_eq!(s.webseed.fails, 1, "seed 1 first failure");
+        assert_eq!(s.webseed.seed_idx, 1, "still on seed 1");
+
+        // Failure 4: seed 1 hits max_fails -> wraps to seed 0 -> BACK OFF.
+        drive_then_fail(&mut s, &mut host);
+        assert_eq!(s.webseed.seed_idx, 0, "wrapped back to seed 0");
+        assert_eq!(s.webseed.fails, 0, "fails reset for the new round");
+        assert!(
+            s.webseed.retry_at > 1_000_000,
+            "backoff must be scheduled after ALL seeds failed (retry_at={})",
+            s.webseed.retry_at
+        );
+        assert!(s.webseed.piece.is_none(), "piece aborted during backoff");
+
+        // While backing off, drive_webseed must NOT fire a new job.
+        let before = host.urls.len();
+        {
+            let mut ctx = SessionCtx {
+                host: &mut host,
+                cache: &mut cache,
+                peer_id: [7u8; 20],
+                port: 6881,
+                now: 1_000_000,
+                dht: None,
+                events: &mut events,
+            };
+            s.drive_webseed(&mut ctx);
+        }
+        assert_eq!(
+            host.urls.len(),
+            before,
+            "no new web-seed job while backing off"
         );
     }
 }

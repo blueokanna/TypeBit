@@ -1620,7 +1620,7 @@ impl<H: Host> Engine<H> {
     /// walk different parts of the keyspace over time without needing an
     /// engine-owned RNG).
     fn dht_refresh_target(&self, now: u64) -> [u8; 20] {
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&now.to_be_bytes());
         buf[8..].copy_from_slice(&self.dht_refresh_serial.to_be_bytes());
         let h = crate::crypto::sha256::Sha256::digest(&buf);
