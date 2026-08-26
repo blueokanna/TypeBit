@@ -257,9 +257,26 @@ impl Host for StdHost {
     }
 
     fn resolve_host(&self, host: &str, port: u16) -> Option<NetAddr> {
-        let mut addrs = (host, port).to_socket_addrs().ok()?;
-        let a = addrs.next()?;
-        Some(from_socket_addr(a))
+        // Prefer an IPv4 address: the UDP socket is bound to `0.0.0.0`
+        // (IPv4-only), so returning an IPv6-first address (the BEP-5
+        // routers publish both families, and `getaddrinfo` may order v6
+        // first) made every bootstrap `send_to` fail with
+        // WSAEAFNOSUPPORT (os error 10047) and left the DHT with zero
+        // seeds — "magnet stuck at metadata". IPv4 is also the family the
+        // routing table and compact peer lists are overwhelmingly v4.
+        let addrs = (host, port).to_socket_addrs().ok()?;
+        let mut v6: Option<NetAddr> = None;
+        for a in addrs {
+            match from_socket_addr(a) {
+                v @ NetAddr::V4(..) => return Some(v),
+                v @ NetAddr::V6(..) => {
+                    if v6.is_none() {
+                        v6 = Some(v);
+                    }
+                }
+            }
+        }
+        v6
     }
 
     fn resolve_host_all(&self, host: &str, port: u16) -> alloc::vec::Vec<NetAddr> {
