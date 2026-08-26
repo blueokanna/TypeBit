@@ -82,9 +82,22 @@ impl Default for EngineConfig {
 }
 
 /// How often the engine retries DHT bootstrap while the routing table is
-/// still empty. Fast retry keeps the DHT searching from app launch and
-/// recovers quickly if the table is ever evicted to zero.
+/// still tiny. Fast retry keeps the DHT searching from app launch and
+/// recovers quickly if the table is ever evicted.
 const BOOTSTRAP_RETRY_MS: u64 = 5_000;
+
+/// Re-bootstrap while the routing table has fewer than this many nodes.
+///
+/// A table that only ever reached 1 node (e.g. a single ZERO placeholder
+/// whose ping was dropped) would otherwise NEVER re-run
+/// [`Engine::bootstrap_dht`] — the guard only fired at exactly `size()==0`.
+/// The seeds the async DNS resolver has since produced would sit unused in
+/// `dht_seeds` and the DHT would stay dormant forever, which surfaces as
+/// "magnet stuck at metadata while qBittorrent succeeds" (DHT is the main
+/// peer-discovery source for trackers-less magnets). A small-table
+/// threshold re-injects the resolved seeds every retry window until the
+/// bootstrap pings snowball the table past the threshold.
+const DHT_REBOOTSTRAP_THRESHOLD: usize = 8;
 
 /// Snapshot of engine-wide counters, surfaced to the UI (qBittorrent-style
 /// stats dialog). Every field is a real counter — nothing is fabricated.
@@ -936,32 +949,23 @@ impl<H: Host> Engine<H> {
                     );
                 }
             }
-            // Spontaneous node discovery (Kademlia bucket refresh): even with no active torrents,
-            // keep the table warm by starting a `find_node` lookup for a random target — this is
-            // how the DHT discovers the wider network on its own (iterative lookups + cache).
             if let Some(target) = dht_refresh_target {
                 self.last_dht_find_node = now;
                 dht.find_node(target, now);
             }
         }
-        // Drain async DHT-seed resolutions every tick (never blocks; the
-        // host's resolver thread does the DNS work).
         self.collect_dht_seeds(now);
-        // Retry bootstrap when the table is empty (cached seeds; DNS at most once).
         let needs_bootstrap = self
             .dht
             .as_ref()
             .map(|d| {
-                d.table().size() == 0
+                d.table().size() < DHT_REBOOTSTRAP_THRESHOLD
                     && now.saturating_sub(self.last_bootstrap_at) >= BOOTSTRAP_RETRY_MS
             })
             .unwrap_or(false);
         if needs_bootstrap {
             self.bootstrap_dht(now);
         }
-        // Route completed async HTTP jobs (tracker announces + web-seed
-        // block fetches) to their sessions. The host's worker performs the
-        // requests on its own thread, so the engine never blocks on HTTP.
         self.pump_http_jobs(now);
         let hashes: Vec<InfoHash> = self.sessions.keys().copied().collect();
         for h in hashes {
