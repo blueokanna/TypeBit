@@ -119,17 +119,20 @@ pub mod msgid {
     pub const PORT: u8 = 9;
     /// 20 — extended message.
     pub const EXTENDED: u8 = 20;
-    // fast extension
-    /// 0x0E — suggest.
-    pub const SUGGEST: u8 = 0x0E;
-    /// 0x0F — have_all.
-    pub const HAVE_ALL: u8 = 0x0F;
-    /// 0x10 — have_none.
-    pub const HAVE_NONE: u8 = 0x10;
-    /// 0x11 — reject.
-    pub const REJECT: u8 = 0x11;
-    /// 0x12 — allowed_fast.
-    pub const ALLOWED_FAST: u8 = 0x12;
+    // A seed announces HAVE_ALL right after the handshake; misdecoding it as SUGGEST (whose
+    // 4-byte payload is absent) made every fast-extension peer a "protocol
+    // violator" and dropped it — the metadata fetch could never complete
+    // even with healthy qBittorrent peers connected.)
+    /// 0x0D — suggest.
+    pub const SUGGEST: u8 = 0x0D;
+    /// 0x0E — have_all.
+    pub const HAVE_ALL: u8 = 0x0E;
+    /// 0x0F — have_none.
+    pub const HAVE_NONE: u8 = 0x0F;
+    /// 0x10 — reject.
+    pub const REJECT: u8 = 0x10;
+    /// 0x11 — allowed_fast.
+    pub const ALLOWED_FAST: u8 = 0x11;
 }
 
 /// A decoded peer-wire message.

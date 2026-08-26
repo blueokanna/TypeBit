@@ -1624,7 +1624,16 @@ impl TorrentSession {
         peer.phase = PeerPhase::Ready;
         // send bitfield (or have_all/have_none)
         if peer.fast {
-            if self.pieces.have_count() == self.pieces.piece_count() {
+            // A metadata-fetching session has piece_count == 0: have_count
+            // (0) equals piece_count (0), so the naive check would announce
+            // HAVE_ALL — "I own every piece" — while we own none and are
+            // still asking for metadata. Seeds read that as a lie and close
+            // the connection, which is exactly why magnets never completed
+            // metadata against qBittorrent peers. Empty sessions must
+            // announce HAVE_NONE.
+            if self.pieces.have_count() == self.pieces.piece_count()
+                && self.pieces.piece_count() > 0
+            {
                 peer.send(&Message::HaveAll);
             } else if self.pieces.have_count() == 0 {
                 peer.send(&Message::HaveNone);
@@ -2045,29 +2054,31 @@ impl TorrentSession {
                 }
             }
             if self.torrent.is_none() {
-                if let Some(peer) = self.peers.get(&conn) {
-                    if let Some(meta_id) = peer.ext_metadata {
-                        let msg = Message::Extended {
-                            id: meta_id,
-                            payload: MetadataMsg::Request { piece: 0 }.encode(),
-                        };
-                        if let Some(p) = self.peers.get_mut(&conn) {
-                            p.send(&msg);
-                        }
-                        if let Some(m) = self.metadata.as_mut() {
-                            m.outstanding += 1;
-                        }
+                let meta_id = self.peers.get(&conn).and_then(|p| p.ext_metadata);
+                if let Some(meta_id) = meta_id {
+                    let msg = Message::Extended {
+                        id: meta_id,
+                        payload: MetadataMsg::Request { piece: 0 }.encode(),
+                    };
+                    if let Some(p) = self.peers.get_mut(&conn) {
+                        p.send(&msg);
+                    }
+                    if let Some(m) = self.metadata.as_mut() {
+                        m.outstanding += 1;
                     }
                 }
             }
             return Ok(());
         }
-        // ut_metadata (id 3 as we advertise)
+        // ut_metadata / ut_pex — the extended id in an INCOMING message is
+        // OUR advertised id (each side sends extended messages using the
+        // RECEIVER's advertised id: the peer sends its metadata DATA with
+        // our ut_metadata id = 3). `ext_metadata`/`ext_pex` (the ids the
+        // peer advertised) are what WE must use when SENDING to it.
         if id == 3 {
             let m = MetadataMsg::parse(&payload)?;
             return self.on_metadata_msg(conn, m, ctx);
         }
-        // ut_pex (id 5)
         if id == 5 {
             let pex = PexMsg::parse(&payload)?;
             self.on_pex(conn, pex, ctx);
