@@ -430,6 +430,15 @@ pub trait Host {
     /// fragmentation and reduces per-piece allocation churn.
     fn disk_prealloc(&mut self, id: DiskId, size: u64) -> Result<()>;
 
+    /// Record the allocation strategy for a freshly-opened file before
+    /// [`Host::disk_prealloc`]: 0 = off, 1 = sparse, 2 = full. Hosts may
+    /// ignore the hint (the default no-op keeps custom hosts
+    /// source-compatible); the native Windows host uses it to mark sparse
+    /// files so reserved extents do not consume real disk space.
+    fn disk_set_alloc(&mut self, _id: DiskId, _mode: u8) -> Result<()> {
+        Ok(())
+    }
+
     /// Flush buffered writes for this file to stable storage.
     fn disk_flush(&mut self, id: DiskId) -> Result<()>;
 

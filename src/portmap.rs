@@ -476,6 +476,16 @@ pub struct PortMapManager {
     control_url: Option<String>,
     /// Whether the live mapping was established via UPnP (vs NAT-PMP).
     using_upnp: bool,
+    /// UDP mapping established. Both UDP and TCP must be live before the
+    /// manager reports [`PortMapPhase::Mapped`] — inbound peer connections
+    /// are TCP, inbound DHT/tracker traffic is UDP, so a single-protocol
+    /// mapping leaves half the port unreachable from the outside.
+    mapped_udp: bool,
+    /// TCP mapping established.
+    mapped_tcp: bool,
+    /// Set by [`PortMapManager::unmap`] so a finished unmap cycle stays
+    /// disabled instead of re-arming the periodic retry probe.
+    manual_unmap: bool,
     next: u64,
     error: Option<String>,
 }
@@ -494,6 +504,9 @@ impl PortMapManager {
             location: None,
             control_url: None,
             using_upnp: false,
+            mapped_udp: false,
+            mapped_tcp: false,
+            manual_unmap: false,
             next: 0,
             error: None,
         }
@@ -505,6 +518,9 @@ impl PortMapManager {
             return;
         }
         self.protocol = Some(MapProtocol::Udp);
+        self.mapped_udp = false;
+        self.mapped_tcp = false;
+        self.manual_unmap = false;
         self.external_port = None;
         self.location = None;
         self.control_url = None;
@@ -529,10 +545,13 @@ impl PortMapManager {
         }
     }
 
-    /// Best-effort removal of the current mapping.
+    /// Best-effort removal of both live mappings (UDP then TCP). After the
+    /// cycle completes the manager stays disabled (no periodic re-probe).
     pub fn unmap(&mut self, now: u64) {
         if self.phase == PortMapPhase::Mapped {
             self.phase = PortMapPhase::Unmapping;
+            self.protocol = Some(MapProtocol::Udp);
+            self.manual_unmap = true;
             self.sent_at = None;
             self.next = now;
         }
@@ -618,22 +637,38 @@ impl PortMapManager {
             PortMapPhase::UpnpFetching => self.step_upnp_fetch(host, now),
             PortMapPhase::UpnpMapping => self.step_upnp_map(host, now),
             PortMapPhase::Mapped => {
-                // lease about to expire → renew through the active method
+                // lease about to expire → full refresh cycle: re-map UDP,
+                // then TCP, through the transport that last succeeded.
                 self.sent_at = None;
                 self.next = now;
-                if self.using_upnp {
-                    self.phase = PortMapPhase::UpnpMapping;
+                self.mapped_udp = false;
+                self.mapped_tcp = false;
+                self.protocol = Some(MapProtocol::Udp);
+                self.phase = if self.using_upnp {
+                    PortMapPhase::UpnpMapping
                 } else {
-                    self.phase = PortMapPhase::NatPmpMapping;
-                }
+                    PortMapPhase::NatPmpMapping
+                };
             }
             PortMapPhase::Unmapping => {
+                // Delete the current protocol now, TCP on the next tick.
+                let proto = self.protocol.unwrap_or(MapProtocol::Udp);
                 let _ = self.send_delete(host);
-                self.phase = PortMapPhase::Done;
-                self.next = now;
+                if proto == MapProtocol::Udp {
+                    self.protocol = Some(MapProtocol::Tcp);
+                    self.sent_at = None;
+                    self.next = now;
+                } else {
+                    self.phase = PortMapPhase::Done;
+                    self.next = now;
+                }
             }
             PortMapPhase::Done | PortMapPhase::Failed => {
-                // periodic retry (long backoff, no hammering)
+                // periodic retry (long backoff, no hammering) — unless we
+                // were explicitly unmapped, in which case stay disabled.
+                if self.manual_unmap {
+                    return;
+                }
                 self.phase = PortMapPhase::NatPmpProbe;
                 self.sent_at = None;
                 self.next = now + self.cfg.retry_interval_ms;
@@ -668,6 +703,35 @@ impl PortMapManager {
         match proto {
             MapProtocol::Udp => self.cfg.udp_port,
             MapProtocol::Tcp => self.cfg.tcp_port,
+        }
+    }
+
+    /// Record a successful mapping for the current protocol. Once both UDP
+    /// and TCP are live the manager settles in [`PortMapPhase::Mapped`];
+    /// until then it advances to the next protocol using the same transport
+    /// (NAT-PMP or UPnP) that just succeeded.
+    fn on_mapping_success(&mut self, now: u64, external: u16) {
+        self.error = None;
+        self.external_port = Some(external);
+        match self.protocol {
+            Some(MapProtocol::Udp) => self.mapped_udp = true,
+            Some(MapProtocol::Tcp) => self.mapped_tcp = true,
+            None => {}
+        }
+        if self.mapped_udp && self.mapped_tcp {
+            self.phase = PortMapPhase::Mapped;
+            self.sent_at = None;
+            self.next = now + refresh_interval(self.cfg.lease_sec);
+        } else {
+            // Advance to the next protocol; the transport is already known.
+            self.protocol = Some(MapProtocol::Tcp);
+            self.sent_at = None;
+            self.next = now;
+            self.phase = if self.using_upnp {
+                PortMapPhase::UpnpMapping
+            } else {
+                PortMapPhase::NatPmpMapping
+            };
         }
     }
 
@@ -737,11 +801,8 @@ impl PortMapManager {
         match host.http_post(&url, &body, self.cfg.step_timeout_ms, &mut resp) {
             Ok(()) => {
                 if soap_succeeded(&resp, SoapAction::Add) {
-                    self.error = None;
                     self.using_upnp = true;
-                    self.external_port = Some(port);
-                    self.phase = PortMapPhase::Mapped;
-                    self.next = now + refresh_interval(self.cfg.lease_sec);
+                    self.on_mapping_success(now, port);
                 } else {
                     self.fail("upnp: AddPortMapping rejected");
                 }
@@ -808,14 +869,11 @@ impl PortMapManager {
                     return false;
                 }
                 if resp.result == NAT_PMP_OK {
-                    self.error = None;
-                    self.external_port = resp.external_port.or(Some(
-                        self.port_for(self.protocol.unwrap_or(MapProtocol::Udp)),
-                    ));
                     self.using_upnp = false;
-                    self.phase = PortMapPhase::Mapped;
-                    self.sent_at = None;
-                    self.next = now + refresh_interval(self.cfg.lease_sec);
+                    let external = resp.external_port.unwrap_or_else(|| {
+                        self.port_for(self.protocol.unwrap_or(MapProtocol::Udp))
+                    });
+                    self.on_mapping_success(now, external);
                 } else if resp.result == NAT_PMP_UNSUPPORTED {
                     self.enter_upnp_discover(now, "nat-pmp mapping unsupported");
                 } else {
@@ -1097,9 +1155,19 @@ mod tests {
         assert_eq!(host.sent.len(), 2);
         let (_, req) = &host.sent[1];
         assert_eq!(req[1], NAT_PMP_MAP_UDP);
-        // gateway grants the mapping
+        // gateway grants the UDP mapping
         let reply = nat_pmp_map_reply(NAT_PMP_MAP_UDP, NAT_PMP_OK);
         assert!(pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &reply, 20));
+        // UDP alone is not enough: the manager advances to the TCP mapping
+        assert!(!pm.is_mapped());
+        assert_eq!(pm.status().external_port, Some(6881));
+        pm.tick(&mut host, 20);
+        assert_eq!(host.sent.len(), 3);
+        let (_, req) = &host.sent[2];
+        assert_eq!(req[1], NAT_PMP_MAP_TCP);
+        // gateway grants the TCP mapping too
+        let treply = nat_pmp_map_reply(NAT_PMP_MAP_TCP, NAT_PMP_OK);
+        assert!(pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &treply, 30));
         assert!(pm.is_mapped());
         assert_eq!(pm.status().external_port, Some(6881));
     }
@@ -1120,14 +1188,17 @@ mod tests {
         let mut pub_reply = [0u8; 12];
         pub_reply[8..12].copy_from_slice(&[203, 0, 113, 9]);
         pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &pub_reply, 10);
-        pm.tick(&mut host, 10);
+        pm.tick(&mut host, 10); // UDP map sent
         let reply = nat_pmp_map_reply(NAT_PMP_MAP_UDP, NAT_PMP_OK);
         pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &reply, 20);
+        pm.tick(&mut host, 20); // TCP map sent
+        let treply = nat_pmp_map_reply(NAT_PMP_MAP_TCP, NAT_PMP_OK);
+        pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &treply, 30);
         assert!(pm.is_mapped());
-        // at refresh time the renewing map request is issued on the next tick
+        // at refresh time the renewing UDP map request is issued on the next tick
         let sent_before = host.sent.len();
-        pm.tick(&mut host, 20 + 60_000);
-        pm.tick(&mut host, 20 + 60_000);
+        pm.tick(&mut host, 30 + 60_000);
+        pm.tick(&mut host, 30 + 60_000);
         assert_eq!(host.sent.len(), sent_before + 1);
         assert_eq!(host.sent[sent_before].1[1], NAT_PMP_MAP_UDP);
     }
@@ -1163,11 +1234,87 @@ mod tests {
         pm.tick(&mut host, 10);
         let ssdp = "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1:5000/rootDesc.xml\r\n\r\n";
         assert!(pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 1900), ssdp.as_bytes(), 20));
-        // fetch description, then the SOAP AddPortMapping, on subsequent ticks
+        // fetch description, then SOAP AddPortMapping for UDP then TCP
+        pm.tick(&mut host, 20);
         pm.tick(&mut host, 20);
         pm.tick(&mut host, 20);
         assert!(pm.is_mapped());
         assert!(pm.status().error.is_none());
+    }
+
+    #[test]
+    fn port_mapper_maps_both_protocols_in_order() {
+        let mut host = ScriptedHost::new([192, 168, 1, 1]);
+        let cfg = PortMapConfig {
+            enabled: true,
+            udp_port: 6881,
+            tcp_port: 6881,
+            ..Default::default()
+        };
+        let mut pm = PortMapManager::new(cfg);
+        pm.start(0);
+        pm.tick(&mut host, 0);
+        let mut pub_reply = [0u8; 12];
+        pub_reply[8..12].copy_from_slice(&[203, 0, 113, 9]);
+        pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &pub_reply, 10);
+        pm.tick(&mut host, 10); // UDP map request
+                                // UDP granted → advances straight to the TCP mapping (no re-probe)
+        let reply = nat_pmp_map_reply(NAT_PMP_MAP_UDP, NAT_PMP_OK);
+        pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &reply, 20);
+        assert!(!pm.is_mapped());
+        assert_eq!(pm.status().phase, PortMapPhase::NatPmpMapping);
+        pm.tick(&mut host, 20);
+        assert_eq!(host.sent[host.sent.len() - 1].1[1], NAT_PMP_MAP_TCP);
+        // TCP granted → fully mapped
+        let treply = nat_pmp_map_reply(NAT_PMP_MAP_TCP, NAT_PMP_OK);
+        pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &treply, 30);
+        assert!(pm.is_mapped());
+        assert_eq!(pm.status().external_port, Some(6881));
+    }
+
+    #[test]
+    fn port_mapper_unmaps_both_protocols_and_stays_disabled() {
+        let mut host = ScriptedHost::new([192, 168, 1, 1]);
+        let cfg = PortMapConfig {
+            enabled: true,
+            udp_port: 6881,
+            tcp_port: 6881,
+            retry_interval_ms: 1000,
+            ..Default::default()
+        };
+        let mut pm = PortMapManager::new(cfg);
+        pm.start(0);
+        pm.tick(&mut host, 0);
+        let mut pub_reply = [0u8; 12];
+        pub_reply[8..12].copy_from_slice(&[203, 0, 113, 9]);
+        pm.handle_datagram(&NetAddr::V4([192, 168, 1, 1], 5351), &pub_reply, 10);
+        pm.tick(&mut host, 10);
+        pm.handle_datagram(
+            &NetAddr::V4([192, 168, 1, 1], 5351),
+            &nat_pmp_map_reply(NAT_PMP_MAP_UDP, NAT_PMP_OK),
+            20,
+        );
+        pm.tick(&mut host, 20);
+        pm.handle_datagram(
+            &NetAddr::V4([192, 168, 1, 1], 5351),
+            &nat_pmp_map_reply(NAT_PMP_MAP_TCP, NAT_PMP_OK),
+            30,
+        );
+        assert!(pm.is_mapped());
+        // unmap: UDP delete now, TCP delete on the next tick, then Done
+        pm.unmap(40);
+        pm.tick(&mut host, 40);
+        let (_, req) = &host.sent[host.sent.len() - 1];
+        assert_eq!(req[1], NAT_PMP_MAP_UDP);
+        assert_eq!(req[11], 0); // lifetime 0 = delete
+        assert_eq!(pm.status().phase, PortMapPhase::Unmapping);
+        pm.tick(&mut host, 40);
+        let (_, req) = &host.sent[host.sent.len() - 1];
+        assert_eq!(req[1], NAT_PMP_MAP_TCP);
+        assert_eq!(pm.status().phase, PortMapPhase::Done);
+        // even after the retry backoff elapses, a manual unmap stays off
+        pm.tick(&mut host, 40 + 1_000);
+        assert_eq!(pm.status().phase, PortMapPhase::Done);
     }
 
     #[test]

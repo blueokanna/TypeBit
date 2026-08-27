@@ -168,6 +168,48 @@ pub struct PeerSnapshot {
     pub in_flight: u32,
 }
 
+/// Disk file allocation strategy (fragmentation vs. upfront cost).
+///
+/// BitTorrent pieces arrive in roughly random order; a file that simply
+/// grows block-by-block gets scattered clusters on HDDs. Reserving the full
+/// logical extent when the file is first opened lets the OS lay out the
+/// whole file contiguously in one pass — the single biggest fragmentation
+/// win, at the cost of reserving the final size up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preallocation {
+    /// No upfront allocation — files grow as pieces land. Least startup
+    /// I/O, most fragmentation on rotating media.
+    Off = 0,
+    /// Reserve the full logical extent at open time (contiguous layout),
+    /// but consume disk space only for data actually written. On Windows
+    /// this is implemented as a sparse file (`FSCTL_SET_SPARSE` +
+    /// `SetEndOfFile`); elsewhere it is a plain `set_len`.
+    #[default]
+    Sparse = 1,
+    /// Reserve the full extent and physically write it out. Best
+    /// contiguous layout on all filesystems; costs the full disk size and
+    /// an initial write pass for every file.
+    Full = 2,
+}
+
+impl Preallocation {
+    /// Stable numeric code for config / FFI.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a stable numeric code, defaulting to [`Preallocation::Sparse`]
+    /// (the safe middle ground: fragmentation resistance without wasting
+    /// disk space on sparse-capable filesystems).
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            2 => Preallocation::Full,
+            0 => Preallocation::Off,
+            _ => Preallocation::Sparse,
+        }
+    }
+}
+
 /// Per-torrent configuration.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -218,6 +260,10 @@ pub struct SessionConfig {
     /// Local TCP/DHT listen port (used for PEX port advertisement when no
     /// externally-confirmed port is available).
     pub listen_port: u16,
+    /// Disk file allocation strategy. Applied when a torrent's files are
+    /// first opened ([`TorrentSession::open_files`]); changing it only
+    /// affects torrents added afterwards.
+    pub preallocation: Preallocation,
 }
 
 impl Default for SessionConfig {
@@ -241,6 +287,7 @@ impl Default for SessionConfig {
             upload_limit_bps: 0,
             download_limit_bps: 0,
             file_priorities: Vec::new(),
+            preallocation: Preallocation::default(),
         }
     }
 }
@@ -816,14 +863,18 @@ impl TorrentSession {
         self.status = SessionStatus::Stopped;
     }
 
-    /// Open all files and preallocate.
+    /// Open all files and apply the configured allocation strategy.
     fn open_files<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) -> Result<()> {
         if self.files.is_empty() {
             if let Some(t) = &self.torrent {
+                let alloc = self.cfg.preallocation;
                 for f in &t.files {
                     let path = self.file_path(f);
                     let id = ctx.host.disk_open(&path)?;
-                    let _ = ctx.host.disk_prealloc(id, f.length);
+                    if alloc != Preallocation::Off {
+                        let _ = ctx.host.disk_set_alloc(id, alloc.code());
+                        let _ = ctx.host.disk_prealloc(id, f.length);
+                    }
                     self.files.push(id);
                 }
             }

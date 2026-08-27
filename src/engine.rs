@@ -736,6 +736,12 @@ impl<H: Host> Engine<H> {
         }
     }
 
+    /// Live UPnP/NAT-PMP port-mapping status (phase + granted external
+    /// port), for hosts to surface in their UI. `None` when disabled.
+    pub fn port_mapping_status(&self) -> Option<crate::portmap::PortMapStatus> {
+        self.portmap.as_ref().map(|pm| pm.status())
+    }
+
     /// Drain engine events (call frequently).
     pub fn take_events(&mut self) -> Vec<EngineEvent> {
         core::mem::take(&mut self.events)
