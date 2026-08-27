@@ -395,9 +395,6 @@ pub fn encode(msg: &KrpcMsg) -> Vec<u8> {
         KrpcBody::Response { id, resp, ip } => {
             root.push((b"y", bytes("r")));
             let mut r: Vec<(&[u8], BVal)> = vec![(b"id", bytes(id.0.to_vec()))];
-            // BEP-42: report the sender's address as observed (only when the
-            // request came from a routable endpoint — never a private/loopback
-            // one, which would leak a LAN address and poison NAT detection).
             if let Some(ipv) = ip {
                 if ipv.len() == 4 || ipv.len() == 16 {
                     r.push((b"ip", bytes(ipv.clone())));
@@ -525,8 +522,6 @@ pub fn decode(payload: &[u8]) -> Result<KrpcMsg> {
                     .and_then(|x| x.as_bytes())
                     .ok_or(Error::Dht)?,
             )?);
-            // BEP-42: the sender's observation of OUR address (4/16 bytes;
-            // tolerate the 6/18-byte ip:port form some clients use).
             let ip = r
                 .get(&b"ip"[..])
                 .and_then(|x| x.as_bytes())
@@ -538,8 +533,7 @@ pub fn decode(payload: &[u8]) -> Result<KrpcMsg> {
                     .and_then(|x| x.as_bytes())
                     .unwrap_or(&[])
                     .to_vec();
-                let mut peers = parse_compact_peers(r.get(&b"values"[..]));
-                peers.extend(parse_compact_peers6(r.get(&b"values6"[..])));
+                let peers = parse_values_field(r.get(&b"values"[..]), r.get(&b"values6"[..]));
                 let mut nodes = parse_compact_nodes(r.get(&b"nodes"[..]));
                 nodes.extend(parse_compact_nodes6(r.get(&b"nodes6"[..])));
                 KrpcBody::Response {
@@ -594,6 +588,72 @@ fn read20(b: &[u8]) -> Result<[u8; 20]> {
     Ok(out)
 }
 
+/// Parse a get_peers response's `values` field. BEP-5 permits TWO shapes in
+/// the wild:
+/// 1. A single byte string of concatenated compact peers (modern/current).
+/// 2. A LIST of byte strings (legacy/mainline, e.g. libtorrent-era nodes),
+///    where each item is one compact endpoint (6/18 bytes) or a 20-byte peer
+///    node-id (no endpoint — skipped).
+///
+/// The old code only handled shape 1, so every list-form response yielded
+/// ZERO peers — which made tracker-less magnets (pure-DHT discovery) unable
+/// to find any peers even when the DHT was answering with values.
+fn parse_values_field(
+    v: Option<&crate::bencode::BVal>,
+    v6: Option<&crate::bencode::BVal>,
+) -> Vec<NetAddr> {
+    let mut out = Vec::new();
+    match v {
+        Some(crate::bencode::BVal::Bytes(b)) => {
+            for c in b.as_chunks::<6>().0 {
+                if let Some(a) = NetAddr::from_compact6(c) {
+                    out.push(a);
+                }
+            }
+        }
+        Some(crate::bencode::BVal::List(items)) => {
+            for item in items {
+                if let Some(b) = item.as_bytes() {
+                    if b.len() == 6 {
+                        if let Some(a) = NetAddr::from_compact6(b) {
+                            out.push(a);
+                        }
+                    } else if b.len() == 18 {
+                        if let Some(a) = NetAddr::from_compact18(b) {
+                            out.push(a);
+                        }
+                    }
+                    // 20-byte items are peer node-ids without an endpoint:
+                    // not directly connectable, skip.
+                }
+            }
+        }
+        _ => {}
+    }
+    match v6 {
+        Some(crate::bencode::BVal::Bytes(b)) => {
+            for c in b.as_chunks::<18>().0 {
+                if let Some(a) = NetAddr::from_compact18(c) {
+                    out.push(a);
+                }
+            }
+        }
+        Some(crate::bencode::BVal::List(items)) => {
+            for item in items {
+                if let Some(b) = item.as_bytes() {
+                    if b.len() == 18 {
+                        if let Some(a) = NetAddr::from_compact18(b) {
+                            out.push(a);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 fn parse_compact_nodes(v: Option<&crate::bencode::BVal>) -> Vec<NodeEntry> {
     let mut out = Vec::new();
     if let Some(b) = v.and_then(|x| x.as_bytes()) {
@@ -626,30 +686,6 @@ fn parse_compact_nodes6(v: Option<&crate::bencode::BVal>) -> Vec<NodeEntry> {
                     last_seen: 0,
                     failed: 0,
                 });
-            }
-        }
-    }
-    out
-}
-
-fn parse_compact_peers(v: Option<&crate::bencode::BVal>) -> Vec<NetAddr> {
-    let mut out = Vec::new();
-    if let Some(b) = v.and_then(|x| x.as_bytes()) {
-        for c in b.as_chunks::<6>().0 {
-            if let Some(a) = NetAddr::from_compact6(c) {
-                out.push(a);
-            }
-        }
-    }
-    out
-}
-
-fn parse_compact_peers6(v: Option<&crate::bencode::BVal>) -> Vec<NetAddr> {
-    let mut out = Vec::new();
-    if let Some(b) = v.and_then(|x| x.as_bytes()) {
-        for c in b.as_chunks::<18>().0 {
-            if let Some(a) = NetAddr::from_compact18(c) {
-                out.push(a);
             }
         }
     }

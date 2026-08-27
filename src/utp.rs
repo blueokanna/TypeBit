@@ -611,6 +611,8 @@ impl UtpSocket {
 pub struct UtpManager {
     conns: BTreeMap<ConnId, UtpSocket>,
     next_handle: u32,
+    /// Outbound connection-ID allocator. BEP-29: the initiator picks an ODD
+    next_send_id: u16,
     /// New inbound sockets (SYN accepted), for the engine to attach.
     accepted: VecDeque<(ConnId, NetAddr)>,
     /// Sockets closed by RESET/timeout/FIN-ACK since the last call.
@@ -623,6 +625,7 @@ impl UtpManager {
         UtpManager {
             conns: BTreeMap::new(),
             next_handle: 1,
+            next_send_id: 1,
             accepted: VecDeque::new(),
             reaped: VecDeque::new(),
         }
@@ -632,12 +635,10 @@ impl UtpManager {
     /// [`Self::tick`].
     pub fn connect(&mut self, addr: NetAddr, now: u64) -> ConnId {
         let handle = self.alloc_handle();
-        let send_id = now as u16;
+        let send_id = self.next_send_id;
+        self.next_send_id = self.next_send_id.wrapping_add(2);
         let recv_id = send_id.wrapping_add(1);
         let mut sock = UtpSocket::new(handle, addr, send_id, recv_id, now);
-        // We have received nothing yet: the peer's first DATA has seq 0, so
-        // our cumulative ACK starts one below it — otherwise that first
-        // DATA would be misread as a duplicate of the SYN.
         sock.ack_nr = sock.syn_seq.wrapping_sub(1);
         self.conns.insert(handle, sock);
         handle
@@ -754,7 +755,6 @@ impl UtpManager {
         };
         let body = &payload[HDR_LEN..];
 
-        // Route by the connection's receive id.
         for sock in self.conns.values() {
             if sock.recv_id == h.conn_id {
                 let id = sock.handle;
@@ -765,7 +765,6 @@ impl UtpManager {
             }
         }
 
-        // Unknown connection: accept a SYN by creating a responder socket.
         if h.ptype == ST_SYN {
             let handle = self.alloc_handle();
             let recv_id = h.conn_id;
