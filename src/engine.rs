@@ -586,6 +586,30 @@ impl<H: Host> Engine<H> {
         s.set_file_priority(file, prio)
     }
 
+    /// Atomically replace the per-file priorities of a torrent and release
+    /// any two-phase magnet hold.
+    pub fn set_file_priorities(
+        &mut self,
+        hash: &InfoHash,
+        priorities: &[FilePriority],
+    ) -> Result<()> {
+        let s = self.sessions.get_mut(hash).ok_or(Error::NotFound)?;
+        s.set_file_priorities(priorities)
+    }
+
+    /// Two-phase magnet support: hold off data downloads until per-file
+    /// priorities are committed.
+    pub fn set_hold_data(&mut self, hash: &InfoHash, hold: bool) -> Result<()> {
+        let s = self.sessions.get_mut(hash).ok_or(Error::NotFound)?;
+        s.set_hold_data(hold);
+        Ok(())
+    }
+
+    /// Whether a torrent session is currently holding off data downloads.
+    pub fn holding_data(&self, hash: &InfoHash) -> Option<bool> {
+        self.sessions.get(hash).map(|s| s.holding_data())
+    }
+
     /// Priority of one file in a torrent.
     pub fn file_priority(&self, hash: &InfoHash, file: u32) -> Option<FilePriority> {
         self.sessions.get(hash).map(|s| s.file_priority(file))

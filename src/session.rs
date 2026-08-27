@@ -466,6 +466,11 @@ pub struct TorrentSession {
     piece_priorities: Vec<i64>,
     /// Number of pieces selected for download (skipped pieces excluded).
     selected_piece_count: u32,
+    /// Two-phase magnet hold: when set, the session keeps fetching metadata
+    /// and running discovery but requests NO data pieces (every piece
+    /// priority is forced to 0) until per-file priorities are committed via
+    /// [`Self::set_file_priorities`] or [`Self::set_hold_data(false)`].
+    hold_data_until_priorities: bool,
     /// Piece index → supplier connection ids (corrupt-block attribution).
     piece_suppliers: BTreeMap<u32, Vec<ConnId>>,
     /// Assembled pieces handed to the verifier (piece → bytes), drained by
@@ -582,6 +587,7 @@ impl TorrentSession {
             tick_down_remaining: 0,
             piece_priorities,
             selected_piece_count,
+            hold_data_until_priorities: false,
             piece_suppliers: BTreeMap::new(),
             pending_verify: BTreeMap::new(),
             verifying: BTreeMap::new(),
@@ -655,6 +661,7 @@ impl TorrentSession {
             tick_down_remaining: 0,
             piece_priorities: Vec::new(),
             selected_piece_count: 0,
+            hold_data_until_priorities: false,
             piece_suppliers: BTreeMap::new(),
             pending_verify: BTreeMap::new(),
             verifying: BTreeMap::new(),
@@ -679,8 +686,6 @@ impl TorrentSession {
         self.announce_at = ctx.now;
         self.refresh_completion();
         self.open_files(ctx)?;
-        // Kick DHT discovery FIRST so the first get_peers is never delayed by the (blocking) announce;
-        // the HTTP `Started` announce is deferred to the tick so `start()` never blocks.
         if let Some(dht) = ctx.dht.as_mut() {
             dht.get_peers(self.tracker_hash, ctx.port, ctx.now);
             self.dht_started = true;
@@ -738,7 +743,6 @@ impl TorrentSession {
         self.status = SessionStatus::Downloading;
         self.refresh_completion();
         self.announce_at = ctx.now;
-        // DHT re-discovery is instant; the blocking `Started` announce is deferred to the tick.
         if let Some(dht) = ctx.dht.as_mut() {
             dht.get_peers(self.tracker_hash, ctx.port, ctx.now);
             self.dht_started = true;
@@ -831,6 +835,48 @@ impl TorrentSession {
         Ok(())
     }
 
+    /// Two-phase magnet support: when `hold` is set, the session keeps
+    /// fetching metadata and running discovery but requests NO data pieces
+    /// until per-file priorities are committed. Clearing the hold re-derives
+    /// the piece priorities from the current file priorities.
+    pub fn set_hold_data(&mut self, hold: bool) {
+        self.hold_data_until_priorities = hold;
+        self.recompute_priorities();
+    }
+
+    /// Whether the session is currently holding off data downloads while
+    /// waiting for a per-file priority commit.
+    pub fn holding_data(&self) -> bool {
+        self.hold_data_until_priorities
+    }
+
+    /// Atomically replace the per-file priorities (selective download) and
+    /// release any hold set by [`Self::set_hold_data`]. Index-aligned with
+    /// the torrent's file list; trailing entries default to `Normal`.
+    /// Returns `Err(NotFound)` when metadata has not arrived yet.
+    pub fn set_file_priorities(&mut self, priorities: &[FilePriority]) -> Result<()> {
+        let t = match &self.torrent {
+            Some(t) => t.clone(),
+            None => return Err(Error::NotFound),
+        };
+        let n = core::cmp::min(priorities.len(), t.files.len());
+        self.cfg.file_priorities.clear();
+        self.cfg
+            .file_priorities
+            .extend(priorities[..n].iter().copied());
+        self.hold_data_until_priorities = false;
+        self.recompute_priorities();
+        if self.status != SessionStatus::Failed {
+            if self.selected_piece_count == 0 {
+                self.status = SessionStatus::Seeding;
+            } else {
+                self.status = SessionStatus::Downloading;
+            }
+            self.refresh_completion();
+        }
+        Ok(())
+    }
+
     /// The priority of one file (`Normal` when unset).
     pub fn file_priority(&self, file: u32) -> FilePriority {
         self.cfg
@@ -885,8 +931,6 @@ impl TorrentSession {
                 .extend(priorities[..n].iter().map(|b| file_priority_from_u8(*b)));
             self.recompute_priorities();
         }
-        // anti-leech: restore the persistent reputation ledger so repeat
-        // offenders start pre-penalized. Malformed blobs are ignored.
         if !reputation.is_empty() {
             if let Some(r) = ReputationStore::decode(reputation) {
                 self.reputation = r;
@@ -937,6 +981,10 @@ impl TorrentSession {
         let (prio, selected) = compute_piece_priorities(&t, &self.cfg.file_priorities);
         self.piece_priorities = prio;
         self.selected_piece_count = selected;
+        if self.hold_data_until_priorities {
+            self.piece_priorities.iter_mut().for_each(|p| *p = 0);
+            self.selected_piece_count = 0;
+        }
         // the selection may have shrunk below what we already have
         self.refresh_completion();
     }
@@ -968,14 +1016,10 @@ impl TorrentSession {
                 .saturating_sub(self.pieces.have_count());
             self.endgame = outstanding <= self.cfg.endgame_pieces;
         }
-        // choke/unchoke pass
         if ctx.now.saturating_sub(self.last_unchoke_at) >= self.cfg.leech.rechoke_interval_ms {
             self.choke_pass(ctx);
             self.last_unchoke_at = ctx.now;
         }
-        // anti-leech: when near capacity with candidates waiting, evict the
-        // worst peers so better candidates can connect. This keeps the
-        // swarm fresh instead of letting bad peers occupy slots forever.
         if self.peers.len() as u32 >= self.cfg.max_peers.saturating_mul(3) / 4
             && !self.connect_queue.is_empty()
             && ctx.now.saturating_sub(self.last_evict_at) >= self.cfg.leech.rechoke_interval_ms
@@ -983,19 +1027,9 @@ impl TorrentSession {
             self.last_evict_at = ctx.now;
             self.evict_worst(ctx);
         }
-        // Drop peers that got our full metadata but never interacted since:
-        // harvesters/dead conns must not squat session/connection capacity.
         self.drop_metadata_idle(ctx);
-        // DHT lookup / peer pull
         if self.dht_started {
             if let Some(dht) = ctx.dht.as_mut() {
-                // Re-issue the lookup on a cadence. `get_peers` never
-                // duplicates an active lookup, so this is cheap while one is
-                // running; but a lookup that was pruned (timeout, or started
-                // before the bootstrap populated the table) is re-created
-                // here — otherwise a later-successful bootstrap would never
-                // be asked for this torrent again and the downloader would
-                // stay at 0 peers forever.
                 if ctx.now.saturating_sub(self.last_dht_announce) >= DHT_ANNOUNCE_INTERVAL_MS {
                     self.last_dht_announce = ctx.now;
                     dht.get_peers(self.tracker_hash, ctx.port, ctx.now);
@@ -1108,12 +1142,9 @@ impl TorrentSession {
                 }
             }
         };
-        // (c) a block fetch is already in flight → wait for it (never block)
         if self.webseed.job_id != 0 {
             return;
         }
-        // Fire an async range fetch (engine never blocks on web seeds);
-        // proxy mode has no async seam, so fall back to the sync SOCKS GET.
         if self.cfg.proxy.is_none() {
             let job_id = ctx.host.http_get_range_async(
                 &url,
@@ -1181,10 +1212,6 @@ impl TorrentSession {
                 self.webseed.fails = self.webseed.fails.saturating_add(1);
             }
         }
-        // (d) failure handling: rotate seeds, then back off after ALL seeds
-        // failed this round. `fails` is per-seed and reset on rotation, else
-        // the first failure of the next seed re-triggers rotation and no
-        // backoff ever fires (unreachable seeds retry forever).
         if self.webseed.fails >= self.cfg.webseed.max_fails {
             self.webseed.fails = 0;
             self.webseed.seed_idx = (self.webseed.seed_idx + 1) % self.web_seeds.len();
@@ -1194,7 +1221,6 @@ impl TorrentSession {
             self.abort_webseed_piece();
             return;
         }
-        // (e) piece complete → hand to the verification pipeline
         if self.webseed.next_block >= self.webseed.total_blocks {
             let buf = core::mem::take(&mut self.webseed.data);
             self.pieces.set_in_flight(piece, true);
@@ -1298,12 +1324,9 @@ impl TorrentSession {
     }
 
     fn choke_pass<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
-        // 1. refresh snub flags
         for p in self.peers.values_mut() {
             p.refresh_snub(ctx.now, self.cfg.leech.snub_timeout_ms);
         }
-        // 2. rotate the optimistic slot fairly: newcomers get a chance to
-        //    prove reciprocity before we pick permanent favorites.
         let rotate = match self.optimistic {
             Some(c) => self
                 .peers
@@ -1319,8 +1342,6 @@ impl TorrentSession {
             self.optimistic = self.pick_optimistic();
             self.optimistic_at = ctx.now;
         }
-        // 3. build the choke views for ready peers (merging any stored
-        //    reputation so repeat offenders are scored from the start)
         let views: Vec<PeerChokeView> = self
             .peers
             .values()
@@ -1335,7 +1356,6 @@ impl TorrentSession {
             |id| self.peers.get(&id).map(|p| !p.am_choking).unwrap_or(false),
             self.optimistic,
         );
-        // 4. apply choke / unchoke transitions
         let cur: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in cur {
             let (was, now_choking) = {
@@ -1359,7 +1379,6 @@ impl TorrentSession {
                 }
             }
         }
-        // 5. interested / not interested
         let conns: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in conns {
             let want = {
@@ -1387,7 +1406,6 @@ impl TorrentSession {
             };
             let _ = send;
         }
-        // 6. roll rate windows
         for p in self.peers.values_mut() {
             p.roll_window(ctx.now);
         }
@@ -4662,5 +4680,58 @@ mod tests {
             before,
             "no new web-seed job while backing off"
         );
+    }
+
+    #[test]
+    fn magnet_hold_blocks_data_until_priorities_commit() {
+        let mut s = session();
+        // 3 pieces total: piece 0 -> file 0, pieces 1-2 -> file 1.
+        assert_eq!(s.piece_priorities.len(), 3);
+        assert_eq!(s.selected_piece_count, 3, "default: every piece selected");
+
+        // Hold: request nothing even though every file is Normal by default.
+        s.set_hold_data(true);
+        assert!(s.holding_data(), "hold flag set");
+        assert_eq!(
+            s.selected_piece_count, 0,
+            "hold forces zero selected pieces"
+        );
+        assert!(
+            s.piece_priorities.iter().all(|p| *p == 0),
+            "hold zeroes every piece priority"
+        );
+
+        // The picker must refuse to pick anything while held (a `have_all`
+        // peer is the most permissive case).
+        let peer = Bitfield::new(3);
+        let picked = Picker::pick_piece(
+            &s.pieces,
+            &s.scheduler.utilities(),
+            &s.availability,
+            &peer,
+            true,
+            &s.piece_priorities,
+            PickOptions::default(),
+        );
+        assert_eq!(picked, None, "no piece may be requested while held");
+
+        // Commit: keep file 0, skip file 1 -> only piece 0 selected.
+        s.set_file_priorities(&[FilePriority::Normal, FilePriority::Skip])
+            .expect("commit priorities");
+        assert!(!s.holding_data(), "commit releases the hold");
+        assert_eq!(s.selected_piece_count, 1, "only file 0 (piece 0) selected");
+        assert_eq!(s.piece_priorities[0], 1);
+        assert_eq!(s.piece_priorities[1], 0);
+        assert_eq!(s.piece_priorities[2], 0);
+
+        // Commit again: skip file 0, keep file 1 -> pieces 1-2 selected.
+        s.set_file_priorities(&[FilePriority::Skip, FilePriority::Normal])
+            .expect("commit priorities");
+        assert_eq!(
+            s.selected_piece_count, 2,
+            "only file 1 (pieces 1-2) selected"
+        );
+        assert_eq!(s.piece_priorities[0], 0);
+        assert!(s.piece_priorities[1] > 0 && s.piece_priorities[2] > 0);
     }
 }

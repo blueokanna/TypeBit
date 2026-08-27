@@ -255,12 +255,13 @@ impl Torrent {
                 if len < 0 {
                     return Err(Error::MetaInfo);
                 }
-                let path = vec![info_dict
-                    .get(&b"name.utf-8"[..])
-                    .or_else(|| info_dict.get(&b"name"[..]))
-                    .and_then(|v| v.as_bytes())
-                    .unwrap_or(&[])
-                    .to_vec()];
+                let path = vec![sanitize_component(
+                    info_dict
+                        .get(&b"name.utf-8"[..])
+                        .or_else(|| info_dict.get(&b"name"[..]))
+                        .and_then(|v| v.as_bytes())
+                        .unwrap_or(&[]),
+                )];
                 vec![FileEntry {
                     path,
                     length: len as u64,
@@ -288,7 +289,7 @@ impl Torrent {
                         .ok_or(Error::MetaInfo)?;
                     let mut comps = Vec::new();
                     for c in path {
-                        comps.push(c.as_bytes().ok_or(Error::MetaInfo)?.to_vec());
+                        comps.push(sanitize_component(c.as_bytes().ok_or(Error::MetaInfo)?));
                     }
                     if comps.is_empty() {
                         return Err(Error::MetaInfo);
@@ -640,6 +641,25 @@ fn capture_info_raw(data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// Sanitize one untrusted path component so a crafted torrent can never
+/// write outside the save directory (CWE-22): neutralize path separators
+/// (`/`, `\`) and Windows drive-letter / ADS colons (`:`) to `_`, and map
+/// the empty, `.` and `..` components to a safe placeholder. Components are
+/// rewritten, never dropped, so the file count and total size are preserved.
+fn sanitize_component(c: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(c.len());
+    for &b in c {
+        out.push(match b {
+            b'/' | b'\\' | b':' => b'_',
+            _ => b,
+        });
+    }
+    if out.is_empty() || out == b"." || out == b".." {
+        out = b"_".to_vec();
+    }
+    out
+}
+
 /// Recursively parse a v2 file tree dict.
 fn parse_v2_tree(
     node: &BTreeMap<Vec<u8>, BVal>,
@@ -648,6 +668,7 @@ fn parse_v2_tree(
 ) -> Result<()> {
     for (name, v) in node {
         let d = v.as_dict().ok_or(Error::MetaInfo)?;
+        let clean = sanitize_component(name);
         if let Some(file_meta) = d.get(&b""[..]) {
             let meta = file_meta.as_dict().ok_or(Error::MetaInfo)?;
             let len = meta
@@ -666,14 +687,14 @@ fn parse_v2_tree(
                 _ => None,
             };
             let mut path = prefix.clone();
-            path.push(name.clone());
+            path.push(clean);
             out.push(FileEntry {
                 path,
                 length: len as u64,
                 root,
             });
         } else {
-            prefix.push(name.clone());
+            prefix.push(clean);
             parse_v2_tree(d, prefix, out)?;
             prefix.pop();
         }
@@ -784,7 +805,7 @@ impl Torrent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bencode::{bytes, dict, int};
+    use crate::bencode::{bytes, dict, int, list};
 
     fn build_v1_torrent() -> Vec<u8> {
         let info = dict(vec![
@@ -818,6 +839,87 @@ mod tests {
         assert_eq!(pi.len, 16384);
         let pi = t.piece_info(1).unwrap();
         assert_eq!(pi.len, 16384);
+    }
+
+    #[test]
+    fn path_components_are_sanitized_against_traversal() {
+        // A crafted multi-file torrent whose paths try to escape the save
+        // dir: parent traversal, drive letters and embedded separators/ADS.
+        let info = dict(vec![
+            (b"name", bytes("root")),
+            (b"piece length", int(16 * 1024)),
+            (b"pieces", bytes(vec![0u8; 40])),
+            (
+                b"files",
+                list(vec![
+                    dict(vec![
+                        (b"length", int(1000)),
+                        (
+                            b"path",
+                            list(vec![
+                                bytes(".."),
+                                bytes(".."),
+                                bytes("Windows"),
+                                bytes("evil.dll"),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![
+                        (b"length", int(2000)),
+                        (
+                            b"path",
+                            list(vec![bytes("C:"), bytes("Users"), bytes("a.txt")]),
+                        ),
+                    ]),
+                    dict(vec![
+                        (b"length", int(3000)),
+                        (
+                            b"path",
+                            list(vec![bytes("dir/sub"), bytes("f:stream"), bytes("ok.bin")]),
+                        ),
+                    ]),
+                ]),
+            ),
+        ]);
+        let t = dict(vec![
+            (b"announce", bytes("http://t.example/announce")),
+            (b"info", info),
+        ]);
+        let mut data = Vec::new();
+        t.encode(&mut data);
+        let tor = Torrent::from_bytes(&data).expect("parse");
+        assert_eq!(tor.files.len(), 3);
+
+        // `..` / `.` are neutralized; nothing may climb above the save dir.
+        assert_eq!(
+            tor.files[0].path[0],
+            b"_".to_vec(),
+            "parent climb neutralized"
+        );
+        assert!(tor.files[0].path.iter().all(|c| c != b".." && c != b"."));
+
+        // Drive-letter / ADS colons are neutralized on every platform.
+        assert_eq!(
+            tor.files[1].path[0],
+            b"C_".to_vec(),
+            "drive colon neutralized"
+        );
+        assert!(
+            tor.files[1].path.iter().all(|c| !c.contains(&b':')),
+            "no component contains a colon"
+        );
+
+        // Embedded separators are flattened into single safe components.
+        assert_eq!(tor.files[2].path[0], b"dir_sub".to_vec());
+        assert_eq!(tor.files[2].path[1], b"f_stream".to_vec());
+        assert_eq!(tor.files[2].path[2], b"ok.bin".to_vec());
+        assert!(
+            tor.files[2]
+                .path
+                .iter()
+                .all(|c| !c.contains(&b'/') && !c.contains(&b'\\') && !c.contains(&b':')),
+            "no component carries a separator or colon"
+        );
     }
 
     #[test]
