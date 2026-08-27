@@ -209,6 +209,14 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
+    /// Number of nodes with a REAL node id — bootstrap `ZERO` placeholders are excluded.
+    pub fn real_size(&self) -> usize {
+        self.buckets
+            .iter()
+            .map(|b| b.nodes.iter().filter(|n| n.id != NodeId::ZERO).count())
+            .sum()
+    }
+
     /// Collect up to `limit` known nodes spread across buckets — one per
     /// bucket — for persistence / bootstrap (good geographic coverage).
     pub fn export(&self, limit: usize) -> Vec<NodeEntry> {
@@ -1060,10 +1068,6 @@ impl Dht {
             .cloned()
             .collect();
         if to_query.is_empty() {
-            // If nothing was ever queried, the bootstrap pings are still in
-            // flight: keep the lookup alive (`closest` refreshes each tick)
-            // until the candidate set is truly exhausted (bounded by
-            // LOOKUP_TIMEOUT_MS above).
             if self.lookups[idx].queried.is_empty() {
                 return false;
             }
@@ -1168,10 +1172,6 @@ impl Dht {
                         let token = self.make_token(&from);
                         let ih = args.info_hash.unwrap_or([0; 20]);
                         let nodes = self.table.closest(&NodeId(ih), K);
-                        // BEP-5: serve the peers that announced for this
-                        // infohash (compact values), alongside the closest
-                        // nodes so the querying node can continue its
-                        // iterative lookup.
                         let values: Vec<NetAddr> = self
                             .peer_store
                             .get(&ih)
@@ -1207,11 +1207,6 @@ impl Dht {
                             };
                             return Ok(DatagramOutcome::Reply(encode(&reply)));
                         }
-                        // BEP-5: store the announcing peer so later
-                        // `get_peers` queries can return it. The port is the
-                        // caller's listening port (or the UDP source port
-                        // when `implied_port` is set); the IP is the UDP
-                        // source address.
                         if let Some(ih) = args.info_hash {
                             let port =
                                 if args.implied_port == Some(1) || args.port.unwrap_or(0) == 0 {
@@ -1253,9 +1248,6 @@ impl Dht {
             }
             KrpcBody::Response { id, resp, ip } => {
                 self.table.on_response(&id, from, now);
-                // BEP-42 receive side: a response's `ip` field is the
-                // responder's observation of OUR address. Cross-confirm it
-                // across distinct nodes before trusting it (防污染).
                 if let Some(ipv) = ip {
                     self.observe_external(&ipv, from, now);
                 }
@@ -1325,9 +1317,6 @@ impl Dht {
                 }
             }
         }
-        // Persist discovered peers beyond the lookup's lifetime, so results
-        // that arrive late (e.g. after the bootstrap populated the table) are
-        // still delivered to the session even if this lookup is pruned.
         if !values.is_empty() {
             // Scope the entry borrow so the cache can be pruned afterwards.
             {
@@ -1580,18 +1569,13 @@ fn observed_compact(from: &NetAddr) -> Option<Vec<u8>> {
 /// a plain IPv4 stored in the first 4 bytes with the rest zero (the form
 /// the BEP-42 4/6-byte `ip` values are expanded to internally).
 fn is_routable(ip: &[u8; 16]) -> bool {
-    // IPv4-mapped: bytes 0..10 zero, bytes 10..12 0xFF
     let mapped = ip[0..10].iter().all(|&b| b == 0) && ip[10] == 0xFF && ip[11] == 0xFF;
     if mapped {
         return is_routable_v4([ip[12], ip[13], ip[14], ip[15]]);
     }
-    // Plain IPv4 in the first 4 bytes (rest zero) — as produced when
-    // expanding a compact 4/6-byte BEP-42 value.
     if ip[4..].iter().all(|&b| b == 0) {
         return is_routable_v4([ip[0], ip[1], ip[2], ip[3]]);
     }
-    // true IPv6: skip the unspecified address, loopback, ULA (fc00::/7),
-    // link-local (fe80::/10) and multicast.
     if ip.iter().all(|&b| b == 0) {
         return false; // ::
     }
@@ -1802,13 +1786,7 @@ mod tests {
         let bob_addr = NetAddr::V4([127, 0, 0, 1], 6882);
         let alice_addr = NetAddr::V4([127, 0, 0, 1], 6881);
 
-        // 1) bob starts a get_peers lookup while its routing table is EMPTY
-        //    (the "session started before bootstrap answered" race).
         bob.get_peers(ih, 7777, 1);
-
-        // 2) Driving the lookup must NOT prune it: nothing was queried yet
-        //    and the table may still be populated by in-flight bootstrap
-        //    pings. (Regression: it used to end immediately.)
         bob.tick(2);
         assert_eq!(
             bob.active_lookups(),
@@ -1816,7 +1794,6 @@ mod tests {
             "empty-table lookup must stay alive"
         );
 
-        // 3) bob learns alice through a bootstrap ping.
         alice.bootstrap(&[bob_addr], 3);
         for (addr, payload) in alice.outgoing() {
             if let Ok(DatagramOutcome::Reply(reply)) = bob.handle_datagram(addr, &payload, 3) {
@@ -1825,7 +1802,6 @@ mod tests {
         }
         assert!(bob.table().contains(&alice.id));
 
-        // 4) The SAME lookup must now query the newly learned node.
         bob.tick(4);
         let out = bob.outgoing();
         assert!(!out.is_empty(), "lookup must query the newly learned node");
@@ -1859,7 +1835,6 @@ mod tests {
             _ => panic!("expected announce reply"),
         }
 
-        // A querying node asks for peers of ih → gets the announcer back.
         let q = KrpcMsg {
             t: t2(10),
             body: KrpcBody::Query {
@@ -1981,7 +1956,6 @@ mod tests {
             }
             _ => panic!("expected response"),
         }
-        // A private source → no `ip` field (would teach a useless LAN addr).
         let private = NetAddr::V4([192, 168, 1, 50], 40001);
         let reply = match node.handle_datagram(private, &encode(&ping), 2).unwrap() {
             DatagramOutcome::Reply(b) => b,

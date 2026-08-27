@@ -378,7 +378,12 @@ impl<H: Host> Engine<H> {
                     .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg);
             }
         }
-        if self.dht.as_ref().map(|d| d.table().size()).unwrap_or(1) == 0 {
+        if self
+            .dht
+            .as_ref()
+            .map(|d| d.table().real_size() == 0)
+            .unwrap_or(false)
+        {
             self.bootstrap_dht(now);
         }
         Ok(())
@@ -912,32 +917,34 @@ impl<H: Host> Engine<H> {
                 );
             }
             for conn in self.utp.take_reaped() {
-                // Connecting peers (uTP handshake never finished) fall back
-                // to TCP; established ones are just dropped.
                 let was_connecting = self.connecting.contains(&conn);
                 self.cleanup_utp_conn(conn, now, was_connecting);
             }
         }
-        // Compute the spontaneous-refresh target BEFORE borrowing `dht` mutably (borrow rules).
-        // Snowball diffusion: a small table refreshes 4x as often, so a few bootstrap nodes
-        // snowball into the wider network quickly even with zero active torrents.
         let dht_refresh_ready = self
             .dht
             .as_ref()
             .map(|d| {
-                let interval = if d.table().size() < crate::dht::K {
+                let real = d.table().real_size();
+                let interval = if real < 32 {
+                    5_000
+                } else if real < 128 {
                     15_000
                 } else {
                     60_000
                 };
-                d.table().size() > 0 && now.saturating_sub(self.last_dht_find_node) >= interval
+                real > 0 && now.saturating_sub(self.last_dht_find_node) >= interval
             })
             .unwrap_or(false);
-        let dht_refresh_target = if dht_refresh_ready {
-            self.dht_refresh_serial = self.dht_refresh_serial.wrapping_add(1);
-            Some(crate::dht::NodeId(self.dht_refresh_target(now)))
+        let dht_refresh_targets = if dht_refresh_ready {
+            let mut out = Vec::with_capacity(3);
+            for _ in 0..3 {
+                self.dht_refresh_serial = self.dht_refresh_serial.wrapping_add(1);
+                out.push(crate::dht::NodeId(self.dht_refresh_target(now)));
+            }
+            out
         } else {
-            None
+            Vec::new()
         };
         if let Some(dht) = self.dht.as_mut() {
             dht.tick(now);
@@ -949,17 +956,23 @@ impl<H: Host> Engine<H> {
                     );
                 }
             }
-            if let Some(target) = dht_refresh_target {
+            if !dht_refresh_targets.is_empty() {
                 self.last_dht_find_node = now;
-                dht.find_node(target, now);
+                for target in dht_refresh_targets {
+                    dht.find_node(target, now);
+                }
             }
         }
         self.collect_dht_seeds(now);
+        // Re-bootstrap while the REAL node count is below the threshold.
+        // Bootstrap ZERO placeholders must never satisfy this guard — a
+        // table full of unanswered pings to dead seeds would otherwise look
+        // healthy and the DHT would stay dormant (the ~12-node plateau).
         let needs_bootstrap = self
             .dht
             .as_ref()
             .map(|d| {
-                d.table().size() < DHT_REBOOTSTRAP_THRESHOLD
+                d.table().real_size() < DHT_REBOOTSTRAP_THRESHOLD
                     && now.saturating_sub(self.last_bootstrap_at) >= BOOTSTRAP_RETRY_MS
             })
             .unwrap_or(false);

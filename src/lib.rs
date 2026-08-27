@@ -70,14 +70,20 @@ pub mod consts {
     pub const VERSION_TAG: &str = "TB10";
     /// DHT bootstrap nodes (BEP-5) — the well-known, permanently online
     /// routers used by the mainstream clients (uTorrent, qBittorrent,
-    /// Aria2, Transmission, BitComet).
+    /// Aria2, Transmission, BitComet). More seeds = more initial diversity:
+    /// a client that only pings a couple of alive routers snowballs far
+    /// slower than qBittorrent/libtorrent (which also carry a large
+    /// persisted table across restarts).
     pub const DHT_BOOTSTRAP: &[(&str, u16)] = &[
-        ("dht.transmissionbt.com", 6881),
         ("router.bittorrent.com", 6881),
+        ("dht.transmissionbt.com", 6881),
         ("router.utorrent.com", 6881),
         ("router.transmissionbt.com", 6881),
-        ("dht.bitcomet.com", 6881),
         ("dht.libtorrent.org", 25401),
+        ("dht.aelitis.com", 6881),
+        ("dht.bitcomet.com", 6881),
+        ("router.bitcomet.com", 6881),
+        ("dht.dhtool.com", 6881),
     ];
     /// Source for the community tracker list (qBittorrent/BitComet
     /// compatible; the host refreshes it at runtime via `http_get`).
