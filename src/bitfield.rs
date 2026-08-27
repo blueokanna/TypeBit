@@ -182,7 +182,7 @@ impl Bitfield {
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = (self.len as usize).div_ceil(8);
         let mut out = vec![0u8; n];
-        for i in 0..n {
+        for (i, ob) in out.iter_mut().enumerate() {
             let bit = i * 8;
             let w = bit / 64;
             let s = bit % 64;
@@ -190,7 +190,7 @@ impl Bitfield {
             if s > 56 && w + 1 < self.words.len() {
                 byte |= (self.words[w + 1] << (64 - s)) as u8;
             }
-            out[i] = byte.reverse_bits();
+            *ob = byte.reverse_bits();
         }
         out
     }

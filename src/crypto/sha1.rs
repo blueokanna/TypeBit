@@ -91,7 +91,7 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
         w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
     }
     let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
-    for i in 0..80 {
+    for (i, wi) in w.iter().enumerate() {
         let (f, k) = match i / 20 {
             0 => ((b & c) | ((!b) & d), 0x5A827999u32),
             1 => (b ^ c ^ d, 0x6ED9EBA1),
@@ -103,7 +103,7 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
             .wrapping_add(f)
             .wrapping_add(e)
             .wrapping_add(k)
-            .wrapping_add(w[i]);
+            .wrapping_add(*wi);
         e = d;
         d = c;
         c = b.rotate_left(30);

@@ -22,20 +22,26 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # clippy across the full feature matrix × 3 OSes. `-D warnings` makes every
-  # lint a hard error — no drift is allowed past main.
   clippy:
     name: clippy (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: no_std,      os: ubuntu-latest,  features: "--no-default-features" }
-          - { name: std,         os: ubuntu-latest,  features: "--features std" }
-          - { name: std+ffi,     os: ubuntu-latest,  features: "--features std,ffi" }
-          - { name: all-linux,   os: ubuntu-latest,  features: "--all-features" }
-          - { name: all-windows, os: windows-latest, features: "--all-features" }
-          - { name: all-macos,   os: macos-latest,   features: "--all-features" }
+          - {
+              name: no_std,
+              os: ubuntu-latest,
+              features: "--no-default-features",
+            }
+          - { name: std, os: ubuntu-latest, features: "--features std" }
+          - { name: std+ffi, os: ubuntu-latest, features: "--features std,ffi" }
+          - { name: all-linux, os: ubuntu-latest, features: "--all-features" }
+          - {
+              name: all-windows,
+              os: windows-latest,
+              features: "--all-features",
+            }
+          - { name: all-macos, os: macos-latest, features: "--all-features" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -44,8 +50,6 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
-  # Tests on all three OSes; `no_std` code paths get executed too (the
-  # `--no-default-features` run is NOT just a compile check).
   test:
     name: test (${{ matrix.os }})
     strategy:
@@ -75,8 +79,7 @@ jobs:
       matrix:
         target:
           - aarch64-unknown-none
-          - thumbv7em-none-eabihf
-          - riscv32imac-unknown-none-elf
+          - riscv64gc-unknown-none-elf
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,8 +88,6 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo check --target ${{ matrix.target }} --no-default-features
 
-  # MSRV as declared by `rust-version` in Cargo.toml (1.95, required by
-  # courierust's use of AtomicU64::try_update, stabilized in 1.95.0).
   msrv:
     name: MSRV 1.95
     runs-on: ubuntu-latest

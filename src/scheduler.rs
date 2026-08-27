@@ -219,9 +219,13 @@ impl Scheduler {
     pub fn update_availability(&mut self, availability: &[u32]) {
         let n = self.availability.len().min(availability.len());
         let max_avail = availability.iter().copied().max().unwrap_or(0);
-        for i in 0..n {
-            let a = availability[i];
-            self.availability[i] = (max_avail as i64) - (a as i64);
+        for (dst, &a) in self
+            .availability
+            .iter_mut()
+            .zip(availability.iter())
+            .take(n)
+        {
+            *dst = (max_avail as i64) - (a as i64);
         }
         self.recompute();
     }

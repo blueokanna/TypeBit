@@ -31,8 +31,8 @@ impl NodeId {
     /// XOR distance to another id (used by the routing table).
     pub fn distance(&self, other: &NodeId) -> [u8; 20] {
         let mut d = [0u8; 20];
-        for i in 0..20 {
-            d[i] = self.0[i] ^ other.0[i];
+        for (di, (a, b)) in d.iter_mut().zip(self.0.iter().zip(other.0.iter())) {
+            *di = a ^ b;
         }
         d
     }

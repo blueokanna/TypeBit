@@ -16,8 +16,8 @@ pub fn generate(rng: &mut Rng) -> [u8; 20] {
     let n = tag.len().min(4);
     id[0] = b'-';
     id[1..1 + n].copy_from_slice(&tag[..n]);
-    for k in (1 + n)..5 {
-        id[k] = b'0';
+    for slot in id.iter_mut().take(5).skip(1 + n) {
+        *slot = b'0';
     }
     id[5] = b'0';
     id[6] = b'0';

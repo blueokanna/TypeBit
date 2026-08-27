@@ -72,8 +72,8 @@ impl Fe {
 
     fn add(a: Fe, b: Fe) -> Fe {
         let mut t = [0i128; 5];
-        for i in 0..5 {
-            t[i] = a.0[i] as i128 + b.0[i] as i128;
+        for (ti, (ai, bi)) in t.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
+            *ti = *ai as i128 + *bi as i128;
         }
         let mut r = normalize(t);
         cond_sub_p(&mut r);
@@ -237,10 +237,10 @@ fn normalize(t: [i128; 5]) -> Fe {
 fn cond_sub_p(a: &mut Fe) {
     if ge_p(a) {
         let mut borrow = 0u64;
-        for i in 0..5 {
-            let (d, b) = a.0[i].overflowing_sub(P[i]);
+        for (ai, pi) in a.0.iter_mut().zip(P.iter()) {
+            let (d, b) = ai.overflowing_sub(*pi);
             let (d2, b2) = d.overflowing_sub(borrow);
-            a.0[i] = d2;
+            *ai = d2;
             borrow = (b || b2) as u64;
         }
     }
@@ -488,9 +488,9 @@ fn mod_l(x: &[u64; 8]) -> [u64; 4] {
     for i in (0..512).rev() {
         let bit = (x[i / 64] >> (i % 64)) & 1;
         let mut carry = bit;
-        for j in 0..4 {
-            let next = r[j] >> 63;
-            r[j] = (r[j] << 1) | carry;
+        for rj in r.iter_mut() {
+            let next = *rj >> 63;
+            *rj = (*rj << 1) | carry;
             carry = next;
         }
         if ge(&r, &L) {
@@ -654,8 +654,8 @@ mod tests {
     fn field_roundtrip() {
         // from_bytes / to_bytes roundtrip for random-ish values
         let mut v = [0u8; 32];
-        for i in 0..32 {
-            v[i] = (i * 37 + 11) as u8;
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = (i * 37 + 11) as u8;
         }
         v[31] &= 0x7f; // field elements keep bit 255 clear
         let f = Fe::from_bytes(&v);
