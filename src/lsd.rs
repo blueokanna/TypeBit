@@ -17,7 +17,11 @@
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-
+/// Fixed LSD (BEP-14) UDP port. LSD announces are sent to
+/// `<group>:6771`, so a client MUST have a socket bound to this port to
+/// receive LAN announces — binding to the BT listen port (like DHT) misses
+/// them.
+pub const LSD_PORT: u16 = 6771;
 /// IPv4 LSD multicast group (org-local scope).
 pub const LSD_GROUP_V4: crate::platform::NetAddr =
     crate::platform::NetAddr::V4([239, 192, 152, 143], 6771);

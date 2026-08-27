@@ -374,6 +374,34 @@ pub trait Host {
     /// Receive one datagram (non-blocking). `Err(WouldBlock)` = none pending.
     fn udp_recv(&mut self, buf: &mut [u8]) -> Result<(NetAddr, usize)>;
 
+    // ---------- LSD (BEP-14) dedicated socket ----------
+
+    /// Open a dedicated LSD (BEP-14) UDP socket bound to the fixed multicast
+    /// port ([`crate::lsd::LSD_PORT`]). The shared [`Self::udp_open`] socket
+    /// is bound to the BT listen port, so multicast datagrams addressed to
+    /// `239.192.152.143:6771` are NEVER delivered to it — LSD must listen on
+    /// port 6771 to receive LAN announces (the "local peer never appears"
+    /// bug). Default: `NotSupported` (LSD receive disabled; outgoing
+    /// announces and unicast replies still work via the shared socket).
+    fn udp_open_lsd(&mut self, _port: u16) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// Join the LSD multicast group on the dedicated LSD socket. Default
+    /// no-op; hosts without a dedicated socket leave it a no-op.
+    fn udp_join_multicast_lsd(&mut self, _addr: NetAddr) -> Result<()> {
+        Ok(())
+    }
+
+    /// Receive one datagram on the dedicated LSD socket (non-blocking).
+    /// Default: `WouldBlock` (no dedicated socket).
+    fn udp_recv_lsd(&mut self, _buf: &mut [u8]) -> Result<(NetAddr, usize)> {
+        Err(Error::WouldBlock)
+    }
+
+    /// Close the dedicated LSD socket. Default no-op.
+    fn udp_close_lsd(&mut self) {}
+
     // ---------- Disk ----------
 
     /// Open (create if missing) a file by path. Returns a handle.

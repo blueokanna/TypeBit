@@ -46,6 +46,10 @@ pub struct EngineConfig {
     /// UPnP IGD) for the listen port. Needs a host that reports a default
     /// gateway; UPnP additionally needs HTTP POST + a LAN IP.
     pub port_mapping: bool,
+    /// Local Service Discovery (BEP-14): announce active swarms on the LAN
+    /// and discover same-LAN peers. Off disables both the multicast
+    /// announce and the dedicated 6771 receive socket.
+    pub lsd_enabled: bool,
     /// Piece-verification worker threads. `0` = auto-detect under `std`
     /// (one per core minus one, capped at 8) and inline under `no_std`.
     /// The engine event loop never blocks on hashing either way.
@@ -73,6 +77,7 @@ impl Default for EngineConfig {
             global_max_connections: 512,
             max_connections_per_ip: 8,
             port_mapping: false,
+            lsd_enabled: true,
             verify_workers: 0,
             proxy: None,
             connect_timeout_ms: 30_000,
@@ -798,6 +803,17 @@ impl<H: Host> Engine<H> {
             // reach us; failure to join is best-effort (still announce out).
             let _ = self.host.udp_join_multicast(crate::lsd::LSD_GROUP_V4);
             let _ = self.host.udp_join_multicast(crate::lsd::LSD_GROUP_V6);
+            if self.cfg.lsd_enabled {
+                // BEP-14 datagrams arrive on the FIXED multicast port 6771,
+                // but the shared UDP socket is bound to the BT listen port
+                // and can NEVER receive them — LSD must listen on 6771 too.
+                // Open a dedicated LSD socket and join the groups on it;
+                // otherwise LAN discovery only half-works (we announce out
+                // but never hear our neighbours). All best-effort.
+                let _ = self.host.udp_open_lsd(crate::lsd::LSD_PORT);
+                let _ = self.host.udp_join_multicast_lsd(crate::lsd::LSD_GROUP_V4);
+                let _ = self.host.udp_join_multicast_lsd(crate::lsd::LSD_GROUP_V6);
+            }
         }
         let _ = now;
         Ok(())
@@ -1816,6 +1832,27 @@ impl<H: Host> Engine<H> {
                 Err(_) => break,
             }
         }
+
+        // Dedicated LSD (BEP-14) socket: drain multicast announces sent to
+        // 239.192.152.143:6771 / [ff15::efc0:988f]:6771 — the shared socket
+        // (bound to the BT port) never sees these.
+        if self.cfg.lsd_enabled {
+            let mut lsd_buf = [0u8; 64 * 1024];
+            loop {
+                match self.host.udp_recv_lsd(&mut lsd_buf) {
+                    Ok((addr, n)) => {
+                        let payload = &lsd_buf[..n];
+                        if payload.starts_with(b"BT-SEARCH") {
+                            self.handle_lsd_datagram(addr, payload, now);
+                        }
+                        // Only LSD traffic is expected here; ignore
+                        // everything else defensively.
+                    }
+                    Err(Error::WouldBlock) => break,
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     /// Deterministic pseudo-random 20-byte target for spontaneous DHT bucket
@@ -1854,8 +1891,8 @@ impl<H: Host> Engine<H> {
     /// Announce one active torrent to the LAN (BEP-14), rate-limited by the
     /// scheduler to one announce per minute, round-robin across torrents.
     fn announce_lsd(&mut self, now: u64) {
-        if self.cfg.proxy.is_some() || !self.udp_open {
-            return; // outbound-only mode must not leak our presence
+        if !self.cfg.lsd_enabled || self.cfg.proxy.is_some() || !self.udp_open {
+            return; // disabled, or outbound-only mode must not leak presence
         }
         if !self.lsd.due(now) {
             return;
@@ -2268,6 +2305,156 @@ mod tests {
 
         assert!(engine.tick().is_ok());
         assert_eq!(engine.host.udp_open_calls, 1);
+    }
+
+    /// Host that records the dedicated LSD socket lifecycle and can feed one
+    /// BT-SEARCH announce back through `udp_recv_lsd` (the port-6771 path the
+    /// shared socket can never receive).
+    struct LsdHost {
+        lsd_open: u32,
+        lsd_joins: u32,
+        feed: Option<(NetAddr, alloc::vec::Vec<u8>)>,
+    }
+
+    impl crate::platform::Host for LsdHost {
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+        fn fill_random(&mut self, b: &mut [u8]) {
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = (i as u8).wrapping_mul(7);
+            }
+        }
+        fn log(&mut self, _l: crate::platform::LogLevel, _m: &str) {}
+        fn http_get(
+            &mut self,
+            _u: &str,
+            _t: u64,
+            _o: &mut alloc::vec::Vec<u8>,
+        ) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn resolve_host(&self, _host: &str, _port: u16) -> Option<NetAddr> {
+            None
+        }
+        fn tcp_connect(&mut self, _a: &NetAddr) -> crate::error::Result<ConnId> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_connect_done(&mut self, _id: ConnId) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_send(&mut self, _id: ConnId, _d: &[u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_recv(&mut self, _id: ConnId, _b: &mut [u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn tcp_close(&mut self, _id: ConnId) {}
+        fn udp_open(&mut self, _p: u16) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_send(&mut self, _a: &NetAddr, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_multicast_send(&mut self, _a: &NetAddr, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_join_multicast(&mut self, _a: NetAddr) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_recv(&mut self, _b: &mut [u8]) -> crate::error::Result<(NetAddr, usize)> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn udp_open_lsd(&mut self, _p: u16) -> crate::error::Result<()> {
+            self.lsd_open += 1;
+            Ok(())
+        }
+        fn udp_join_multicast_lsd(&mut self, _a: NetAddr) -> crate::error::Result<()> {
+            self.lsd_joins += 1;
+            Ok(())
+        }
+        fn udp_recv_lsd(&mut self, b: &mut [u8]) -> crate::error::Result<(NetAddr, usize)> {
+            match self.feed.take() {
+                Some((addr, data)) => {
+                    let n = data.len().min(b.len());
+                    b[..n].copy_from_slice(&data[..n]);
+                    Ok((addr, n))
+                }
+                None => Err(crate::error::Error::WouldBlock),
+            }
+        }
+        fn disk_open(&mut self, _p: &str) -> crate::error::Result<DiskId> {
+            Ok(1)
+        }
+        fn disk_read(
+            &mut self,
+            _id: DiskId,
+            _o: u64,
+            _b: &mut [u8],
+        ) -> crate::error::Result<usize> {
+            Ok(0)
+        }
+        fn disk_write(&mut self, _id: DiskId, _o: u64, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_prealloc(&mut self, _id: DiskId, _s: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_flush(&mut self, _id: DiskId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_close(&mut self, _id: DiskId) {}
+    }
+
+    #[test]
+    fn lsd_opens_dedicated_socket_and_routes_lan_announces() {
+        use crate::lsd;
+        let host = LsdHost {
+            lsd_open: 0,
+            lsd_joins: 0,
+            feed: None,
+        };
+        let mut engine = Engine::new(host, EngineConfig::default());
+        let t = make_torrent();
+        let hash = t.info_hash;
+        engine.add_torrent_obj(t, "/tmp").expect("add");
+        engine.start(&hash).expect("start");
+        engine.tick().expect("tick");
+
+        // The dedicated LSD socket (port 6771) must have been opened and the
+        // multicast groups joined on it — the fix for "local peer never found".
+        assert!(
+            engine.host.lsd_open >= 1,
+            "dedicated LSD socket must be opened"
+        );
+        assert!(
+            engine.host.lsd_joins >= 1,
+            "LSD multicast group must be joined on the dedicated socket"
+        );
+
+        // A neighbour announces our torrent on the LSD group → its address
+        // (from the announce Port header) must be attached to the swarm for
+        // connection (drive_connect_queue consumes the queue in the same
+        // tick via the uTP/TCP dial, so we assert on the attached peer).
+        let mut ih20 = [0u8; 20];
+        ih20.copy_from_slice(hash.as_bytes());
+        let msg = lsd::build_announce(&ih20, 6882, None, lsd::LSD_GROUP_V4);
+        engine.host.feed = Some((NetAddr::V4([192, 168, 1, 50], 6771), msg));
+        engine.tick().expect("tick");
+
+        let attached = engine
+            .sessions
+            .get(&hash)
+            .map(|s| {
+                s.peers
+                    .values()
+                    .any(|p| p.addr == NetAddr::V4([192, 168, 1, 50], 6882))
+            })
+            .unwrap_or(false);
+        assert!(
+            attached,
+            "LSD-discovered LAN peer (192.168.1.50:6882) must be attached to the swarm"
+        );
     }
 
     #[test]

@@ -84,6 +84,12 @@ pub struct StdHost {
     /// destinations are sent as IPv4-mapped IPv6 addresses — Windows
     /// rejects native AF_INET sockaddrs on an AF_INET6 dual-stack socket.
     udp_dual_stack: bool,
+    /// Dedicated LSD (BEP-14) socket bound to the fixed port 6771 so LAN
+    /// multicast announces are actually received (the shared UDP socket is
+    /// bound to the BT listen port and can never hear them).
+    lsd_udp: Option<UdpSocket>,
+    /// Whether the LSD socket is dual-stack (mirror of `udp_dual_stack`).
+    lsd_udp_dual_stack: bool,
     /// Open files (disk id → file).
     disk: HashMap<DiskId, File>,
     /// Next disk id (1-based).
@@ -99,6 +105,8 @@ impl StdHost {
             next_tcp: 1,
             udp: None,
             udp_dual_stack: false,
+            lsd_udp: None,
+            lsd_udp_dual_stack: false,
             disk: HashMap::new(),
             next_disk: 1,
         }
@@ -443,6 +451,62 @@ impl Host for StdHost {
             }
             Err(_) => Err(Error::Io),
         }
+    }
+
+    fn udp_open_lsd(&mut self, port: u16) -> crate::Result<()> {
+        if self.lsd_udp.is_some() {
+            return Ok(());
+        }
+        // Same dual-stack / v4-only strategy as the shared socket: one LSD
+        // socket serves both the v4 (239.192.152.143) and v6 (ff15::efc0:988f)
+        // groups. `SO_REUSEADDR`-style sharing of the well-known 6771 port is
+        // not needed here (single client per host); two clients on one host
+        // simply bind-fail on the second, which LSD tolerates (best-effort).
+        let (sock, dual) = match Self::open_dual_stack(port) {
+            Ok(s) => (s, true),
+            Err(_) => (Self::open_v4_only(port)?, false),
+        };
+        self.lsd_udp_dual_stack = dual;
+        self.lsd_udp = Some(sock);
+        Ok(())
+    }
+
+    fn udp_join_multicast_lsd(&mut self, addr: NetAddr) -> crate::Result<()> {
+        let sock = self.lsd_udp.as_ref().ok_or(Error::NotFound)?;
+        match addr {
+            NetAddr::V4(ip, _) => {
+                let group = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                sock.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+                    .map_err(|_| Error::Io)
+            }
+            NetAddr::V6(ip, _) => {
+                let group = Ipv6Addr::from(ip);
+                sock.join_multicast_v6(&group, 0).map_err(|_| Error::Io)
+            }
+        }
+    }
+
+    fn udp_recv_lsd(&mut self, buf: &mut [u8]) -> crate::Result<(NetAddr, usize)> {
+        let sock = self.lsd_udp.as_ref().ok_or(Error::NotFound)?;
+        match sock.recv_from(buf) {
+            Ok((n, sa)) => Ok((from_socket_addr(sa), n)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Err(Error::WouldBlock)
+            }
+            Err(_) => Err(Error::Io),
+        }
+    }
+
+    fn udp_close_lsd(&mut self) {
+        self.lsd_udp = None;
+        self.lsd_udp_dual_stack = false;
     }
 
     fn disk_open(&mut self, path: &str) -> crate::Result<DiskId> {
