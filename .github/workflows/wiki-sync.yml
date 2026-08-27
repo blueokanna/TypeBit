@@ -1,5 +1,9 @@
 name: sync-wiki
 
+# Mirrors docs/wiki/ into the GitHub Wiki (a separate git repository).
+# Requires a CLASSIC PAT with `repo` scope stored as the WIKI_TOKEN secret;
+# fine-grained PATs and the built-in GITHUB_TOKEN cannot write the wiki.
+
 on:
   push:
     branches: [main]
@@ -17,11 +21,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone the wiki repository
+      # Fail fast with a clear message instead of a cryptic 401 at push time.
+      - name: Verify WIKI_TOKEN secret is set
         run: |
-          git clone "https://x-access-token:${WIKI_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki
+          if [ -z "$WIKI_TOKEN" ]; then
+            echo "::error::WIKI_TOKEN secret is not set."
+            echo "Create a CLASSIC PAT (https://github.com/settings/tokens) with the 'repo' scope"
+            echo "and add it as a repository secret named WIKI_TOKEN."
+            exit 1
+          fi
         env:
           WIKI_TOKEN: ${{ secrets.WIKI_TOKEN }}
+
+      - name: Clone the wiki repository
+        run: |
+          git clone "https://github.com/${GITHUB_REPOSITORY}.wiki.git" wiki
 
       - name: Mirror docs/wiki into the wiki clone
         working-directory: wiki
@@ -38,7 +52,11 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "no wiki changes"
-          else
-            git commit -m "sync wiki from docs/wiki"
-            git push
+            exit 0
           fi
+          git commit -m "sync wiki from docs/wiki"
+          # Use the token only for the authenticated push (never leaks into
+          # a persisted remote URL; the token is read straight from the env).
+          git push "https://x-access-token:${WIKI_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" HEAD:master
+        env:
+          WIKI_TOKEN: ${{ secrets.WIKI_TOKEN }}
