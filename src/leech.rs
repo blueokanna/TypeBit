@@ -634,6 +634,8 @@ pub struct LeechConfig {
     pub free_ride_floor_bytes: u64,
     /// Soft penalty for known aggressive clients (behavior still dominates).
     pub client_leech_penalty: i64,
+    /// Anti-leech measure: hard-block known leech clients
+    pub block_leech_clients: bool,
     /// Minimum score margin a newcomer needs to displace an incumbent
     /// unchoked peer (anti-flap hysteresis). 0 disables stickiness.
     pub anti_flap_threshold: i64,
@@ -697,9 +699,7 @@ impl Default for LeechConfig {
             min_share_permyriad: 100, // 1% return is enough to stay unlabeled
             free_ride_floor_bytes: 1024 * 1024,
             client_leech_penalty: 200_000,
-            // ~250 KiB/s of upload rate (leech reward is rate/16), so a
-            // materially faster peer displaces an incumbent but small
-            // differences do not cause choke churn.
+            block_leech_clients: true,
             anti_flap_threshold: 16_000,
             ban_ttl_ms: 30 * 60 * 1000,
             max_bans: 4096,
@@ -768,14 +768,17 @@ fn permyriad(numer: u64, denom: u64) -> u32 {
 /// **clamped** ([`LeechConfig::max_reciprocity_reward`]) so lifetime bytes
 /// never shield behavioral penalties.
 pub fn choke_score(cfg: &LeechConfig, seeding: bool, v: &PeerChokeView) -> i64 {
+    if cfg.block_leech_clients
+        && v.client
+            .map(|c| c.class == ClientClass::Leech)
+            .unwrap_or(false)
+    {
+        return i64::MIN / 4;
+    }
     let mut s: i64 = 0;
-    // Penalties that describe *current misbehavior* only apply after the
-    // peer had a fair chance to reciprocate.
     let past_grace = v.age_ms >= cfg.recip_grace_ms;
 
     if seeding {
-        // Reciprocity: lifetime bytes + live upload rate, clamped so that
-        // behavioral penalties always dominate.
         let given_kib = (v.given / 1024) as i64;
         let rate_term = (v.rate_up as i64) * cfg.seed_reciprocity_weight / 1024;
         let recip = given_kib
@@ -783,7 +786,6 @@ pub fn choke_score(cfg: &LeechConfig, seeding: bool, v: &PeerChokeView) -> i64 {
             .saturating_add(rate_term)
             .min(cfg.max_reciprocity_reward);
         s += recip;
-        // Free-riders: big takers that never return (after grace).
         if past_grace
             && v.taken >= cfg.free_ride_floor_bytes
             && permyriad(v.given, v.taken) < cfg.min_share_permyriad
@@ -791,19 +793,12 @@ pub fn choke_score(cfg: &LeechConfig, seeding: bool, v: &PeerChokeView) -> i64 {
             s -= cfg.free_ride_penalty;
         }
     } else {
-        // We are downloading: reward the peers feeding us.
         let rate_term = (v.rate_up as i64) * cfg.leech_upload_weight / 1024;
         s += rate_term.min(cfg.max_reciprocity_reward);
-        // Tit-for-tat: do not let non-reciprocators drain our scarce upload
-        // (after grace — a peer that just connected has not had time to
-        // upload anything back yet).
         if past_grace && v.taken >= cfg.free_ride_floor_bytes && v.given == 0 {
             s -= cfg.nonrecip_penalty;
         }
     }
-    // Idle slot squatting: interested, connected past grace, holds a slot,
-    // but has never actually pulled a block from us. Such a peer is wasting
-    // scarce upload capacity and should be rotated out.
     if v.interested && past_grace && v.served_requests == 0 && v.idle_ms >= cfg.idle_slot_timeout_ms
     {
         s -= cfg.idle_slot_penalty;
@@ -853,19 +848,21 @@ where
     let mut cands: Vec<Cand> = views
         .iter()
         .filter(|v| v.interested || !seeding)
+        .filter(|v| {
+            !(cfg.block_leech_clients
+                && v.client
+                    .map(|c| c.class == ClientClass::Leech)
+                    .unwrap_or(false))
+        })
         .map(|v| Cand {
             id: v.id,
             score: choke_score(cfg, seeding, v),
         })
         .collect();
-    // Stable-ish tie-break by id for deterministic tests.
     cands.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
 
     let mut result: Vec<ConnId> = Vec::with_capacity(slots);
 
-    // 1) the optimistic peer reserves a slot (BEP-3), but a peer that is
-    //    snubbed or already past the corrupt threshold is not allowed to
-    //    squat the free slot.
     if let Some(o) = optimistic {
         let eligible = cands.iter().any(|c| c.id == o)
             && views
@@ -878,7 +875,6 @@ where
         }
     }
 
-    // 2) incumbents keep their slots (anti-flap stickiness)
     for c in cands.iter() {
         if result.len() >= slots {
             break;
@@ -887,10 +883,6 @@ where
             result.push(c.id);
         }
     }
-    // 3) fill remaining slots with the best newcomers; once full, displace
-    //    the weakest non-optimistic holder only when the newcomer is
-    //    clearly better (past the anti-flap margin; with margin 0 any
-    //    strictly better newcomer displaces).
     for c in cands.iter() {
         if result.contains(&c.id) || is_cur_unchoked(c.id) {
             continue;
@@ -1049,20 +1041,49 @@ mod tests {
     }
 
     #[test]
+    fn blocked_leech_clients_never_win_any_slot() {
+        let cfg = LeechConfig::default();
+        let mut leech = view(1, 0, 0, 500_000, true);
+        leech.client = Some(ClientId::new(b"XL", ClientClass::Leech));
+        let mut citizen = view(2, 0, 0, 500_000, true);
+        citizen.client = Some(ClientId::new(b"qB", ClientClass::Standard));
+
+        assert!(
+            choke_score(&cfg, false, &leech) < choke_score(&cfg, false, &citizen),
+            "blocked leech must be at the absolute bottom"
+        );
+
+        let views = [leech];
+        let set = select_unchoke_set(&views, false, &cfg, |_| false, Some(1));
+        assert!(
+            !set.contains(&1),
+            "leech client must never be unchoked, even optimistically"
+        );
+
+        let soft = LeechConfig {
+            block_leech_clients: false,
+            ..Default::default()
+        };
+        let views = [leech, citizen];
+        let set = select_unchoke_set(&views, false, &soft, |_| false, None);
+        assert!(
+            set.contains(&1),
+            "with blocking off the leech client is only softly penalized"
+        );
+    }
+
+    #[test]
     fn anti_flap_keeps_incumbents() {
         let cfg = LeechConfig {
             leeching_slots: 1,
             anti_flap_threshold: 16_000,
             ..Default::default()
         };
-        // incumbent has a modest score
         let inc = view(1, 0, 0, 100_000, true);
-        // newcomer is better but not by the margin
         let newcomer = view(2, 0, 0, 300_000, true);
         let views = [inc, newcomer];
         let set = select_unchoke_set(&views, false, &cfg, |id| id == 1, None);
         assert_eq!(set, vec![1], "incumbent should stay within the margin");
-        // a dominant newcomer displaces it
         let dominant = view(3, 0, 0, 1_000_000, true);
         let views = [inc, newcomer, dominant];
         let set = select_unchoke_set(&views, false, &cfg, |id| id == 1, None);
@@ -1093,7 +1114,6 @@ mod tests {
         assert!(!bm.is_banned(&a, 1500));
         bm.sweep(1500);
         assert_eq!(bm.len(), 0);
-        // cap
         for i in 0..10u8 {
             bm.ban(
                 NetAddr::V4([10, 0, 0, i], 6881),
@@ -1109,7 +1129,6 @@ mod tests {
     #[test]
     fn free_rider_needs_grace() {
         let cfg = LeechConfig::default();
-        // brand-new peer: took 10 MB, gave nothing, but only 5 s old
         let mut young = view(1, 0, 10 * 1024 * 1024, 0, true);
         young.age_ms = 5_000;
         let old = view(2, 0, 10 * 1024 * 1024, 0, true); // 120 s, past grace
