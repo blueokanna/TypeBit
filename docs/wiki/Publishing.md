@@ -67,10 +67,13 @@ pushing to the main repo.
 
 Two ways to sync:
 
-1. **CI (automatic)** — `.github/workflows/wiki-sync.yml` mirrors
-   `docs/wiki/` to the wiki on every change to `docs/wiki/**`. It requires a
-   Personal Access Token (classic, `repo` scope) stored as the `WIKI_TOKEN`
-   repository secret (the built-in `GITHUB_TOKEN` cannot push to the wiki).
+1. **CI (automatic)** — `.github/workflows/wiki-sync.yml` checks out the
+   wiki via `actions/checkout` and mirrors `docs/wiki/` into it on every
+   change to `docs/wiki/**`. It uses the automatic `GITHUB_TOKEN` (granted
+   `contents: write`, which covers wiki pushes) with no extra setup. If your
+   fork/org blocks that, set a fine-grained PAT with "Read and write" wiki
+   access as the `GH_PAT` secret — the workflow falls back to it
+   automatically.
 2. **Local script (manual)** — `scripts/sync-wiki.ps1` or
    `scripts/sync-wiki.sh` (needs the `gh` CLI, authenticated).
 

@@ -1,8 +1,19 @@
 name: sync-wiki
 
-# Mirrors docs/wiki/ into the GitHub Wiki (a separate git repository).
-# Requires a CLASSIC PAT with `repo` scope stored as the WIKI_TOKEN secret;
-# fine-grained PATs and the built-in GITHUB_TOKEN cannot write the wiki.
+# Publish the in-repo docs/wiki/ directory to the GitHub wiki.
+#
+# The wiki is a separate git repo (<owner>/<repo>.wiki). This workflow
+# checks it out, replaces every tracked markdown page with the content of
+# docs/wiki/ from main, and pushes.
+#
+# `git rm -r '*.md'` first, so renames and deletions in docs/wiki/ propagate
+# instead of leaving stale pages behind.
+#
+# Push auth: the automatic GITHUB_TOKEN can write to the wiki as long as
+# `contents: write` is granted (it is below). If your fork/org blocks
+# that, create a fine-grained PAT with "Read and write" access to the
+# wiki and store it as the GH_PAT secret — the token expression falls
+# back to it automatically.
 
 on:
   push:
@@ -12,51 +23,39 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   sync:
-    name: mirror docs/wiki → GitHub Wiki
+    name: Publish wiki
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          path: repo
 
-      # Fail fast with a clear message instead of a cryptic 401 at push time.
-      - name: Verify WIKI_TOKEN secret is set
-        run: |
-          if [ -z "$WIKI_TOKEN" ]; then
-            echo "::error::WIKI_TOKEN secret is not set."
-            echo "Create a CLASSIC PAT (https://github.com/settings/tokens) with the 'repo' scope"
-            echo "and add it as a repository secret named WIKI_TOKEN."
-            exit 1
-          fi
-        env:
-          WIKI_TOKEN: ${{ secrets.WIKI_TOKEN }}
+      - name: Checkout wiki
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+          token: ${{ secrets.GH_PAT || github.token }}
 
-      - name: Clone the wiki repository
-        run: |
-          git clone "https://github.com/${GITHUB_REPOSITORY}.wiki.git" wiki
-
-      - name: Mirror docs/wiki into the wiki clone
-        working-directory: wiki
-        run: |
-          # keep only the wiki's .git directory, drop everything else
-          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-          cp -R ../docs/wiki/. .
-
-      - name: Commit and push
+      - name: Sync wiki content
         working-directory: wiki
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Drop every tracked markdown page so renames/deletions propagate.
+          git rm -r --quiet --ignore-unmatch '*.md' || true
+          # Mirror docs/wiki/ into the wiki root (Home.md = landing page;
+          # the en/zh pages live at the root with distinct file names).
+          cp -R ../repo/docs/wiki/. .
           git add -A
           if git diff --cached --quiet; then
-            echo "no wiki changes"
+            echo "No wiki changes; nothing to push"
             exit 0
           fi
-          git commit -m "sync wiki from docs/wiki"
-          # Use the token only for the authenticated push (never leaks into
-          # a persisted remote URL; the token is read straight from the env).
-          git push "https://x-access-token:${WIKI_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" HEAD:master
-        env:
-          WIKI_TOKEN: ${{ secrets.WIKI_TOKEN }}
+          git commit -m "Publish wiki from main (${{ github.sha }})"
+          git push

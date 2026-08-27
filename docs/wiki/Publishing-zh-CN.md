@@ -66,10 +66,12 @@ Wiki 页面在仓库内的 `docs/wiki/` 下（随 crate 一起发布）。GitHub
 
 两种同步方式：
 
-1. **CI（自动）**——`.github/workflows/wiki-sync.yml` 在每次改动
-   `docs/wiki/**` 时把 `docs/wiki/` 镜像到 wiki。需要一个 Personal Access
-   Token（classic，`repo` 权限）存为仓库 secret `WIKI_TOKEN`（内置的
-   `GITHUB_TOKEN` 无法推送 wiki）。
+1. **CI（自动）**——`.github/workflows/wiki-sync.yml` 用 `actions/checkout`
+   检出 wiki，在每次改动 `docs/wiki/**` 时把 `docs/wiki/` 镜像进去。
+   使用内置的 `GITHUB_TOKEN`（授予 `contents: write`，即可推送 wiki），
+   **无需额外配置**。如果 fork/org 禁止了这一点，可在 `GH_PAT` secret
+   里放一个对 wiki 有 "Read and write" 权限的 fine-grained PAT，工作流
+   会自动回退使用。
 2. **本地脚本（手动）**——`scripts/sync-wiki.ps1` 或
    `scripts/sync-wiki.sh`（需要已登录的 `gh` CLI）。
 
