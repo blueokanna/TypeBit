@@ -678,6 +678,7 @@ pub unsafe extern "C" fn typebit_engine_take_event(
                 crate::leech::BanReason::Corrupt => 1u8,
                 crate::leech::BanReason::Protocol => 2u8,
                 crate::leech::BanReason::FreeRide => 3u8,
+                crate::leech::BanReason::Timeout => 4u8,
             };
             buf.push(rc);
         }

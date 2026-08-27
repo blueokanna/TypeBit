@@ -34,6 +34,13 @@ pub struct CacheStats {
 /// **read-through LRU** for seeding/upload reads: flushed pieces leave the
 /// dirty map, so the LRU keeps them resident and repeated upload reads
 /// (disk speed ≫ upload speed) are served from RAM instead of disk.
+///
+/// The cache is the shared memory budget across all torrent sessions, so it
+/// also owns the **global in-flight request window** (mechanism 3): how many
+/// 16 KiB blocks may be outstanding across every peer of every session
+/// before new requests are held back. The cap is derived from the byte
+/// budget (`budget / block size`), so a smaller cache automatically throttles
+/// concurrency and a bigger one lets a fat pipe stay full.
 #[derive(Debug)]
 pub struct DiskCache {
     budget: u64,
@@ -46,6 +53,10 @@ pub struct DiskCache {
     clean_used: u64,
     /// Monotonic LRU clock (tick counter, not wall time).
     lru_clock: u64,
+    /// Total outstanding request blocks across all sessions (mechanism 3).
+    inflight_blocks: usize,
+    /// Global in-flight block cap: `budget / BLOCK_LEN`, floored at one.
+    max_inflight_blocks: usize,
     /// Stats.
     pub stats: CacheStats,
 }
@@ -61,13 +72,20 @@ impl DiskCache {
 
     /// Create with a byte budget.
     pub fn new(budget: u64) -> Self {
+        let budget = budget.max(1 << 20);
         DiskCache {
-            budget: budget.max(1 << 20),
+            budget,
             used: 0,
             dirty: BTreeMap::new(),
             clean: BTreeMap::new(),
             clean_used: 0,
             lru_clock: 0,
+            inflight_blocks: 0,
+            // Global in-flight cap: budget / block size, floored at one.
+            max_inflight_blocks: core::cmp::max(
+                1,
+                (budget / crate::consts::BLOCK_LEN as u64) as usize,
+            ),
             stats: CacheStats::default(),
         }
     }
@@ -75,6 +93,35 @@ impl DiskCache {
     /// Buffered bytes.
     pub fn used(&self) -> u64 {
         self.used
+    }
+
+    // -- global in-flight request window (mechanism 3) ----------------------
+
+    /// Outstanding request blocks across all sessions.
+    pub fn inflight_blocks(&self) -> usize {
+        self.inflight_blocks
+    }
+
+    /// Global in-flight block cap derived from the cache budget.
+    pub fn max_inflight_blocks(&self) -> usize {
+        self.max_inflight_blocks
+    }
+
+    /// Whether a new block request may be issued (the global window is not
+    /// exhausted).
+    pub fn inflight_available(&self) -> bool {
+        self.inflight_blocks < self.max_inflight_blocks
+    }
+
+    /// Record one issued block request.
+    pub fn inflight_inc(&mut self) {
+        self.inflight_blocks = self.inflight_blocks.saturating_add(1);
+    }
+
+    /// Release one resolved request (block arrived, cancelled, timed out or
+    /// the peer disconnected).
+    pub fn inflight_dec(&mut self) {
+        self.inflight_blocks = self.inflight_blocks.saturating_sub(1);
     }
 
     /// Cache budget.

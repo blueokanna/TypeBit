@@ -90,8 +90,20 @@ pub mod consts {
     /// Source for the community tracker list (qBittorrent/BitComet
     /// compatible; the host refreshes it at runtime via `http_get`).
     pub const TRACKERS_LIST_URL: &str = "https://cf.trackerslist.com/all.txt";
-    /// Maximum number of outstanding request blocks per peer connection.
-    pub const REQUEST_PIPELINE: u32 = 256;
+    /// Default maximum number of outstanding request blocks per peer
+    /// connection (the "request pipeline depth"). 32 blocks × 16 KiB =
+    /// ≤ 512 KiB in flight per peer — enough to saturate a fat pipe while
+    /// bounding memory and making slow peers recoverable. This is the
+    /// value libtorrent-class clients use; the session config can override
+    /// it per torrent.
+    pub const REQUEST_PIPELINE: u32 = 32;
+    /// Default per-request timeout (ms): a block requested from a peer that
+    /// is not answered within this window is released and re-issued to
+    /// another peer. 20 s is the classic libtorrent block timeout.
+    pub const REQUEST_TIMEOUT_MS: u64 = 20_000;
+    /// Default number of consecutive request timeouts on one peer before it
+    /// is disconnected and blacklisted (mechanism 2's punishment limit).
+    pub const MAX_REQUEST_TIMEOUTS: u32 = 5;
     /// Recommended write-back cache budget (bytes).
     pub const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
     /// Upper bound on magnet metadata size (a .torrent info dict is small).

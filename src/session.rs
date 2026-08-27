@@ -162,8 +162,18 @@ pub struct SessionConfig {
     pub save_dir: String,
     /// Max concurrent peers.
     pub max_peers: u32,
-    /// Outstanding request blocks per peer.
+    /// Outstanding request blocks per peer (mechanism 1). This value is
+    /// copied onto each peer at attach time and enforced as its pipeline
+    /// depth; it is also advertised to the peer via the extended handshake
+    /// `reqq` field.
     pub request_pipeline: u32,
+    /// Per-request timeout (ms, mechanism 2): a block requested from a peer
+    /// that is not answered within this window is released and re-issued to
+    /// another peer.
+    pub request_timeout_ms: u64,
+    /// Consecutive request timeouts on one peer before it is disconnected
+    /// and blacklisted (mechanism 2's punishment limit).
+    pub max_request_timeouts: u32,
     /// Endgame activation threshold (pieces).
     pub endgame_pieces: u32,
     /// Enable content-aware scheduling (head/tail for video).
@@ -203,6 +213,8 @@ impl Default for SessionConfig {
             save_dir: String::from("."),
             max_peers: 80,
             request_pipeline: crate::consts::REQUEST_PIPELINE,
+            request_timeout_ms: crate::consts::REQUEST_TIMEOUT_MS,
+            max_request_timeouts: crate::consts::MAX_REQUEST_TIMEOUTS,
             endgame_pieces: 32,
             smart_scheduling: true,
             leech: LeechConfig::default(),
@@ -392,6 +404,10 @@ pub struct TorrentSession {
     pub peers: BTreeMap<ConnId, Peer>,
     /// Blocks → requesting peers (endgame cancels).
     requested_by: BTreeMap<(u32, u16), Vec<ConnId>>,
+    /// When each block request was issued (ms) — the mechanism-2 timeout
+    /// clock. A (piece, block) whose age exceeds `request_timeout_ms` is
+    /// released and re-issued to a healthier peer.
+    requested_at: BTreeMap<(u32, u16), u64>,
     /// Per-piece peer availability counts.
     pub availability: Vec<u32>,
     /// Assembling piece buffers (piece → bytes).
@@ -548,6 +564,7 @@ impl TorrentSession {
             scheduler,
             peers: BTreeMap::new(),
             requested_by: BTreeMap::new(),
+            requested_at: BTreeMap::new(),
             availability: vec![0; piece_count as usize],
             assembling: BTreeMap::new(),
             files: Vec::new(),
@@ -621,6 +638,7 @@ impl TorrentSession {
             scheduler,
             peers: BTreeMap::new(),
             requested_by: BTreeMap::new(),
+            requested_at: BTreeMap::new(),
             availability: Vec::new(),
             assembling: BTreeMap::new(),
             files: Vec::new(),
@@ -1049,6 +1067,10 @@ impl TorrentSession {
         if self.torrent.is_none() {
             self.kick_metadata(ctx);
         }
+        // Mechanism 2: release stale requests (reassign them to healthier
+        // peers) and blacklist peers that time out repeatedly. Runs BEFORE
+        // the pipeline fill so the freed slots are re-issued this same tick.
+        self.sweep_request_timeouts(ctx);
         // request pipeline for unchoked peers
         if self.torrent.is_some() && self.status == SessionStatus::Downloading {
             let conns: Vec<ConnId> = self.peers.keys().copied().collect();
@@ -1349,10 +1371,19 @@ impl TorrentSession {
             .map(|p| self.peer_choke_view(p, ctx.now))
             .collect();
         let seeding = self.status == SessionStatus::Seeding;
+        // During the metadata-only phase (magnet still resolving) there is no
+        // data to protect, and some leech clients withhold ut_metadata from
+        // peers they see as permanently choked — which would stall magnet
+        // resolution. The hard anti-leech block only kicks in once the
+        // torrent is installed and pieces actually exist to serve.
+        let mut leech_cfg = self.cfg.leech.clone();
+        if self.torrent.is_none() {
+            leech_cfg.block_leech_clients = false;
+        }
         let unchoke = leech::select_unchoke_set(
             &views,
             seeding,
-            &self.cfg.leech,
+            &leech_cfg,
             |id| self.peers.get(&id).map(|p| !p.am_choking).unwrap_or(false),
             self.optimistic,
         );
@@ -1544,7 +1575,7 @@ impl TorrentSession {
             return;
         }
         let pc = self.pieces.piece_count();
-        let mut peer = Peer::new(conn, addr, pc, source);
+        let mut peer = Peer::new(conn, addr, pc, source, self.cfg.request_pipeline);
         peer.connected_at = ctx.now;
         peer.window_started = ctx.now;
         peer.phase = PeerPhase::Handshake;
@@ -1821,11 +1852,14 @@ impl TorrentSession {
             self.monitor.record_rates(addr, 0, 0, ctx.now);
         }
         if let Some(_p) = self.peers.remove(&conn) {
-            // release requested blocks (borrow-safe two-phase)
+            // release requested blocks (borrow-safe two-phase): every
+            // outstanding request on the dead connection frees one global
+            // in-flight slot (mechanism 3).
             let mut to_clear: Vec<(u32, u16)> = Vec::new();
             for ((piece, block), reqs) in self.requested_by.iter_mut() {
                 if let Some(pos) = reqs.iter().position(|c| *c == conn) {
                     reqs.remove(pos);
+                    ctx.cache.inflight_dec();
                     if reqs.is_empty() {
                         to_clear.push((*piece, *block));
                     }
@@ -1833,6 +1867,7 @@ impl TorrentSession {
             }
             self.requested_by.retain(|_, v| !v.is_empty());
             for (piece, block) in to_clear {
+                self.requested_at.remove(&(piece, block));
                 let bc = self.block_count(piece);
                 self.pieces.clear_block_requested(piece, block, bc);
             }
@@ -1856,6 +1891,7 @@ impl TorrentSession {
             for ((piece, block), reqs) in self.requested_by.iter_mut() {
                 if let Some(pos) = reqs.iter().position(|c| *c == conn) {
                     reqs.remove(pos);
+                    ctx.cache.inflight_dec();
                     if reqs.is_empty() {
                         to_clear.push((*piece, *block));
                     }
@@ -1863,6 +1899,7 @@ impl TorrentSession {
             }
             self.requested_by.retain(|_, v| !v.is_empty());
             for (piece, block) in to_clear {
+                self.requested_at.remove(&(piece, block));
                 let bc = self.block_count(piece);
                 self.pieces.clear_block_requested(piece, block, bc);
             }
@@ -3020,10 +3057,18 @@ impl TorrentSession {
             if self.tick_down_remaining < len as u64 {
                 break;
             }
+            // Mechanism 3: the global in-flight window is exhausted (the
+            // shared cache has more outstanding blocks than its byte budget
+            // can absorb). Hold off until blocks land and the disk IO flushes.
+            if !ctx.cache.inflight_available() {
+                break;
+            }
             self.download_limit.consume(len as u64, ctx.now);
             self.tick_down_remaining -= len as u64;
             self.pieces.mark_block_requested(piece, b, total_blocks);
             self.requested_by.entry((piece, b)).or_default().push(conn);
+            self.requested_at.insert((piece, b), ctx.now);
+            ctx.cache.inflight_inc();
             if let Some(p) = self.peers.get_mut(&conn) {
                 p.requests_in_flight += 1;
                 p.send(&Message::Request {
@@ -3033,6 +3078,81 @@ impl TorrentSession {
                 });
             }
             let _ = pipe;
+        }
+    }
+
+    /// Mechanism 2 — per-request timeout, release and reassign, with
+    /// punishment for repeat offenders.
+    ///
+    /// A block request left unanswered for `request_timeout_ms` is released:
+    /// the block returns to the pool of pickable blocks, every peer that had
+    /// it outstanding is sent a `Cancel` (best effort) and its pipeline slot
+    /// is freed, and one global in-flight slot is returned. Each timeout is
+    /// counted against the peer; a peer that times out
+    /// `max_request_timeouts` times **consecutively** (i.e. without ever
+    /// delivering a block in between) is disconnected and blacklisted —
+    /// the released block is then re-issued to a healthy peer on the very
+    /// next pipeline fill.
+    fn sweep_request_timeouts<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
+        let now = ctx.now;
+        let timeout_ms = self.cfg.request_timeout_ms.max(1_000);
+        let max_timeouts = self.cfg.max_request_timeouts.max(1);
+        if self.requested_at.is_empty() {
+            return;
+        }
+        let stale: Vec<(u32, u16)> = self
+            .requested_at
+            .iter()
+            .filter(|(_, t)| now.saturating_sub(**t) >= timeout_ms)
+            .map(|((p, b), _)| (*p, *b))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let mut to_ban: Vec<ConnId> = Vec::new();
+        for (piece, block) in stale {
+            let Some(reqs) = self.requested_by.get(&(piece, block)) else {
+                continue;
+            };
+            let begin = (block as u32) * BLOCK_LEN;
+            let len = self
+                .torrent
+                .as_ref()
+                .and_then(|t| t.piece_info(piece).ok())
+                .map(|pi| core::cmp::min(BLOCK_LEN, pi.len - begin))
+                .unwrap_or(BLOCK_LEN);
+            let conns: Vec<ConnId> = reqs.clone();
+            for &c in &conns {
+                if let Some(p) = self.peers.get_mut(&c) {
+                    p.send(&Message::Cancel {
+                        index: piece,
+                        begin,
+                        length: len,
+                    });
+                    p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
+                    p.requests_timed_out = p.requests_timed_out.saturating_add(1);
+                    if p.requests_timed_out >= max_timeouts {
+                        to_ban.push(c);
+                    }
+                }
+                ctx.cache.inflight_dec();
+            }
+            self.requested_by.remove(&(piece, block));
+            self.requested_at.remove(&(piece, block));
+            self.pieces
+                .clear_block_requested(piece, block, self.block_count(piece));
+        }
+        // Disconnect + blacklist repeat offenders (dedup by conn id).
+        to_ban.sort_unstable();
+        to_ban.dedup();
+        for c in to_ban {
+            let (addr, peer_id) = match self.peers.get(&c) {
+                Some(p) => (p.addr, p.peer_id),
+                None => continue,
+            };
+            // Remember the offense across disconnects/sessions.
+            self.reputation.note_violation(addr, peer_id.as_ref(), now);
+            self.ban_peer(c, addr, BanReason::Timeout, ctx);
         }
     }
 
@@ -3058,6 +3178,10 @@ impl TorrentSession {
         if data.len() as u32 != core::cmp::min(BLOCK_LEN, pi.len - begin) {
             return Err(Error::Protocol);
         }
+        // Resolve every outstanding request for this block: the delivering
+        // peer's request lands, the others (endgame duplicates) are
+        // cancelled. The (piece, block) entry is fully removed, so release
+        // one global in-flight slot per resolved request (mechanism 3).
         if let Some(reqs) = self.requested_by.get(&(index, block as u16)) {
             for &c in reqs {
                 if c != conn {
@@ -3070,14 +3194,19 @@ impl TorrentSession {
                         p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
                     }
                 }
+                ctx.cache.inflight_dec();
             }
         }
         self.requested_by.remove(&(index, block as u16));
+        self.requested_at.remove(&(index, block as u16));
         self.pieces
             .clear_block_requested(index, block as u16, total_blocks);
         if let Some(p) = self.peers.get_mut(&conn) {
             p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
             p.last_real_at = ctx.now;
+            // The peer actually delivered: its consecutive-timeout ledger
+            // resets (mechanism 2).
+            p.requests_timed_out = 0;
         }
         let newly = self
             .pieces
@@ -3387,7 +3516,7 @@ impl TorrentSession {
         conn: ConnId,
         index: u32,
         begin: u32,
-        _ctx: &'_ mut SessionCtx<'_, H>,
+        ctx: &'_ mut SessionCtx<'_, H>,
     ) -> Result<()> {
         let block = (begin / BLOCK_LEN) as u16;
         let outstanding = self
@@ -3415,9 +3544,13 @@ impl TorrentSession {
         if let Some(reqs) = self.requested_by.get_mut(&(index, block)) {
             if let Some(pos) = reqs.iter().position(|c| *c == conn) {
                 reqs.remove(pos);
+                // One resolved (cancelled) request → one global slot back
+                // (mechanism 3).
+                ctx.cache.inflight_dec();
             }
             if reqs.is_empty() {
                 self.requested_by.remove(&(index, block));
+                self.requested_at.remove(&(index, block));
                 self.pieces
                     .clear_block_requested(index, block, self.block_count(index));
             }
@@ -4729,5 +4862,238 @@ mod tests {
         );
         assert_eq!(s.piece_priorities[0], 0);
         assert!(s.piece_priorities[1] > 0 && s.piece_priorities[2] > 0);
+    }
+
+    // ---------- mechanism 1/2/3: request pipeline, timeout, global window ----------
+
+    /// Attach a peer, complete the handshake (unchoke + have_all) and mark it
+    /// interested in us — the minimal state for `fill_pipeline` to issue.
+    fn attach_ready_seed(s: &mut TorrentSession, conn: ConnId, ctx: &mut SessionCtx<'_, NoopHost>) {
+        s.attach_peer(
+            conn,
+            NetAddr::V4([93, 184, 216, 34], 6881),
+            true,
+            DiscoverySource::Tracker,
+            ctx,
+        );
+        let seg = remote_handshake_plus_first_messages([1u8; 20], true);
+        s.on_data(conn, &seg, ctx);
+        // We lack every piece and the seed has everything → interested.
+        s.peers.get_mut(&conn).unwrap().am_interested = true;
+    }
+
+    #[test]
+    fn per_peer_pipeline_uses_configured_depth() {
+        // Mechanism 1: the configured `request_pipeline` must actually bound
+        // how many blocks a single peer may have outstanding (the old code
+        // ignored the config and always used the 256-block crate constant).
+        let mut s = session();
+        s.cfg.request_pipeline = 3;
+        s.tick_down_remaining = u64::MAX;
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        attach_ready_seed(&mut s, 1, &mut ctx);
+        s.fill_pipeline(1, &mut ctx);
+        let p = s.peers.get(&1).expect("peer");
+        assert_eq!(p.max_pipeline(), 3, "configured depth is enforced");
+        assert_eq!(
+            p.requests_in_flight, 3,
+            "pipeline fills exactly to the configured depth"
+        );
+        assert_eq!(
+            cache.inflight_blocks(),
+            3,
+            "every issued request is counted in the global window"
+        );
+    }
+
+    #[test]
+    fn request_timeout_releases_block_and_counts_peer() {
+        // Mechanism 2: a block unanswered past `request_timeout_ms` is
+        // released (returns to the pickable pool, its global slot freed),
+        // and the peer's consecutive-timeout ledger is incremented.
+        let mut s = session();
+        s.cfg.request_pipeline = 2;
+        s.cfg.request_timeout_ms = 5_000;
+        s.tick_down_remaining = u64::MAX;
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        attach_ready_seed(&mut s, 1, &mut ctx);
+        s.fill_pipeline(1, &mut ctx);
+        let issued = s.peers.get(&1).unwrap().requests_in_flight;
+        assert!(issued > 0);
+        assert_eq!(ctx.cache.inflight_blocks(), issued as usize);
+        assert_eq!(s.requested_at.len(), issued as usize);
+
+        ctx.now = 1_000_000 + 6_000; // past the 5 s timeout
+        s.sweep_request_timeouts(&mut ctx);
+        assert!(s.requested_at.is_empty(), "stale requests are released");
+        assert_eq!(
+            ctx.cache.inflight_blocks(),
+            0,
+            "global window slots are returned"
+        );
+        let p = s.peers.get(&1).unwrap();
+        assert_eq!(p.requests_in_flight, 0);
+        assert_eq!(
+            p.requests_timed_out, issued,
+            "each outstanding request counts one timeout"
+        );
+        assert!(s.peers.contains_key(&1), "a single timeout does not ban");
+
+        // The released blocks are pickable again → the pipeline refills.
+        s.fill_pipeline(1, &mut ctx);
+        assert_eq!(s.peers.get(&1).unwrap().requests_in_flight, issued);
+    }
+
+    #[test]
+    fn peer_banned_after_max_request_timeouts() {
+        // Mechanism 2's punishment limit: a peer that times out
+        // `max_request_timeouts` times in a row (never delivering) is
+        // disconnected and blacklisted.
+        let mut s = session();
+        s.cfg.request_pipeline = 1;
+        s.cfg.request_timeout_ms = 5_000;
+        s.cfg.max_request_timeouts = 2;
+        s.tick_down_remaining = u64::MAX;
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        let addr = NetAddr::V4([93, 184, 216, 34], 6881);
+        attach_ready_seed(&mut s, 1, &mut ctx);
+        s.fill_pipeline(1, &mut ctx);
+
+        ctx.now = 1_000_000 + 6_000;
+        s.sweep_request_timeouts(&mut ctx);
+        assert!(s.peers.contains_key(&1), "one timeout is not enough to ban");
+        assert_eq!(s.peers.get(&1).unwrap().requests_timed_out, 1);
+
+        // The released block is re-issued to the same (only) peer.
+        s.fill_pipeline(1, &mut ctx);
+        ctx.now = 1_000_000 + 12_000;
+        s.sweep_request_timeouts(&mut ctx);
+
+        assert!(
+            !s.peers.contains_key(&1),
+            "peer is disconnected after repeated timeouts"
+        );
+        assert!(s.bans.is_banned(&addr, ctx.now), "peer is blacklisted");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::PeerBanned { .. })),
+            "a ban event is surfaced"
+        );
+    }
+
+    #[test]
+    fn global_inflight_cap_stops_new_requests() {
+        // Mechanism 3: the global in-flight window is derived from the
+        // shared cache budget (budget / 16 KiB; the cache has a 1 MiB
+        // floor, so the window is 64 blocks). When the window is exhausted
+        // — here by 63 blocks simulated as already outstanding from other
+        // sessions — no further requests are issued until blocks land.
+        let mut s = session();
+        s.cfg.request_pipeline = 8;
+        s.tick_down_remaining = u64::MAX;
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        assert_eq!(cache.max_inflight_blocks(), 64);
+        for _ in 0..63 {
+            cache.inflight_inc();
+        }
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        attach_ready_seed(&mut s, 1, &mut ctx);
+        s.fill_pipeline(1, &mut ctx);
+        assert_eq!(ctx.cache.inflight_blocks(), 64, "global window is full");
+        assert_eq!(
+            s.peers.get(&1).unwrap().requests_in_flight,
+            1,
+            "only the single remaining slot is used, even though the per-peer depth is 8"
+        );
+    }
+
+    #[test]
+    fn global_inflight_window_recovers_after_block_arrives() {
+        // Mechanism 3 end-to-end: after a block is delivered the global
+        // window slot returns and a fresh request is issued.
+        let mut s = session();
+        s.cfg.request_pipeline = 8;
+        s.tick_down_remaining = u64::MAX;
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        // 62 blocks already outstanding → 2 free slots.
+        for _ in 0..62 {
+            cache.inflight_inc();
+        }
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        attach_ready_seed(&mut s, 1, &mut ctx);
+        s.fill_pipeline(1, &mut ctx);
+        assert_eq!(ctx.cache.inflight_blocks(), 64, "window filled to the cap");
+
+        // Deliver one requested block (16 KiB at the block's offset).
+        let (piece, begin) = {
+            let reqs: Vec<(u32, u16)> = s.requested_at.keys().copied().collect();
+            let (p, b) = reqs[0];
+            (p, (b as u32) * BLOCK_LEN)
+        };
+        let data = vec![0xABu8; BLOCK_LEN as usize];
+        s.on_piece(1, piece, begin, data, &mut ctx)
+            .expect("block accepted");
+        assert_eq!(ctx.cache.inflight_blocks(), 63, "one slot returned");
+        // The pipeline refills the freed slot.
+        s.fill_pipeline(1, &mut ctx);
+        assert_eq!(
+            ctx.cache.inflight_blocks(),
+            64,
+            "window stays full but alive"
+        );
     }
 }

@@ -125,6 +125,10 @@ pub enum BanReason {
     Protocol,
     /// Reserved for explicit free-rider bans.
     FreeRide,
+    /// Too many consecutive request timeouts (mechanism 2): the peer
+    /// accepted our requests but never delivered within the timeout window
+    /// `max_request_timeouts` times in a row.
+    Timeout,
 }
 
 #[derive(Debug, Clone, Copy)]

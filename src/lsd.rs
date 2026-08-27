@@ -32,8 +32,21 @@ pub const LSD_GROUP_V6: crate::platform::NetAddr = crate::platform::NetAddr::V6(
     ],
     6771,
 );
-/// LSD announce interval (ms) — one announce per minute max.
+/// Default LSD announce interval (ms) — one announce per minute max
+/// (BEP-14's hard floor for the whole client). Torrents are round-robined
+/// one per interval, so each active torrent is re-announced every
+/// `active_count` intervals (~5 minutes with 5 active torrents, matching
+/// BEP-14's "≈5 minutes per torrent").
 pub const LSD_INTERVAL_MS: u64 = 60_000;
+/// Absolute lower bound for the LSD announce interval (ms): a config cannot
+/// push the LAN broadcast faster than this — the multicast group is shared
+/// and bursts would be network noise (mechanism 4's hard timer).
+pub const LSD_INTERVAL_MIN_MS: u64 = 30_000;
+/// Minimum gap (ms) between two unicast **replies** to the same neighbour
+/// (mechanism 4, anti-amplification): a hostile LAN peer can otherwise use
+/// our multicast group as a reflector by blasting `BT-SEARCH` datagrams at
+/// us with a victim's spoofed source address.
+pub const LSD_REPLY_GAP_MS: u64 = 10_000;
 
 /// Upper bound on infohashes accepted from a single announce datagram.
 pub const MAX_INFOHASHES_PER_ANNOUNCE: usize = 32;
@@ -220,13 +233,17 @@ pub fn parse(data: &[u8]) -> Option<LsdAnnounce> {
     })
 }
 
-/// Round-robin announce scheduler state (one announce per
-/// [`LSD_INTERVAL_MS`], each active torrent re-announced every
-/// `active_count` intervals, matching BEP-14's "~5 minutes per torrent").
+/// Round-robin announce scheduler state (one announce per configured
+/// interval, each active torrent re-announced every `active_count`
+/// intervals, matching BEP-14's "~5 minutes per torrent"). The interval is
+/// configurable but clamped to a hard floor ([`LSD_INTERVAL_MIN_MS`]) so a
+/// config can never turn the LAN broadcast into a storm.
 #[derive(Debug)]
 pub struct LsdScheduler {
     /// Opaque cookie used to recognise our own multicast echoes.
     pub cookie: [u8; 8],
+    /// Announce interval (ms), clamped to [`LSD_INTERVAL_MIN_MS`].
+    pub interval_ms: u64,
     /// Last announce time (ms).
     pub last_announce_at: u64,
     /// Round-robin cursor over the active infohash list.
@@ -235,11 +252,12 @@ pub struct LsdScheduler {
 
 impl LsdScheduler {
     /// Create a scheduler with a fresh opaque cookie; the first announce
-    /// is allowed immediately.
-    pub fn new(cookie: [u8; 8], now: u64) -> Self {
+    /// is allowed immediately. `interval_ms` is clamped to the hard floor.
+    pub fn new(cookie: [u8; 8], now: u64, interval_ms: u64) -> Self {
         LsdScheduler {
             cookie,
-            last_announce_at: now.saturating_sub(LSD_INTERVAL_MS),
+            interval_ms: interval_ms.max(LSD_INTERVAL_MIN_MS),
+            last_announce_at: now.saturating_sub(interval_ms),
             cursor: 0,
         }
     }
@@ -247,7 +265,7 @@ impl LsdScheduler {
     /// Whether an announce is due (rate-limit elapsed). Cheap check the
     /// engine performs *before* building the active-hash list.
     pub fn due(&self, now: u64) -> bool {
-        now.saturating_sub(self.last_announce_at) >= LSD_INTERVAL_MS
+        now.saturating_sub(self.last_announce_at) >= self.interval_ms
     }
 
     /// Pick the next infohash to announce, if enough time has passed.
@@ -256,7 +274,7 @@ impl LsdScheduler {
         if active.is_empty() {
             return None;
         }
-        if now.saturating_sub(self.last_announce_at) < LSD_INTERVAL_MS {
+        if now.saturating_sub(self.last_announce_at) < self.interval_ms {
             return None;
         }
         let ih = &active[self.cursor % active.len()];
@@ -350,7 +368,7 @@ mod tests {
     #[test]
     fn scheduler_rate_limits() {
         let cookie = [0u8; 8];
-        let mut s = LsdScheduler::new(cookie, 1_000_000);
+        let mut s = LsdScheduler::new(cookie, 1_000_000, 60_000);
         let active = [[1u8; 20], [2u8; 20]];
         // First call announces (interval elapsed via the constructor).
         assert!(s.next_announce(&active, 1_000_000).is_some());
@@ -359,5 +377,21 @@ mod tests {
         // After one minute → next torrent (round-robin).
         let ih = s.next_announce(&active, 1_060_001);
         assert_eq!(ih, Some(&[2u8; 20]));
+    }
+
+    #[test]
+    fn scheduler_interval_is_floored() {
+        let cookie = [0u8; 8];
+        // A config of 5 s must be clamped to the 30 s hard floor.
+        let mut s = LsdScheduler::new(cookie, 1_000_000, 5_000);
+        assert_eq!(s.interval_ms, LSD_INTERVAL_MIN_MS);
+        // Still rate-limited after 20 s (< 30 s floor).
+        assert!(s.next_announce(&active_two(), 1_020_000).is_none());
+        // Due after the floor.
+        assert!(s.next_announce(&active_two(), 1_031_000).is_some());
+    }
+
+    fn active_two() -> [[u8; 20]; 2] {
+        [[1u8; 20], [2u8; 20]]
     }
 }

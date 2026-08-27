@@ -7,7 +7,6 @@
 //! supplies the per-connection state it operates on.
 
 use crate::bitfield::Bitfield;
-use crate::consts::REQUEST_PIPELINE;
 use crate::leech::PeerReputation;
 use crate::monitoring::DiscoverySource;
 use crate::platform::{ConnId, NetAddr};
@@ -99,6 +98,16 @@ pub struct Peer {
     pub optimistic: bool,
     /// Outstanding request count on this connection.
     pub requests_in_flight: u32,
+    /// Consecutive request timeouts on this connection (mechanism 2). Reset
+    /// to zero as soon as the peer actually delivers a block; when it
+    /// reaches the session's `max_request_timeouts` the peer is
+    /// disconnected and blacklisted.
+    pub requests_timed_out: u32,
+    /// Max request pipeline depth for THIS connection (mechanism 1). The
+    /// session copies its configured `request_pipeline` here at attach time
+    /// so the configured value is actually enforced (the old code ignored
+    /// the config and always used the crate constant).
+    pub max_pipeline: u32,
     /// The piece this peer is committed to filling
     pub current_piece: Option<u32>,
     /// Last time they requested a block from us (ms; 0 = never). Drives
@@ -131,8 +140,16 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// Create a new peer (outbound or inbound).
-    pub fn new(id: ConnId, addr: NetAddr, piece_count: u32, source: DiscoverySource) -> Self {
+    /// Create a new peer (outbound or inbound). `max_pipeline` is the
+    /// request pipeline depth this connection is allowed (mechanism 1);
+    /// pass the session's configured `request_pipeline`.
+    pub fn new(
+        id: ConnId,
+        addr: NetAddr,
+        piece_count: u32,
+        source: DiscoverySource,
+        max_pipeline: u32,
+    ) -> Self {
         Peer {
             id,
             addr,
@@ -168,6 +185,8 @@ impl Peer {
             snubbed: false,
             optimistic: false,
             requests_in_flight: 0,
+            requests_timed_out: 0,
+            max_pipeline: max_pipeline.max(1),
             current_piece: None,
             last_request_at: 0,
             served_requests: 0,
@@ -218,9 +237,10 @@ impl Peer {
         false
     }
 
-    /// Max request pipeline depth for this peer.
+    /// Max request pipeline depth for this peer (mechanism 1: the session's
+    /// configured per-peer pipeline, copied at attach time).
     pub fn max_pipeline(&self) -> u32 {
-        REQUEST_PIPELINE
+        self.max_pipeline
     }
 
     /// Queue a message for sending.
@@ -281,6 +301,7 @@ mod tests {
             NetAddr::V4([127, 0, 0, 1], 6881),
             64,
             DiscoverySource::Tracker,
+            32,
         );
         p.phase = PeerPhase::Ready;
         p

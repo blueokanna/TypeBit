@@ -50,6 +50,12 @@ pub struct EngineConfig {
     /// and discover same-LAN peers. Off disables both the multicast
     /// announce and the dedicated 6771 receive socket.
     pub lsd_enabled: bool,
+    /// LSD announce interval (ms, mechanism 4). One infohash per interval,
+    /// round-robin over active torrents. Clamped to a hard floor
+    /// ([`crate::lsd::LSD_INTERVAL_MIN_MS`]) so a config can never turn the
+    /// LAN broadcast into a storm. 60_000 matches BEP-14's once-per-minute
+    /// rule (~5 min per torrent with 5 active torrents).
+    pub lsd_interval_ms: u64,
     /// Piece-verification worker threads. `0` = auto-detect under `std`
     /// (one per core minus one, capped at 8) and inline under `no_std`.
     /// The engine event loop never blocks on hashing either way.
@@ -78,6 +84,7 @@ impl Default for EngineConfig {
             max_connections_per_ip: 8,
             port_mapping: false,
             lsd_enabled: true,
+            lsd_interval_ms: crate::lsd::LSD_INTERVAL_MS,
             verify_workers: 0,
             proxy: None,
             connect_timeout_ms: 30_000,
@@ -174,6 +181,11 @@ pub struct Engine<H: Host> {
     last_pm_phase: PortMapPhase,
     /// Local Service Discovery (BEP-14) announce scheduler.
     lsd: crate::lsd::LsdScheduler,
+    /// Last unicast LSD reply per source address (mechanism 4,
+    /// anti-amplification): we answer a neighbour's `BT-SEARCH` at most once
+    /// per [`crate::lsd::LSD_REPLY_GAP_MS`], so a spoofed-source flood
+    /// cannot turn us into a multicast reflector.
+    lsd_last_reply: BTreeMap<crate::platform::NetAddr, u64>,
     /// Last time a spontaneous `find_node` (bucket refresh) was started.
     last_dht_find_node: u64,
     /// Counter for deriving refresh targets (cheap deterministic random).
@@ -258,6 +270,7 @@ impl<H: Host> Engine<H> {
                 None
             }
         };
+        let lsd_interval = cfg.lsd_interval_ms;
         Engine {
             host: h,
             peer_id,
@@ -284,7 +297,8 @@ impl<H: Host> Engine<H> {
             global_down,
             portmap,
             last_pm_phase: PortMapPhase::Idle,
-            lsd: crate::lsd::LsdScheduler::new(lsd_cookie, now),
+            lsd: crate::lsd::LsdScheduler::new(lsd_cookie, now, lsd_interval),
+            lsd_last_reply: BTreeMap::new(),
             last_dht_find_node: now,
             dht_refresh_serial: 0,
             verify_pool,
@@ -1833,14 +1847,18 @@ impl<H: Host> Engine<H> {
             }
         }
 
-        // Dedicated LSD (BEP-14) socket: drain multicast announces sent to
-        // 239.192.152.143:6771 / [ff15::efc0:988f]:6771 — the shared socket
-        // (bound to the BT port) never sees these.
         if self.cfg.lsd_enabled {
             let mut lsd_buf = [0u8; 64 * 1024];
+            let mut lsd_budget = 256u32;
+            let mut drained = 0u32;
             loop {
+                if lsd_budget == 0 {
+                    break;
+                }
+                lsd_budget -= 1;
                 match self.host.udp_recv_lsd(&mut lsd_buf) {
                     Ok((addr, n)) => {
+                        drained += 1;
                         let payload = &lsd_buf[..n];
                         if payload.starts_with(b"BT-SEARCH") {
                             self.handle_lsd_datagram(addr, payload, now);
@@ -1851,6 +1869,14 @@ impl<H: Host> Engine<H> {
                     Err(Error::WouldBlock) => break,
                     Err(_) => break,
                 }
+            }
+
+            if drained >= 256 {
+                self.host.log(
+                    LogLevel::Warn,
+                    "LSD multicast group flooded past the per-tick budget (256 datagrams); \
+                     additional announces deferred to the next tick",
+                );
             }
         }
     }
@@ -1917,6 +1943,12 @@ impl<H: Host> Engine<H> {
     /// have (reply with our presence + add them as a peer) or their reply
     /// to our announce (add them as a peer). Our own multicast echoes are
     /// dropped via the cookie.
+    ///
+    /// Mechanism 4 (anti-amplification): we unicast a reply to a given
+    /// source at most once per [`crate::lsd::LSD_REPLY_GAP_MS`]. LSD
+    /// multicast groups are shared and unauthenticated — without this gate,
+    /// a hostile neighbour could spoof a victim's source address on a burst
+    /// of `BT-SEARCH` datagrams and make us reflect traffic at them.
     fn handle_lsd_datagram(&mut self, addr: NetAddr, payload: &[u8], now: u64) {
         let Some(ann) = crate::lsd::parse(payload) else {
             return;
@@ -1926,6 +1958,17 @@ impl<H: Host> Engine<H> {
         }
         if ann.port == 0 {
             return;
+        }
+
+        if now.saturating_sub(self.lsd_last_reply.get(&addr).copied().unwrap_or(0))
+            < crate::lsd::LSD_REPLY_GAP_MS
+        {
+            return;
+        }
+        self.lsd_last_reply.insert(addr, now);
+        if self.lsd_last_reply.len() > 1024 {
+            self.lsd_last_reply
+                .retain(|_, t| now.saturating_sub(*t) < crate::lsd::LSD_REPLY_GAP_MS);
         }
         let group = match addr {
             NetAddr::V4(..) => crate::lsd::LSD_GROUP_V4,
@@ -2160,11 +2203,7 @@ pub mod engine_events {
         },
         /// DHT node count changed.
         DhtNodeCount(usize),
-        /// A non-fatal engine-level failure that degraded operation (e.g.
-        /// the UDP socket could not be opened, so DHT and UDP trackers are
-        /// off). The engine keeps running — HTTP trackers and peer
-        /// transport still work — but the host should surface this to the
-        /// user instead of showing a silent `0 B/s`.
+        /// A non-fatal engine-level failure that degraded operation.
         Error {
             /// Stable machine-readable code: 0 = UDP open failed,
             /// 1 = DHT bootstrap: no router resolvable.
