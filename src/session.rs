@@ -39,6 +39,14 @@ const DHT_ANNOUNCE_INTERVAL_MS: u64 = 60_000;
 /// interaction (piece request/data) within this window — harvesters/dead conns must not squat capacity.
 const METADATA_SERVED_IDLE_TIMEOUT_MS: u64 = 10_000;
 
+/// A `ut_metadata` request left unanswered for this long is released and
+/// re-issued to another peer.
+const METADATA_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+/// A corrupt-feeding peer is retried (fresh fetch), but a hostile peer that
+/// always returns garbage must not make us loop forever.
+const MAX_METADATA_HASH_FAILS: u32 = 5;
+
 /// HTTP announce in-flight window: no second HTTP connection for a tracker
 /// within it. 5 s keeps a multi-tracker rotation fast while still bounding
 /// the concurrency the shared async HTTP worker sees.
@@ -456,6 +464,11 @@ pub struct TorrentSession {
     external_ports: BTreeMap<u16, Vec<(NetAddr, u64)>>,
     /// Metadata fetch state.
     metadata: Option<MetadataFetch>,
+    /// Wall time (ms) of the last issued `ut_metadata` request.
+    last_metadata_request_at: u64,
+    /// A peer that feeds corrupt metadata is retried (fresh fetch) up to this cap,
+    /// then the session fails instead of looping forever against a lying peer.
+    metadata_hash_fails: u32,
     /// Web seeds (BEP-19) for direct HTTP piece download.
     web_seeds: Vec<String>,
     /// Web-seed (BEP-19) fetch state.
@@ -587,6 +600,8 @@ impl TorrentSession {
             pex_known: Vec::new(),
             external_ports: BTreeMap::new(),
             metadata: None,
+            last_metadata_request_at: 0,
+            metadata_hash_fails: 0,
             web_seeds: torrent
                 .web_seeds
                 .iter()
@@ -666,6 +681,8 @@ impl TorrentSession {
                 requested: Bitfield::new(0),
                 outstanding: 0,
             }),
+            last_metadata_request_at: 0,
+            metadata_hash_fails: 0,
             web_seeds: Vec::new(),
             webseed: WebSeedState::default(),
             monitor,
@@ -1872,6 +1889,9 @@ impl TorrentSession {
                 self.pieces.clear_block_requested(piece, block, bc);
             }
         }
+        if self.torrent.is_none() {
+            self.clear_metadata_requests();
+        }
         self.recompute_availability();
     }
 
@@ -1903,6 +1923,11 @@ impl TorrentSession {
                 let bc = self.block_count(piece);
                 self.pieces.clear_block_requested(piece, block, bc);
             }
+        }
+        // A magnet's unanswered ut_metadata asks on the dead connection must
+        // not block re-requesting those pieces from other peers.
+        if self.torrent.is_none() {
+            self.clear_metadata_requests();
         }
         ctx.host.tcp_close(conn);
         self.recompute_availability();
@@ -2110,26 +2135,42 @@ impl TorrentSession {
             }
             if self.torrent.is_none() {
                 let meta_id = self.peers.get(&conn).and_then(|p| p.ext_metadata);
+                // Bounded: don't pile up more than 8 redundant asks for
+                // piece 0 (all direct asks are for piece 0 until total_size
+                // is known). Once saturated, the request-timeout sweep
+                // releases them.
+                let saturated = self
+                    .metadata
+                    .as_ref()
+                    .map(|m| m.outstanding >= 8)
+                    .unwrap_or(true);
                 if let Some(meta_id) = meta_id {
-                    let msg = Message::Extended {
-                        id: meta_id,
-                        payload: MetadataMsg::Request { piece: 0 }.encode(),
-                    };
-                    if let Some(p) = self.peers.get_mut(&conn) {
-                        p.send(&msg);
-                    }
-                    if let Some(m) = self.metadata.as_mut() {
-                        m.outstanding += 1;
+                    if !saturated {
+                        let msg = Message::Extended {
+                            id: meta_id,
+                            payload: MetadataMsg::Request { piece: 0 }.encode(),
+                        };
+                        if let Some(p) = self.peers.get_mut(&conn) {
+                            p.send(&msg);
+                        }
+                        if let Some(m) = self.metadata.as_mut() {
+                            m.outstanding += 1;
+                            // Mark piece 0 requested so the disconnect and
+                            // timeout sweeps can release this ask again — the
+                            // old code only bumped `outstanding`, so a peer
+                            // that never answered left the count permanently
+                            // inflated and the magnet could stall forever.
+                            if m.requested.len() == 0 {
+                                m.requested = Bitfield::new(1);
+                            }
+                            m.requested.set(0);
+                        }
+                        self.last_metadata_request_at = ctx.now;
                     }
                 }
             }
             return Ok(());
         }
-        // ut_metadata / ut_pex — the extended id in an INCOMING message is
-        // OUR advertised id (each side sends extended messages using the
-        // RECEIVER's advertised id: the peer sends its metadata DATA with
-        // our ut_metadata id = 3). `ext_metadata`/`ext_pex` (the ids the
-        // peer advertised) are what WE must use when SENDING to it.
         if id == 3 {
             let m = MetadataMsg::parse(&payload)?;
             return self.on_metadata_msg(conn, m, ctx);
@@ -2150,7 +2191,6 @@ impl TorrentSession {
     ) -> Result<()> {
         match msg {
             MetadataMsg::Request { piece } => {
-                // we are the source: serve our info dict
                 if let Some(t) = &self.torrent {
                     let meta = &t.info_raw;
                     let piece_len = 16 * 1024usize;
@@ -2172,8 +2212,6 @@ impl TorrentSession {
                             payload: msg.encode(),
                         });
                     }
-                    // Track serving completion: once every piece of our info dict is handed over,
-                    // note the moment so the idle-disconnect rule can apply.
                     let total = (meta.len().div_ceil(piece_len)) as u32;
                     let p = self.peers.get_mut(&conn).ok_or(Error::NotFound)?;
                     p.metadata_total_pieces = total;
@@ -2258,13 +2296,26 @@ impl TorrentSession {
             crate::crypto::Sha256::digest(&raw) == self.info_hash.full()
         };
         if !hash_ok {
-            self.metadata = None;
-            self.status = SessionStatus::Failed;
-            ctx.events.push(EngineEvent::MetadataFailed {
-                info_hash: self.info_hash,
-            });
+            self.metadata_hash_fails = self.metadata_hash_fails.saturating_add(1);
+            if self.metadata_hash_fails >= MAX_METADATA_HASH_FAILS {
+                self.metadata = None;
+                self.status = SessionStatus::Failed;
+                ctx.events.push(EngineEvent::MetadataFailed {
+                    info_hash: self.info_hash,
+                });
+            } else {
+                self.metadata = Some(MetadataFetch {
+                    size: 0,
+                    pieces: BTreeMap::new(),
+                    requested: Bitfield::new(0),
+                    outstanding: 0,
+                });
+                self.last_metadata_request_at = 0;
+                self.status = SessionStatus::FetchingMetadata;
+            }
             return;
         }
+        self.metadata_hash_fails = 0;
         match Torrent::from_info(&raw) {
             Ok(t) => {
                 self.install_torrent(t, ctx);
@@ -2306,7 +2357,7 @@ impl TorrentSession {
     }
 
     fn kick_metadata<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
-        // ensure we are requesting metadata from peers that support it
+        self.sweep_metadata_requests(ctx);
         let conns: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in conns {
             let can_request = {
@@ -2340,6 +2391,7 @@ impl TorrentSession {
                         m.requested.set(piece);
                         m.outstanding += 1;
                     }
+                    self.last_metadata_request_at = ctx.now;
                     peer.send(&Message::Extended {
                         id: meta_id,
                         payload: MetadataMsg::Request { piece }.encode(),
@@ -2352,6 +2404,61 @@ impl TorrentSession {
             self.announce_at = ctx.now;
             self.announce_to_tracker(ctx, TrackerEvent::Started);
         }
+    }
+
+    /// Release `ut_metadata` piece requests that have been outstanding
+    /// longer than [`METADATA_REQUEST_TIMEOUT_MS`] without an answer. The
+    /// piece returns to the pool of requestable pieces and `outstanding` is
+    /// decremented so `kick_metadata` can re-issue it to another peer.
+    fn sweep_metadata_requests<H: Host>(&mut self, ctx: &SessionCtx<'_, H>) {
+        let Some(m) = self.metadata.as_mut() else {
+            return;
+        };
+        if m.outstanding == 0 {
+            return;
+        }
+        if ctx.now.saturating_sub(self.last_metadata_request_at) < METADATA_REQUEST_TIMEOUT_MS {
+            return;
+        }
+        let np = if m.size == 0 {
+            0
+        } else {
+            m.size.div_ceil(16 * 1024)
+        };
+        let mut released = 0u32;
+        for piece in 0..m.requested.len() as u32 {
+            if m.requested.get(piece) && !m.pieces.contains_key(&piece) {
+                if np == 0 || piece < np {
+                    m.requested.clear(piece);
+                    released += 1;
+                }
+            }
+        }
+        m.outstanding = m.outstanding.saturating_sub(released);
+    }
+
+    /// Release every outstanding metadata request (called when a peer
+    /// disconnects — its unanswered asks must not block re-requesting those
+    /// pieces from other peers).
+    fn clear_metadata_requests(&mut self) {
+        let Some(m) = self.metadata.as_mut() else {
+            return;
+        };
+        let np = if m.size == 0 {
+            0
+        } else {
+            m.size.div_ceil(16 * 1024)
+        };
+        let mut released = 0u32;
+        for piece in 0..m.requested.len() as u32 {
+            if m.requested.get(piece) && !m.pieces.contains_key(&piece) {
+                if np == 0 || piece < np {
+                    m.requested.clear(piece);
+                    released += 1;
+                }
+            }
+        }
+        m.outstanding = m.outstanding.saturating_sub(released);
     }
 
     // ---------- tracker ----------
@@ -2399,8 +2506,6 @@ impl TorrentSession {
             let kind = self.trackers[idx].kind;
             match kind {
                 TrackerKind::Http => {
-                    // Pending guard: never open a second HTTP connection for a tracker still
-                    // inside its timeout window (re-entrant announce paths must not pile up conns).
                     if ctx.now < self.trackers[idx].http_pending_until {
                         pending_skipped = true;
                         attempt += 1;
@@ -2412,9 +2517,6 @@ impl TorrentSession {
                         &String::from_utf8_lossy(&self.trackers[idx].url),
                         &params,
                     );
-                    // Async path (never blocks the engine): the request runs on the host's
-                    // worker; the result is applied by on_http_job_done. Proxy mode has no
-                    // async seam, so it falls back to the synchronous SOCKS GET.
                     let job_id = if self.cfg.proxy.is_none() {
                         ctx.host.http_get_async(&url, HTTP_ANNOUNCE_TIMEOUT_MS)
                     } else {
@@ -2429,7 +2531,7 @@ impl TorrentSession {
                             self.announce_at = ctx.now + HTTP_ANNOUNCE_PENDING_MS;
                             return;
                         }
-                        continue; // fire the next tracker in the batch
+                        continue;
                     }
                     // Sync fallback (host without an async worker, or proxy mode).
                     let mut body = Vec::new();
@@ -2478,26 +2580,14 @@ impl TorrentSession {
                 }
                 TrackerKind::Udp => {
                     let st = &mut self.trackers[idx];
-                    // UDP is lossy: if a request has gone unanswered for one
-                    // announce interval, restart the handshake instead of
-                    // waiting on a packet that will never come (otherwise a
-                    // single lost connect request would stall this tracker
-                    // forever). Three consecutive timeouts park it like any
-                    // other failing tracker.
                     if st.udp.phase != UdpPhase::Idle
                         && ctx.now.saturating_sub(st.udp.sent_at) >= 15_000
                     {
-                        // Rotate to the next DNS record: a tracker with
-                        // multiple addresses must not keep hammering a dead
-                        // one — the whole point of resolving them all.
                         st.udp.phase = UdpPhase::Idle;
                         let _ = st.udp.next_addr();
                         st.fails = st.fails.saturating_add(1);
                     }
                     if st.udp.phase == UdpPhase::Idle {
-                        // Resolve every record once (hostname trackers are
-                        // the norm); the timeout reset above reuses `addrs`
-                        // and rotates the in-use index.
                         if st.udp.addrs.is_empty() {
                             st.udp.addrs = parse_udp_tracker_addr(&st.url, &mut |h, p| {
                                 ctx.host.resolve_host_all(h, p)
@@ -2509,9 +2599,6 @@ impl TorrentSession {
                             st.udp.sent_at = ctx.now;
                             let req = tracker::udp::build_connect_request(st.udp.tid);
                             if ctx.host.udp_send(&a, &req).is_err() {
-                                // A send failure must be visible, not silent:
-                                // park this tracker so the announce loop moves
-                                // on to the next one instead of wedging here.
                                 st.fails = st.fails.saturating_add(1);
                                 st.failure = Some(String::from("udp send failed"));
                                 st.udp.phase = UdpPhase::Idle;
@@ -2520,19 +2607,11 @@ impl TorrentSession {
                                 st.udp.phase = UdpPhase::ConnectSent;
                             }
                         } else {
-                            // Unresolvable hostname: a dead tracker must not
-                            // stall the whole announce cycle (it used to
-                            // `return` here, so one bad UDP hostname blocked
-                            // every later tracker). Record the failure and
-                            // move on to the next tracker.
                             st.fails = st.fails.saturating_add(1);
                             st.failure = Some(String::from("resolve failed"));
                         }
                     }
                     if st.udp.phase == UdpPhase::ConnectSent {
-                        // A connect request is on the wire: wait for the
-                        // reply (or the 15 s timeout) before touching any
-                        // other tracker — UDP announce is asynchronous.
                         self.tracker_cursor = (idx + 1) % total;
                         self.announce_at = ctx.now + 15_000;
                         return;
@@ -2542,9 +2621,6 @@ impl TorrentSession {
             attempt += 1;
             self.tracker_cursor = (self.tracker_cursor + 1) % total;
         }
-        // All trackers failed or were skipped as pending: back off. Pending
-        // skips retry inside the HTTP timeout window, real failures wait
-        // the standard 30 s.
         self.announce_at = if pending_skipped {
             ctx.now + HTTP_ANNOUNCE_PENDING_MS
         } else {
@@ -2651,8 +2727,6 @@ impl TorrentSession {
         if self.webseed.job_id != id {
             return;
         }
-        // The fetch is over: release the slot so drive_webseed picks the
-        // next block (without this, the web seed stalls after one block).
         self.webseed.job_id = 0;
         let blen = self.webseed.job_len;
         let body = result.unwrap_or_default();
@@ -2685,9 +2759,6 @@ impl TorrentSession {
                     continue;
                 }
                 let action = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                // BEP-15 action 3 = the tracker rejected us; surface the
-                // reason, rotate to the next DNS record and reset the
-                // handshake instead of silently wedging in Connect/Announce.
                 if action == tracker::udp::ACTION_ERROR {
                     let reason = String::from_utf8_lossy(&data[8..])
                         .chars()
@@ -2731,10 +2802,6 @@ impl TorrentSession {
                             let req = tracker::udp::build_announce_request(conn_id, st.udp.tid, &p);
                             if let Some(a) = st.udp.current_addr() {
                                 if ctx.host.udp_send(&a, &req).is_err() {
-                                    // Send failed: reset the handshake so the
-                                    // next announce retries, and record the
-                                    // failure instead of silently hanging in
-                                    // AnnounceSent.
                                     st.udp.phase = UdpPhase::Idle;
                                     st.fails = st.fails.saturating_add(1);
                                     st.failure = Some(String::from("udp send failed"));
@@ -2746,8 +2813,6 @@ impl TorrentSession {
                             break;
                         }
                         Err(_) => {
-                            // Bad connect reply: rotate to the next record and
-                            // re-handshake, rather than parking on this one.
                             st.udp.phase = UdpPhase::Idle;
                             st.fails = st.fails.saturating_add(1);
                             let _ = st.udp.next_addr();
@@ -2917,9 +2982,6 @@ impl TorrentSession {
         }
         msg.added = v4;
         msg.added6 = v6;
-        // Advertise the best-known external port (confirmed by ≥2 distinct
-        // peers via `yourport`/PEX `p`); fall back to our configured listen
-        // port. Proxy mode never advertises a reachable port.
         if self.cfg.proxy.is_none() {
             let port = self
                 .confirmed_external_port(now)
@@ -2996,9 +3058,6 @@ impl TorrentSession {
             if !want {
                 break;
             }
-            // Resolve the piece this peer is committed to (or pick a new
-            // one). A completed piece is dropped so the next iteration picks
-            // a fresh target and the pipeline stays saturated.
             let piece = {
                 let peer = match self.peers.get(&conn) {
                     Some(p) => p,
@@ -5094,6 +5153,177 @@ mod tests {
             ctx.cache.inflight_blocks(),
             64,
             "window stays full but alive"
+        );
+    }
+
+    // ---------- magnet metadata robustness ----------
+
+    #[test]
+    fn metadata_requests_release_on_disconnect_and_timeout() {
+        // The "metadata never loads" stall: a `ut_metadata` piece asked from
+        // a peer that never answers (or disconnects) used to stay `requested`
+        // forever, and since kick_metadata only picks un-requested pieces,
+        // the magnet froze. Disconnects and the timeout window must release
+        // the ask so a fresh peer can re-request it.
+        let magnet = crate::magnet::Magnet::parse(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect("magnet");
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            use_default_trackers: false,
+            ..Default::default()
+        };
+        let mut s = TorrentSession::from_magnet(&magnet, cfg, 1_000_000).expect("session");
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        // Simulate the direct piece-0 ask that `on_extended` issues for the
+        // first ut_metadata peer (requested bitfield sized to 1 with bit 0
+        // set, outstanding 1) — the post-handshake state of a real magnet.
+        s.metadata = Some(MetadataFetch {
+            size: 0,
+            pieces: BTreeMap::new(),
+            requested: {
+                let mut b = Bitfield::new(1);
+                b.set(0);
+                b
+            },
+            outstanding: 1,
+        });
+        s.last_metadata_request_at = 1_000_000;
+        // Peer 1 supports ut_metadata.
+        s.attach_peer(
+            1,
+            NetAddr::V4([93, 184, 216, 34], 6881),
+            true,
+            DiscoverySource::Tracker,
+            &mut ctx,
+        );
+        s.peers.get_mut(&1).unwrap().ext_metadata = Some(3);
+        s.peers.get_mut(&1).unwrap().phase = PeerPhase::Ready;
+
+        s.kick_metadata(&mut ctx);
+        assert_eq!(
+            s.metadata.as_ref().unwrap().outstanding,
+            1,
+            "piece 0 already outstanding"
+        );
+        assert!(
+            s.metadata.as_ref().unwrap().requested.get(0),
+            "piece 0 marked requested"
+        );
+
+        // Peer 1 disconnects without answering → its ask must be released so
+        // a fresh peer can re-request piece 0.
+        s.drop_peer(1, FailureCategory::Timeout, &mut ctx);
+        let m = s.metadata.as_ref().unwrap();
+        assert_eq!(m.outstanding, 0, "dead peer's asks released");
+        assert!(!m.requested.get(0), "piece 0 requestable again");
+
+        // Peer 2 connects → piece 0 is re-requested immediately.
+        s.attach_peer(
+            2,
+            NetAddr::V4([93, 184, 216, 35], 6881),
+            true,
+            DiscoverySource::Tracker,
+            &mut ctx,
+        );
+        s.peers.get_mut(&2).unwrap().ext_metadata = Some(3);
+        s.peers.get_mut(&2).unwrap().phase = PeerPhase::Ready;
+        s.kick_metadata(&mut ctx);
+        assert_eq!(
+            s.metadata.as_ref().unwrap().outstanding,
+            1,
+            "piece 0 re-requested from peer 2"
+        );
+        assert!(s.metadata.as_ref().unwrap().requested.get(0));
+
+        // A peer that stays connected but never answers: past the timeout
+        // window the stale ask is swept back into the requestable pool.
+        ctx.now = 1_000_000 + 31_000;
+        s.sweep_metadata_requests(&ctx);
+        let m = s.metadata.as_ref().unwrap();
+        assert_eq!(m.outstanding, 0, "timeout releases the stale ask");
+        assert!(!m.requested.get(0), "stale ask returned to the pool");
+    }
+
+    #[test]
+    fn metadata_hash_failure_retries_then_fails() {
+        // A lying peer that feeds corrupt metadata must not permanently
+        // poison the magnet: the session retries (fresh fetch) up to the
+        // cap, then fails.
+        let magnet = crate::magnet::Magnet::parse(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect("magnet");
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            use_default_trackers: false,
+            ..Default::default()
+        };
+        let mut s = TorrentSession::from_magnet(&magnet, cfg, 1_000_000).expect("session");
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        // Feed a full, wrong-hash metadata blob (1 piece of garbage).
+        s.metadata = Some(MetadataFetch {
+            size: 3,
+            pieces: {
+                let mut b = BTreeMap::new();
+                b.insert(0u32, vec![0xDE, 0xAD, 0xBE]);
+                b
+            },
+            requested: Bitfield::new(1),
+            outstanding: 0,
+        });
+        s.try_finalize_metadata(&mut ctx);
+        assert_eq!(s.metadata_hash_fails, 1, "one bad hash counts a failure");
+        assert!(
+            s.metadata.is_some(),
+            "session retries instead of failing on the first bad hash"
+        );
+        assert_eq!(s.status, SessionStatus::FetchingMetadata);
+
+        // Burn through the retry cap → terminal failure.
+        for _ in 0..MAX_METADATA_HASH_FAILS {
+            s.metadata = Some(MetadataFetch {
+                size: 3,
+                pieces: {
+                    let mut b = BTreeMap::new();
+                    b.insert(0u32, vec![0xDE, 0xAD, 0xBE]);
+                    b
+                },
+                requested: Bitfield::new(1),
+                outstanding: 0,
+            });
+            s.try_finalize_metadata(&mut ctx);
+        }
+        assert_eq!(s.status, SessionStatus::Failed, "cap reached → fail");
+        assert!(s.metadata.is_none());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::MetadataFailed { .. })),
+            "failure surfaced"
         );
     }
 }
