@@ -2,13 +2,15 @@
 name = "typebit"
 version = "0.1.6"
 edition = "2021"
+rust-version = "1.95"
 license-file = "LICENSE"
 authors = ["blueokanna, HyphenTeam"]
-description = "A universal download engine for torrent with provable-download receipts and a semantic utility scheduler."
+description = "An universal download engine core: BitTorrent v1/v2 (DHT, PEX, web seeds, LSD, uTP), eD2k, Xunlei, IPFS, Kad, direct HTTP(S), with provable-download receipts and a semantic utility scheduler."
 homepage = "https://github.com/blueokanna/TypeBit"
 repository = "https://github.com/blueokanna/TypeBit"
+documentation = "https://docs.rs/typebit"
 readme = "README.md"
-keywords = ["bittorrent", "p2p", "rust-core", "ed2k", "downloader"]
+keywords = ["bittorrent", "p2p", "dht", "ed2k", "torrent"]
 categories = [
     "network-programming",
     "cryptography",
@@ -37,6 +39,10 @@ ffi = ["std"]
 [[example]]
 name = "ffi_demo"
 required-features = ["ffi"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.release]
 lto = "thin"

@@ -107,6 +107,25 @@ impl Host for StdHost {
 }
 ```
 
+## Optional capabilities (all have defaults)
+
+| Method | Default | Needed for |
+|---|---|---|
+| `resolve_host(host, port) -> Option<NetAddr>` | `None` | DHT bootstrap |
+| `resolve_host_all(host, port) -> Vec<NetAddr>` | `resolve_host` only | UDP tracker multi-address fallback |
+| `resolve_host_async` + `take_resolved_hosts()` | `false` / empty | non-blocking DHT bootstrap DNS |
+| `http_post(url, body, timeout, out)` | `Err(NotSupported)` | UPnP IGD SOAP |
+| `http_get_range(url, start, end, timeout, out)` | `Err(NotSupported)` | web seeds (BEP-19) |
+| `http_get_async(url, timeout) -> u64` + `http_take_done()` | `0` / empty | non-blocking tracker / web seed |
+| `udp_multicast_send` / `udp_join_multicast` | `udp_send` / no-op | LSD (BEP-14), SSDP |
+| `default_gateway() -> Option<NetAddr>` | `None` | NAT-PMP |
+| `local_ip() -> Option<NetAddr>` | `None` | UPnP IGD `NewInternalClient` |
+| `tcp_recv_buf_size() -> usize` | 64 KiB | receive-buffer sizing hint |
+
+> **Note**: keep the `out` buffers of every HTTP callback **bounded**. The
+> engine enforces caps (`MAX_HTTP_BODY` / request window), but a host
+> implementation should also defend against hostile response bodies.
+
 ## Integration checklist
 
 1. `Engine::new(host, config)` — one per app

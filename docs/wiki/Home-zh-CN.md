@@ -5,13 +5,18 @@
 
 ## 页面
 
-- **[快速开始](Getting-Started)** — 引入 crate、解析链接、跑引擎
-- **[实现 Host](Implementing-a-Host)** — 你唯一需要写的那层接口
-- **[支持的格式](Supported-Formats)** — 每种链接格式及其限制
-- **[架构](Architecture)** — 模块地图与数据流
+- **[快速开始](Getting-Started-zh-CN)** — 引入 crate、解析链接、跑完整引擎
+  生命周期（真实可编译代码）
+- **[Engine API](Engine-API-zh-CN)** — 每个 `Engine` 方法和 `EngineEvent`，
+  一张表讲完
+- **[实现 Host](Implementing-a-Host-zh-CN)** — 你唯一需要写的那层接口
+- **[支持的格式](Supported-Formats)** — 每种链接格式及其限制（中英双语）
+- **[架构](Architecture-zh-CN)** — 模块地图、分层、tick 流水线
+- **[FFI 绑定](FFI-Binding-zh-CN)** — 对接 Kotlin / Swift / C# / Go 的 C ABI
+- **[发布](Publishing-zh-CN)** — 发布到 crates.io
 - **[Home (English)](Home)** — English entry
 
-## 三十秒心智模型
+## 三十秒带你了解 TypeBit 模型
 
 ```
 你的应用（UI / Kotlin / Swift …）

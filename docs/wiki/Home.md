@@ -5,13 +5,20 @@ core. The README tells you *what* it is; this tells you *how to drive it*.
 
 ## Pages
 
-- **[Getting Started](Getting-Started)** — add the crate, parse links, run an engine
-- **[Implementing a Host](Implementing-a-Host)** — the one interface you must write
-- **[Supported Formats](Supported-Formats)** — every link format and its caveats
-- **[Architecture](Architecture)** — module map and data flow
+- **[Getting Started](Getting-Started)** — add the crate, parse links, run a
+  full engine lifecycle (real, compilable code)
+- **[Engine API](Engine-API)** — every `Engine` method and `EngineEvent`,
+  one table
+- **[Implementing a Host](Implementing-a-Host)** — the one interface you
+  must write
+- **[Supported Formats](Supported-Formats)** — every link format and its
+  caveats
+- **[Architecture](Architecture)** — module map, layering, the tick pipeline
+- **[FFI Binding](FFI-Binding)** — the C ABI for Kotlin / Swift / C# / Go
+- **[Publishing](Publishing)** — release to crates.io
 - **[中文首页](Home-zh-CN)** — 中文入口
 
-## The 30-second mental model
+## The 30-second let you know TypeBit model
 
 ```
 your app (UI, Kotlin/Swift/...)

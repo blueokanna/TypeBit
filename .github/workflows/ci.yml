@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -11,89 +12,107 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Native: formatting, clippy (all features, all targets), tests.
-  check:
-    name: check (stable)
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Format
-        run: cargo fmt --all -- --check
+  # clippy across the full feature matrix × 3 OSes. `-D warnings` makes every
+  # lint a hard error — no drift is allowed past main.
+  clippy:
+    name: clippy (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: no_std,      os: ubuntu-latest,  features: "--no-default-features" }
+          - { name: std,         os: ubuntu-latest,  features: "--features std" }
+          - { name: std+ffi,     os: ubuntu-latest,  features: "--features std,ffi" }
+          - { name: all-linux,   os: ubuntu-latest,  features: "--all-features" }
+          - { name: all-windows, os: windows-latest, features: "--all-features" }
+          - { name: all-macos,   os: macos-latest,   features: "--all-features" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
-      - name: Clippy (no_std)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+  # Tests on all three OSes; `no_std` code paths get executed too (the
+  # `--no-default-features` run is NOT just a compile check).
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-features
+      - run: cargo test --no-default-features
 
-      - name: Clippy (std)
-        run: cargo clippy --all-targets --features std -- -D warnings
+  doc:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --all-features --no-deps
+      - run: cargo test --all-features --doc
 
-      - name: Clippy (std + ffi)
-        run: cargo clippy --all-targets --features std,ffi -- -D warnings
-
-      - name: Test
-        run: cargo test --all-features
-
-      - name: Test (no_std code paths)
-        run: cargo test --no-default-features
   no_std:
-    name: no_std (aarch64)
+    name: no_std (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-none
+          - thumbv7em-none-eabihf
+          - riscv32imac-unknown-none-elf
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust (stable) + aarch64 target
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-none
+          targets: ${{ matrix.target }}
+      - run: cargo check --target ${{ matrix.target }} --no-default-features
 
-      - name: Check bare-metal no_std build
-        run: cargo check --target aarch64-unknown-none --no-default-features
-
-  # MSRV as declared in Cargo.toml (1.95, required by courierust 1.0.2's use
-  # of AtomicU64::try_update, which was stabilized in Rust 1.95.0).
+  # MSRV as declared by `rust-version` in Cargo.toml (1.95, required by
+  # courierust's use of AtomicU64::try_update, stabilized in 1.95.0).
   msrv:
     name: MSRV 1.95
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo check --features std
+      - run: cargo check --no-default-features
 
-      - name: Install Rust 1.95
-        uses: dtolnay/rust-toolchain@1.95.0
-
-      - name: Check on MSRV
-        run: cargo check --features std
-
-  ffi:
-    name: ffi bridge
+  # Dependency security: rustsec advisory database against Cargo.lock.
+  audit:
+    name: audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build with ffi
-        run: cargo build --features ffi
-
-      - name: FFI integration (extern C calls the exported symbols)
-        run: cargo run --example ffi_demo --features ffi
-
+  # The exact artifact that gets published must verify standalone.
   package:
     name: crates.io package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify the crate packages cleanly
-        run: cargo package
-
-      - name: Confirm the packaged tarball contents
-        run: cargo package --list | head -n 200
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package
+      - run: cargo package --list

@@ -5,9 +5,9 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "ffi"), deny(unsafe_code))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
-#![allow(clippy::needless_range_loop)]
 
 #[macro_use]
 extern crate alloc;
@@ -47,8 +47,10 @@ pub mod wire;
 // OS-backed host (feature "std") and C ABI bridge (feature "ffi") are
 // compiled into the same crate so the whole engine ships as one package.
 #[cfg(feature = "ffi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub mod ffi;
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod host_std;
 
 pub use engine::{Engine, EngineConfig, EngineEvent};

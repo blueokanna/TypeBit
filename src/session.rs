@@ -177,8 +177,8 @@ pub struct SessionConfig {
     /// Extra tracker URLs merged into every session (e.g. refreshed from
     /// [`crate::consts::TRACKERS_LIST_URL`]).
     pub trackers: Vec<String>,
-    /// Fall back to the built-in [`crate::consts::DEFAULT_TRACKERS`] when a
-    /// torrent carries no announce URLs.
+    /// Fall back to the built-in [`crate::trackerlist::DEFAULT_TRACKERS`]
+    /// when a torrent carries no announce URLs.
     pub use_default_trackers: bool,
     /// Per-task upload limit in bytes/second (0 = unlimited).
     pub upload_limit_bps: u64,
@@ -4701,12 +4701,10 @@ mod tests {
             "hold zeroes every piece priority"
         );
 
-        // The picker must refuse to pick anything while held (a `have_all`
-        // peer is the most permissive case).
         let peer = Bitfield::new(3);
         let picked = Picker::pick_piece(
             &s.pieces,
-            &s.scheduler.utilities(),
+            s.scheduler.utilities(),
             &s.availability,
             &peer,
             true,
@@ -4715,7 +4713,6 @@ mod tests {
         );
         assert_eq!(picked, None, "no piece may be requested while held");
 
-        // Commit: keep file 0, skip file 1 -> only piece 0 selected.
         s.set_file_priorities(&[FilePriority::Normal, FilePriority::Skip])
             .expect("commit priorities");
         assert!(!s.holding_data(), "commit releases the hold");
@@ -4724,7 +4721,6 @@ mod tests {
         assert_eq!(s.piece_priorities[1], 0);
         assert_eq!(s.piece_priorities[2], 0);
 
-        // Commit again: skip file 0, keep file 1 -> pieces 1-2 selected.
         s.set_file_priorities(&[FilePriority::Skip, FilePriority::Normal])
             .expect("commit priorities");
         assert_eq!(
