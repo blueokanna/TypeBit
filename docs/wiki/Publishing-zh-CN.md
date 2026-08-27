@@ -58,6 +58,25 @@ cargo package          # 构建并验证最终产物
 （`#![warn(missing_docs)]`）；CI 的 `doc` job 会在任何 intra-doc 链接失效时
 让构建失败。
 
+## 保持 GitHub Wiki 同步
+
+Wiki 页面在仓库内的 `docs/wiki/` 下（随 crate 一起发布）。GitHub Wiki
+是**独立的 git 仓库**（`<owner>/<repo>.wiki.git`），必须显式推送才会更新
+——**推主仓库不会更新它**。
+
+两种同步方式：
+
+1. **CI（自动）**——`.github/workflows/wiki-sync.yml` 在每次改动
+   `docs/wiki/**` 时把 `docs/wiki/` 镜像到 wiki。需要一个 Personal Access
+   Token（classic，`repo` 权限）存为仓库 secret `WIKI_TOKEN`（内置的
+   `GITHUB_TOKEN` 无法推送 wiki）。
+2. **本地脚本（手动）**——`scripts/sync-wiki.ps1` 或
+   `scripts/sync-wiki.sh`（需要已登录的 `gh` CLI）。
+
+```sh
+./scripts/sync-wiki.sh
+```
+
 ## 版本策略
 
 Semver。1.0 之前：`0.x.y`——破坏性变更升 `x`，功能/修复升 `y`。FFI 在

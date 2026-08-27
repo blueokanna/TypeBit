@@ -58,6 +58,26 @@ feature-gated modules all render (with `doc(cfg)` badges). Every public item
 has `///` docs (`#![warn(missing_docs)]`); the CI `doc` job fails the build
 if any intra-doc link breaks.
 
+## Keeping the GitHub Wiki in sync
+
+The wiki pages live in-repo under `docs/wiki/` (they ship with the crate).
+The GitHub Wiki is a **separate git repository** (`<owner>/<repo>.wiki.git`),
+so the pages must be pushed to it explicitly — they are NOT updated by
+pushing to the main repo.
+
+Two ways to sync:
+
+1. **CI (automatic)** — `.github/workflows/wiki-sync.yml` mirrors
+   `docs/wiki/` to the wiki on every change to `docs/wiki/**`. It requires a
+   Personal Access Token (classic, `repo` scope) stored as the `WIKI_TOKEN`
+   repository secret (the built-in `GITHUB_TOKEN` cannot push to the wiki).
+2. **Local script (manual)** — `scripts/sync-wiki.ps1` or
+   `scripts/sync-wiki.sh` (needs the `gh` CLI, authenticated).
+
+```sh
+./scripts/sync-wiki.sh
+```
+
 ## Versioning policy
 
 Semver. Pre-1.0: `0.x.y` — a breaking change bumps `x`, features/fixes bump
