@@ -445,7 +445,10 @@ impl<H: Host> Engine<H> {
         if !self.dht_seeds.is_empty() {
             dht.bootstrap(&self.dht_seeds, now);
             self.dht_no_seed_emitted = false;
-        } else if !self.dht_no_seed_emitted {
+        } else if !self.dht_no_seed_emitted
+            && self.dht_resolve_kicked_at != 0
+            && now.saturating_sub(self.dht_resolve_kicked_at) > 10_000
+        {
             self.dht_no_seed_emitted = true;
             self.host.log(
                 LogLevel::Warn,
@@ -509,7 +512,6 @@ impl<H: Host> Engine<H> {
         } else {
             return Err(Error::NotFound);
         }
-        // release connections
         let conns: Vec<ConnId> = self
             .conn_owner
             .iter()
