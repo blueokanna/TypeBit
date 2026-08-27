@@ -264,7 +264,6 @@ impl<H: Host> Engine<H> {
             events: Vec::new(),
             udp_open: false,
             udp_failed: false,
-            // 0 → the very first tick bootstraps the DHT (fast startup).
             last_bootstrap_at: 0,
             dht_seeds: Vec::new(),
             dht_seed_pending: Vec::new(),
@@ -707,8 +706,6 @@ impl<H: Host> Engine<H> {
 
     /// Feed a completed inbound TCP connection.
     pub fn on_inbound_connection(&mut self, conn: ConnId, addr: NetAddr) {
-        // Proxy mode is outbound-only: an inbound connection would reveal
-        // our real IP, so it is dropped immediately.
         if self.cfg.proxy.is_some() {
             self.host.tcp_close(conn);
             return;
@@ -767,8 +764,6 @@ impl<H: Host> Engine<H> {
     }
 
     fn ensure_udp(&mut self, now: u64) -> Result<()> {
-        // Proxy mode is outbound-only: never open a UDP socket (DHT and UDP
-        // trackers are disabled, so a socket would only leak our real IP).
         if self.cfg.proxy.is_some() {
             return Ok(());
         }
@@ -903,9 +898,6 @@ impl<H: Host> Engine<H> {
         }
         self.drive_tcp(now);
         self.drive_udp(now);
-        // uTP transport (BEP-29): retransmits, delayed ACKs, LEDBAT window
-        // updates, timeouts, and inbound SYN acceptance. It shares the UDP
-        // socket with DHT/LSD; packets are demultiplexed in `drive_udp`.
         if self.udp_open {
             let now_us = now.saturating_mul(1000);
             self.utp.tick(&mut self.host, now_us);
@@ -966,10 +958,6 @@ impl<H: Host> Engine<H> {
             }
         }
         self.collect_dht_seeds(now);
-        // Re-bootstrap while the REAL node count is below the threshold.
-        // Bootstrap ZERO placeholders must never satisfy this guard — a
-        // table full of unanswered pings to dead seeds would otherwise look
-        // healthy and the DHT would stay dormant (the ~12-node plateau).
         let needs_bootstrap = self
             .dht
             .as_ref()
@@ -1053,10 +1041,6 @@ impl<H: Host> Engine<H> {
             }
         }
         if now.saturating_sub(self.last_cache_flush) >= 1_000 {
-            // Bounded drain: flush at most CACHE_FLUSH_BUDGET_BYTES per
-            // second so a slow disk can never freeze the engine loop.
-            // (`flush_bounded` exists since 0.1.3; a plain `flush` would
-            // write the whole cache in one blocking call.)
             let _ = self
                 .cache
                 .flush_bounded(&mut self.host, CACHE_FLUSH_BUDGET_BYTES);
@@ -1079,7 +1063,6 @@ impl<H: Host> Engine<H> {
             .unwrap_or_default();
         let proxy = self.cfg.proxy.clone();
         for (addr, source) in queued {
-            // connection flood bounds (global + per-IP)
             let total = self.conn_owner.len() + self.connecting.len() + self.inbound.len();
             if total >= self.cfg.global_max_connections {
                 continue;
@@ -1087,10 +1070,6 @@ impl<H: Host> Engine<H> {
             if self.ip_count(&addr) >= self.cfg.max_connections_per_ip {
                 continue;
             }
-            // Prefer uTP (BEP-29) when the UDP socket is up: modern peers
-            // almost always listen on uTP, and LEDBAT keeps our traffic
-            // background-friendly. TCP is the fallback when the uTP
-            // handshake times out (see `cleanup_utp_conn`).
             if !self.cfg.proxy.is_some() && self.udp_open {
                 let conn = self.utp.connect(addr, now.saturating_mul(1000));
                 self.conn_owner.insert(conn, hash);
@@ -1111,8 +1090,6 @@ impl<H: Host> Engine<H> {
                 }
                 continue;
             }
-            // In proxy mode we dial the proxy; the real peer endpoint is
-            // remembered for the SOCKS CONNECT and the session bookkeeping.
             let dial = match &proxy {
                 Some(p) => p.socks5,
                 None => addr,
@@ -1176,10 +1153,7 @@ impl<H: Host> Engine<H> {
             if let Some(s) = self.sessions.get_mut(&h) {
                 for id in &owns {
                     if let Some((_, res)) = jobs.iter().find(|(j, _)| j == id) {
-                        // tracker announce result
                         s.on_http_job_done(*id, res.clone(), &mut ctx);
-                        // web-seed range result (no-op when the session does
-                        // not own this job as a webseed fetch)
                         s.on_range_job_done(*id, res.clone(), &mut ctx);
                     }
                 }
@@ -1189,15 +1163,12 @@ impl<H: Host> Engine<H> {
 
     /// Drive TCP reads/writes/connects for all connections.
     fn drive_tcp(&mut self, now: u64) {
-        // outbound connects (directly, or to the SOCKS proxy first)
         let mut still_connecting = Vec::new();
         for conn in core::mem::take(&mut self.connecting) {
             let hash = match self.conn_owner.get(&conn) {
                 Some(h) => *h,
                 None => continue,
             };
-            // uTP handshakes are driven by the transport manager; here we
-            // only observe completion and enforce the connect deadline.
             if crate::utp::is_utp_handle(conn) {
                 if self.utp.is_connected(conn) {
                     self.connect_deadline.remove(&conn);
@@ -1230,8 +1201,6 @@ impl<H: Host> Engine<H> {
             }
             match self.host.tcp_connect_done(conn) {
                 Err(Error::WouldBlock) => {
-                    // enforce the connect deadline: a dead proxy or a host
-                    // stuck mid-connect must not hold the slot forever.
                     let deadline = self
                         .connect_deadline
                         .get(&conn)
@@ -1262,7 +1231,6 @@ impl<H: Host> Engine<H> {
                     }
                 }
                 Err(_) => {
-                    // TCP connect to the proxy (or target) failed
                     self.connect_deadline.remove(&conn);
                     self.socks.remove(&conn);
                     self.socks_target.remove(&conn);
@@ -1284,11 +1252,7 @@ impl<H: Host> Engine<H> {
                     }
                 }
                 Ok(()) => {
-                    // TCP established; the connect deadline no longer applies.
                     self.connect_deadline.remove(&conn);
-                    // If we are proxied this socket is the proxy; run the
-                    // SOCKS5 handshake before the peer's BitTorrent handshake
-                    // is allowed through.
                     if let Some(target) = self.socks_target.get(&conn).cloned() {
                         let proxy = match &self.cfg.proxy {
                             Some(p) => p.clone(),
@@ -1317,24 +1281,17 @@ impl<H: Host> Engine<H> {
             }
         }
         self.connecting = still_connecting;
-        // drive any active SOCKS handshakes
         self.pump_socks(now);
 
-        // reads/writes for owned connections
         let conns: Vec<ConnId> = self.conn_owner.keys().copied().collect();
         for conn in conns {
             let hash = match self.conn_owner.get(&conn) {
                 Some(h) => *h,
                 None => continue,
             };
-            // connections still in their SOCKS handshake are driven by
-            // pump_socks; feeding them BitTorrent frames would corrupt the
-            // proxy protocol exchange.
             if self.socks.contains_key(&conn) {
                 continue;
             }
-            // inbound handshake buffer flushing for inbound conns handled
-            // separately below; for session-owned conns:
             self.pump_connection(conn, hash, now);
         }
 
@@ -1441,9 +1398,6 @@ impl<H: Host> Engine<H> {
         loop {
             match self.stream_recv(conn, &mut recv_buf) {
                 Ok(0) => {
-                    // Orderly EOF: the peer closed the connection. Release
-                    // the slot (and any in-flight block bookkeeping) instead
-                    // of pinning a dead peer forever.
                     let mut ctx = SessionCtx {
                         host: &mut self.host,
                         cache: &mut self.cache,
@@ -1493,7 +1447,6 @@ impl<H: Host> Engine<H> {
                 }
             }
         }
-        // flush outgoing (through the upload rate budgets)
         let out_len = {
             let s = match self.sessions.get(&hash) {
                 Some(s) => s,
@@ -1502,8 +1455,6 @@ impl<H: Host> Engine<H> {
             s.peers.get(&conn).map(|p| p.out.len()).unwrap_or(0)
         };
         if out_len > 0 {
-            // drain in chunks, bounded by the global slice for this session
-            // and the session's own upload bucket
             loop {
                 let allowance = {
                     let s = match self.sessions.get_mut(&hash) {
@@ -1537,14 +1488,11 @@ impl<H: Host> Engine<H> {
                 let want = core::cmp::min(chunk.len(), allowance as usize);
                 match self.stream_send(conn, &chunk[..want]) {
                     Ok(n) => {
-                        // account the sent bytes against the rate budgets
                         if let Some(s) = self.sessions.get_mut(&hash) {
                             s.tick_up_allowance = s.tick_up_allowance.saturating_sub(n as u64);
                             s.upload_limit.consume(n as u64, now);
                         }
                         self.global_up.consume(n as u64, now);
-                        // re-queue whatever was not accepted (partial send or
-                        // allowance-limited)
                         if n < chunk.len() {
                             let rest = chunk[n..].to_vec();
                             if let Some(s) = self.sessions.get_mut(&hash) {
@@ -1558,7 +1506,6 @@ impl<H: Host> Engine<H> {
                         }
                     }
                     Err(Error::WouldBlock) => {
-                        // re-queue the whole chunk
                         let rest = chunk[..want].to_vec();
                         if let Some(s) = self.sessions.get_mut(&hash) {
                             if let Some(p) = s.peers.get_mut(&conn) {
@@ -1570,9 +1517,6 @@ impl<H: Host> Engine<H> {
                         break;
                     }
                     Err(Error::NotFound) => {
-                        // Socket still Connecting: nothing can be sent yet.
-                        // Re-queue and wait for the connect to complete —
-                        // dropping here would kill every in-flight connect.
                         if let Some(s) = self.sessions.get_mut(&hash) {
                             if let Some(p) = s.peers.get_mut(&conn) {
                                 let mut r = chunk[..want].to_vec();
@@ -1654,8 +1598,6 @@ impl<H: Host> Engine<H> {
                 .get(&hash)
                 .and_then(|s| s.peers.get(&conn))
                 .map(|p| (p.addr, p.source));
-            // TCP fallback connect happens before the session is borrowed
-            // (borrow order: host, then ctx, then the session).
             let fallback_conn = if tcp_fallback && !self.cfg.proxy.is_some() {
                 peer_info.and_then(|(addr, _)| self.host.tcp_connect(&addr).ok())
             } else {
@@ -1713,7 +1655,6 @@ impl<H: Host> Engine<H> {
                 }
             }
         }
-        // try handshake
         let (infohash, their) = {
             let p = match self.inbound.get(&conn) {
                 Some(p) => p,
@@ -1737,7 +1678,6 @@ impl<H: Host> Engine<H> {
                 }
             }
         };
-        // find a session for this infohash (accept v1 or v2)
         let session_hash = self
             .sessions
             .keys()
@@ -1758,7 +1698,6 @@ impl<H: Host> Engine<H> {
                 return;
             }
         };
-        // move pending buffers into the session
         let (addr, leftover) = {
             let p = self.inbound.remove(&conn).unwrap();
             (p.addr, p.buf[crate::wire::HANDSHAKE_LEN..].to_vec())
@@ -1775,7 +1714,6 @@ impl<H: Host> Engine<H> {
         };
         if let Some(s) = self.sessions.get_mut(&session_hash) {
             s.attach_peer(conn, addr, false, DiscoverySource::Manual, &mut ctx);
-            // feed the leftover bytes (our handshake reply is queued by attach)
             if !leftover.is_empty() {
                 s.on_data(conn, &leftover, &mut ctx);
             }
@@ -1789,10 +1727,6 @@ impl<H: Host> Engine<H> {
             return;
         }
         let mut buf = [0u8; 64 * 1024];
-        // Per-tick datagram budget: a LAN peer flooding multicast datagrams
-        // must not pin the engine in this receive loop forever. The budget
-        // is ample (256 datagrams/tick); the remainder is picked up on the
-        // next tick, so nothing is dropped by this bound.
         let mut budget = 256u32;
         loop {
             if budget == 0 {
@@ -1802,8 +1736,6 @@ impl<H: Host> Engine<H> {
             match self.host.udp_recv(&mut buf) {
                 Ok((addr, n)) => {
                     let payload = &buf[..n];
-                    // NAT-PMP replies / SSDP responses belong to the port
-                    // mapper; consumed there and never touched by DHT/tracker.
                     if let Some(pm) = self.portmap.as_mut() {
                         if pm.handle_datagram(&addr, payload, now) {
                             continue;
@@ -1814,8 +1746,6 @@ impl<H: Host> Engine<H> {
                         self.handle_lsd_datagram(addr, payload, now);
                         continue;
                     }
-                    // uTP (BEP-29) packets share the same UDP socket; they
-                    // are demultiplexed by the transport version nibble.
                     if crate::utp::is_utp_datagram(payload) {
                         self.utp.handle_datagram(
                             &mut self.host,
@@ -1825,7 +1755,6 @@ impl<H: Host> Engine<H> {
                         );
                         continue;
                     }
-                    // DHT messages are bencoded dicts ('d' prefix)
                     if payload.first() == Some(&b'd') {
                         if let Some(dht) = self.dht.as_mut() {
                             if let Ok(DatagramOutcome::Reply(reply)) =
@@ -1840,7 +1769,6 @@ impl<H: Host> Engine<H> {
                             }
                         }
                     } else {
-                        // UDP tracker responses: match by transaction id
                         if n >= 8 {
                             let _tid = u32::from_be_bytes([
                                 payload[4], payload[5], payload[6], payload[7],
@@ -1905,8 +1833,6 @@ impl<H: Host> Engine<H> {
         if self.cfg.proxy.is_some() || !self.udp_open {
             return; // outbound-only mode must not leak our presence
         }
-        // Rate check first: skip the per-tick active-hash list allocation
-        // when the scheduler is not due yet.
         if !self.lsd.due(now) {
             return;
         }
@@ -1916,7 +1842,6 @@ impl<H: Host> Engine<H> {
         };
         let port = self.cfg.listen_port;
         let cookie = self.lsd.cookie;
-        // Per-family packets: the Host header must match the group.
         let msg4 = crate::lsd::build_announce(ih, port, Some(&cookie), crate::lsd::LSD_GROUP_V4);
         let _ = self
             .host
@@ -1938,13 +1863,9 @@ impl<H: Host> Engine<H> {
         if ann.cookie == Some(self.lsd.cookie) {
             return; // our own announce looped back
         }
-        // BEP-14: `Port: 0` means the announcing peer is not accepting
-        // incoming connections — enqueuing `IP:0` would be useless.
         if ann.port == 0 {
             return;
         }
-        // The multicast group we answer on matches the sender's address
-        // family, so the reply's Host header is consistent.
         let group = match addr {
             NetAddr::V4(..) => crate::lsd::LSD_GROUP_V4,
             NetAddr::V6(..) => crate::lsd::LSD_GROUP_V6,
@@ -1953,12 +1874,10 @@ impl<H: Host> Engine<H> {
             let Some(s) = self.sessions.get_mut(&crate::metainfo::InfoHash::v1(ih)) else {
                 continue; // we don't have this torrent
             };
-            // The announcing peer listens on the port from its header.
             let peer_addr = match addr {
                 NetAddr::V4(ip, _) => NetAddr::V4(ip, ann.port),
                 NetAddr::V6(ip, _) => NetAddr::V6(ip, ann.port),
             };
-            // Reply with our presence so they can connect to us too.
             let resp = crate::lsd::build_announce(
                 &ih,
                 self.cfg.listen_port,
@@ -2082,8 +2001,6 @@ impl<H: Host> Engine<H> {
                 upload_limit_bps: s.cfg.upload_limit_bps,
                 download_limit_bps: s.cfg.download_limit_bps,
                 reputation: s.reputation.encode(),
-                // Persist the raw info dict so a magnet never needs to
-                // re-fetch metadata after a restart (qBittorrent parity).
                 info_raw: s
                     .torrent
                     .as_ref()
@@ -2092,7 +2009,7 @@ impl<H: Host> Engine<H> {
             });
         }
         if let Some(d) = &self.dht {
-            st.dht_nodes = d.export_nodes(64);
+            st.dht_nodes = d.export_nodes(160);
         }
         st
     }
