@@ -47,6 +47,11 @@ pub const LSD_INTERVAL_MIN_MS: u64 = 30_000;
 /// our multicast group as a reflector by blasting `BT-SEARCH` datagrams at
 /// us with a victim's spoofed source address.
 pub const LSD_REPLY_GAP_MS: u64 = 10_000;
+/// Maximum number of infohashes announced in one immediate burst when the
+/// active set changes (a torrent started / just completed). Bounded so a
+/// client with dozens of torrents does not flood the LAN multicast group on
+/// every state flip; steady state stays at one hash per interval.
+pub const LSD_ANNOUNCE_BURST_MAX: usize = 20;
 
 /// Upper bound on infohashes accepted from a single announce datagram.
 pub const MAX_INFOHASHES_PER_ANNOUNCE: usize = 32;

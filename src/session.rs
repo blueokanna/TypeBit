@@ -27,6 +27,7 @@ use crate::wire::{
 };
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 /// How often a session re-issues its DHT `get_peers` lookup while running.
@@ -151,6 +152,10 @@ pub struct PeerSnapshot {
     pub addr: String,
     /// Fingerprinted client tag (e.g. `qBittorrent`, `未知`).
     pub client: String,
+    /// ISO-3166 alpha-2 country code (`[0, 0]` when unknown / private), from
+    /// the embedded IP2Location LITE table — drives the flag shown before
+    /// the address in the Peers tab.
+    pub cc: [u8; 2],
     /// 0=Connecting 1=Handshake 2=Ready 3=Closed.
     pub phase: u8,
     /// Whether the peer is a seed (has every piece).
@@ -633,6 +638,13 @@ impl TorrentSession {
         let info_hash = magnet.info_hash.ok_or(Error::Magnet)?;
         let tracker_hash = tracker_hash_of(&info_hash);
         let trackers = seed_trackers(magnet.trackers.iter().map(|s| s.as_bytes().to_vec()), &cfg);
+        let mut web_seeds: Vec<String> = Vec::new();
+        for s in magnet.web_seeds.iter().chain(magnet.sources.iter()) {
+            let t = s.trim();
+            if !t.is_empty() && !web_seeds.iter().any(|w| w == t) {
+                web_seeds.push(t.to_string());
+            }
+        }
         let pieces = PieceTracker::new(0, 0);
         let scheduler = Scheduler::with_goal(
             &Torrent::empty_placeholder(),
@@ -683,7 +695,7 @@ impl TorrentSession {
             }),
             last_metadata_request_at: 0,
             metadata_hash_fails: 0,
-            web_seeds: Vec::new(),
+            web_seeds,
             webseed: WebSeedState::default(),
             monitor,
             receipt_book: ReceiptBook::new(info_hash.full()),
@@ -1388,11 +1400,6 @@ impl TorrentSession {
             .map(|p| self.peer_choke_view(p, ctx.now))
             .collect();
         let seeding = self.status == SessionStatus::Seeding;
-        // During the metadata-only phase (magnet still resolving) there is no
-        // data to protect, and some leech clients withhold ut_metadata from
-        // peers they see as permanently choked — which would stall magnet
-        // resolution. The hard anti-leech block only kicks in once the
-        // torrent is installed and pieces actually exist to serve.
         let mut leech_cfg = self.cfg.leech.clone();
         if self.torrent.is_none() {
             leech_cfg.block_leech_clients = false;
@@ -1478,6 +1485,7 @@ impl TorrentSession {
         };
         PeerChokeView {
             id: p.id,
+            source: p.source,
             client: p.rep.client,
             given: p.down_total,
             taken: p.up_total,
@@ -2155,12 +2163,7 @@ impl TorrentSession {
                         }
                         if let Some(m) = self.metadata.as_mut() {
                             m.outstanding += 1;
-                            // Mark piece 0 requested so the disconnect and
-                            // timeout sweeps can release this ask again — the
-                            // old code only bumped `outstanding`, so a peer
-                            // that never answered left the count permanently
-                            // inflated and the magnet could stall forever.
-                            if m.requested.len() == 0 {
+                            if m.requested.is_empty() {
                                 m.requested = Bitfield::new(1);
                             }
                             m.requested.set(0);
@@ -2426,12 +2429,10 @@ impl TorrentSession {
             m.size.div_ceil(16 * 1024)
         };
         let mut released = 0u32;
-        for piece in 0..m.requested.len() as u32 {
-            if m.requested.get(piece) && !m.pieces.contains_key(&piece) {
-                if np == 0 || piece < np {
-                    m.requested.clear(piece);
-                    released += 1;
-                }
+        for piece in 0..m.requested.len() {
+            if m.requested.get(piece) && !m.pieces.contains_key(&piece) && (np == 0 || piece < np) {
+                m.requested.clear(piece);
+                released += 1;
             }
         }
         m.outstanding = m.outstanding.saturating_sub(released);
@@ -2450,12 +2451,10 @@ impl TorrentSession {
             m.size.div_ceil(16 * 1024)
         };
         let mut released = 0u32;
-        for piece in 0..m.requested.len() as u32 {
-            if m.requested.get(piece) && !m.pieces.contains_key(&piece) {
-                if np == 0 || piece < np {
-                    m.requested.clear(piece);
-                    released += 1;
-                }
+        for piece in 0..m.requested.len() {
+            if m.requested.get(piece) && !m.pieces.contains_key(&piece) && (np == 0 || piece < np) {
+                m.requested.clear(piece);
+                released += 1;
             }
         }
         m.outstanding = m.outstanding.saturating_sub(released);
@@ -3956,6 +3955,7 @@ mod tests {
     use super::*;
     use crate::metainfo::{FileEntry, Torrent, TorrentKind};
     use crate::platform::DiskId;
+    use alloc::string::ToString;
 
     /// A 2-file v1 torrent: piece 0 lives in file 0, pieces 1–2 in file 1.
     fn test_torrent() -> Torrent {
@@ -4175,9 +4175,6 @@ mod tests {
         // one segment: handshake + unchoke + have_all
         let seg = remote_handshake_plus_first_messages([1u8; 20], true);
         s.on_data(1, &seg, &mut ctx);
-        // The peer MUST survive the handshake and process the trailing
-        // messages — a seed that unchokes us in the same segment as its
-        // handshake is the normal case, not a protocol violation.
         let p = s.peers.get(&1).expect("peer was dropped after handshake");
         assert_eq!(p.phase, PeerPhase::Ready);
         assert!(!p.peer_choking, "unchoke was not processed");
@@ -4207,16 +4204,10 @@ mod tests {
             DiscoverySource::Tracker,
             &mut ctx,
         );
-        // handshake + have_all only (the seed has NOT unchoked us yet).
-        // Note: unchoke and have_all both encode to 5 bytes, so drop the
-        // unchoke by its position right after the 68-byte handshake.
         let mut seg = remote_handshake_plus_first_messages([1u8; 20], true);
         seg.drain(crate::wire::HANDSHAKE_LEN..crate::wire::HANDSHAKE_LEN + 5);
         s.on_data(1, &seg, &mut ctx);
         let p = s.peers.get(&1).expect("peer was dropped after handshake");
-        // We lack every piece and it has everything → we MUST be interested,
-        // even while choked. Otherwise seeds that only unchoke interested
-        // peers never let us download (the classic 0% deadlock).
         assert!(p.am_interested, "no Interested sent to a choking seed");
         assert!(p.peer_choking);
         assert!(p
@@ -4281,11 +4272,7 @@ mod tests {
             dht: None,
             events: &mut events,
         };
-        // Start the session: opens the target file(s) and begins announces
-        // (the NoopHost's http_get fails, which the session tolerates).
         s.start(&mut ctx).expect("start");
-        // The seed connects and sends handshake + unchoke + have_all in one
-        // TCP segment (the common fast-extension seed case).
         s.attach_peer(
             1,
             NetAddr::V4([203, 0, 113, 9], 6881),
@@ -4301,8 +4288,6 @@ mod tests {
             assert!(!p.peer_choking, "seed unchoke not processed");
             assert!(p.am_interested, "not interested in a have_all seed");
         }
-        // Grant the per-tick budget (the engine does this in `tick`) and
-        // pump the request pipeline.
         s.tick_down_remaining = u64::MAX;
         s.tick_up_allowance = u64::MAX;
         s.fill_pipeline(1, &mut ctx);
@@ -4349,10 +4334,6 @@ mod tests {
 
     #[test]
     fn udp_tracker_resolves_hostname_and_retransmits_after_timeout() {
-        // A torrent whose only tracker is a *hostname* UDP tracker — the
-        // common shape of public UDP trackers. Without resolution it would
-        // silently never announce; without the timeout reset a single lost
-        // connect request would stall it forever.
         let mut t = test_torrent();
         t.announce_list = vec![vec![b"udp://tracker.example.com:1337/announce".to_vec()]];
         let cfg = SessionConfig {
@@ -4363,8 +4344,6 @@ mod tests {
         let mut host = UdpTrackerHost { sent: Vec::new() };
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
         let mut events = Vec::new();
-        // First announce: hostname is resolved through the host → the
-        // connect request goes to the resolved address.
         {
             let mut ctx = SessionCtx {
                 host: &mut host,
@@ -4379,9 +4358,6 @@ mod tests {
         }
         assert_eq!(host.sent.len(), 1, "one connect request on first announce");
         assert_eq!(host.sent[0], NetAddr::V4([192, 0, 2, 10], 1337));
-        // Tracker never answers. 16 s later we re-announce: the pending
-        // request timed out and a fresh connect request is sent (cached
-        // address reused — no second DNS lookup).
         {
             let mut ctx = SessionCtx {
                 host: &mut host,
@@ -4400,9 +4376,6 @@ mod tests {
 
     #[test]
     fn udp_tracker_dns_returns_all_records() {
-        // A hostname with multiple DNS records must yield every record, so
-        // the announce loop can fall back record-by-record instead of
-        // pinning to the first one.
         let urls = parse_udp_tracker_addr(
             b"udp://multi.tracker.example:1337/announce",
             &mut |_h, p| {
@@ -4474,32 +4447,25 @@ mod tests {
     fn webseed_block_resolves_url_and_file_relative_range() {
         let s = session();
         let t = test_torrent();
-        // piece 0 → file "dir/a.bin", range relative to the file start (0).
         let (url, start, end, len) = s.webseed_block(&t, 0, 0).unwrap();
         assert_eq!(url, "http://seed.example/base/dir/a.bin");
         assert_eq!(start, 0);
         assert_eq!(end, (BLOCK_LEN - 1) as u64);
         assert_eq!(len, BLOCK_LEN as u64);
-        // piece 2 (last partial, 100 B) → file "b.bin", range must be
-        // relative to THAT file, i.e. 256 KiB, NOT the absolute torrent
-        // offset 512 KiB.
         let (url, start, end, len) = s.webseed_block(&t, 2, 0).unwrap();
         assert_eq!(url, "http://seed.example/base/b.bin");
         assert_eq!(start, 256 * 1024u64);
         assert_eq!(end, 256 * 1024u64 + 99);
         assert_eq!(len, 100);
-        // a block past the piece end is refused
         assert!(s.webseed_block(&t, 2, 1).is_none());
     }
 
     #[test]
     fn webseed_skips_cross_file_pieces() {
-        // a piece straddling two files cannot be fetched from one resource
         let mut t = test_torrent();
         t.files[0].length = BLOCK_LEN as u64 + 100; // piece 0 now spans files
         t.total_size = t.files[0].length + t.files[1].length; // keep consistent
         let s = session();
-        // piece 0 is rejected (spans files); piece 1 is whole in file 1
         assert_eq!(s.pick_webseed_piece(&t), Some((1, 16584)));
     }
 
@@ -5157,6 +5123,54 @@ mod tests {
     }
 
     // ---------- magnet metadata robustness ----------
+
+    #[test]
+    fn magnet_web_sources_become_web_seeds() {
+        // A magnet's `ws=` (web-seed bases) and `as=` (exact sources) are
+        // HTTP/FTP mirrors: they must become web seeds so the session
+        // downloads from them in parallel with the swarm (multi-mirror).
+        let magnet = crate::magnet::Magnet::parse(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+             &ws=https%3A%2F%2Fmirror.example%2Fbase%2F\
+             &as=https%3A%2F%2Fdirect.example%2Ffile.iso\
+             &ws=http%3A%2F%2Fftp.example%2Fmirror",
+        )
+        .expect("magnet");
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            use_default_trackers: false,
+            ..Default::default()
+        };
+        let s = TorrentSession::from_magnet(&magnet, cfg, 1_000_000).expect("session");
+        assert_eq!(s.web_seeds.len(), 3, "ws + as URLs become web seeds");
+        assert!(s
+            .web_seeds
+            .contains(&"https://mirror.example/base/".to_string()));
+        assert!(s
+            .web_seeds
+            .contains(&"https://direct.example/file.iso".to_string()));
+        assert!(s
+            .web_seeds
+            .contains(&"http://ftp.example/mirror".to_string()));
+    }
+
+    #[test]
+    fn magnet_web_sources_dedupe() {
+        // Duplicate mirrors (identical ws values) collapse to one.
+        let magnet = crate::magnet::Magnet::parse(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+             &ws=https%3A%2F%2Fmirror.example%2Fbase%2F\
+             &as=https%3A%2F%2Fmirror.example%2Fbase%2F",
+        )
+        .expect("magnet");
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            use_default_trackers: false,
+            ..Default::default()
+        };
+        let s = TorrentSession::from_magnet(&magnet, cfg, 1_000_000).expect("session");
+        assert_eq!(s.web_seeds.len(), 1, "identical mirrors are deduped");
+    }
 
     #[test]
     fn metadata_requests_release_on_disconnect_and_timeout() {

@@ -91,6 +91,11 @@ impl NetAddr {
         }
     }
     /// Human-readable form into a caller buffer (allocator-free).
+    ///
+    /// IPv4 renders `a.b.c.d:port`, IPv6 renders `[a:b:c:...]:port`
+    /// (RFC 5952 brackets + the conventional `ip:port` separator). The old
+    /// code concatenated the port directly onto the address
+    /// (`128.241.252.3449779`) which made peer rows and ban logs unreadable.
     pub fn write_to(&self, buf: &mut [u8]) -> Result<usize> {
         let mut w = 0usize;
         match *self {
@@ -103,10 +108,14 @@ impl NetAddr {
                     let n = write_u32(buf.get_mut(w..).ok_or(Error::TooLarge)?, *o as u32);
                     w += n;
                 }
+                buf[w] = b':';
+                w += 1;
                 let n = write_u16(buf.get_mut(w..).ok_or(Error::TooLarge)?, port);
                 w += n;
             }
             NetAddr::V6(ip, port) => {
+                buf[w] = b'[';
+                w += 1;
                 for (i, g) in ip.chunks(2).enumerate() {
                     if i > 0 {
                         buf[w] = b':';
@@ -116,6 +125,10 @@ impl NetAddr {
                     let n = write_u16_hex(buf.get_mut(w..).ok_or(Error::TooLarge)?, v);
                     w += n;
                 }
+                buf[w] = b']';
+                w += 1;
+                buf[w] = b':';
+                w += 1;
                 let n = write_u16(buf.get_mut(w..).ok_or(Error::TooLarge)?, port);
                 w += n;
             }

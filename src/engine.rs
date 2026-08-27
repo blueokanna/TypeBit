@@ -186,6 +186,11 @@ pub struct Engine<H: Host> {
     /// per [`crate::lsd::LSD_REPLY_GAP_MS`], so a spoofed-source flood
     /// cannot turn us into a multicast reflector.
     lsd_last_reply: BTreeMap<crate::platform::NetAddr, u64>,
+    /// The last active-torrent set we announced. When it changes (a torrent
+    /// started or just completed), all active hashes are announced
+    /// immediately (bounded burst) so LAN neighbours find the new seed
+    /// within seconds instead of waiting for the round-robin.
+    lsd_last_active: Vec<[u8; 20]>,
     /// Last time a spontaneous `find_node` (bucket refresh) was started.
     last_dht_find_node: u64,
     /// Counter for deriving refresh targets (cheap deterministic random).
@@ -299,6 +304,7 @@ impl<H: Host> Engine<H> {
             last_pm_phase: PortMapPhase::Idle,
             lsd: crate::lsd::LsdScheduler::new(lsd_cookie, now, lsd_interval),
             lsd_last_reply: BTreeMap::new(),
+            lsd_last_active: Vec::new(),
             last_dht_find_node: now,
             dht_refresh_serial: 0,
             verify_pool,
@@ -380,22 +386,10 @@ impl<H: Host> Engine<H> {
         };
         let s = self.sessions.get_mut(hash).ok_or(Error::NotFound)?;
         s.start(&mut ctx)?;
-        if !self.cfg.proxy.is_some() && self.udp_open {
-            let b = s.info_hash.as_bytes();
-            if b.len() == 20 {
-                let mut ih20 = [0u8; 20];
-                ih20.copy_from_slice(b);
-                let msg = crate::lsd::build_announce(
-                    &ih20,
-                    self.cfg.listen_port,
-                    Some(&self.lsd.cookie),
-                    crate::lsd::LSD_GROUP_V4,
-                );
-                let _ = self
-                    .host
-                    .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg);
-            }
-        }
+        // LSD presence is announced by `announce_lsd` on the next tick: the
+        // active-set-change burst fires immediately when this torrent enters
+        // the active set, so no eager send here (it would duplicate the v4
+        // half of the burst).
         if self
             .dht
             .as_ref()
@@ -1914,19 +1908,44 @@ impl<H: Host> Engine<H> {
         out
     }
 
-    /// Announce one active torrent to the LAN (BEP-14), rate-limited by the
-    /// scheduler to one announce per minute, round-robin across torrents.
+    /// Announce to the LAN (BEP-14).
+    ///
+    /// **State-change burst**: when the active-torrent set changes (a
+    /// torrent started, resumed or just completed), every active hash is
+    /// announced immediately (bounded) — so a seed that just finished on
+    /// this device is discoverable by LAN neighbours (qBittorrent, this
+    /// app, …) within seconds instead of waiting for the round-robin.
+    /// **Steady state**: the scheduler allows one announce per interval,
+    /// round-robin across torrents (BEP-14's once-per-minute rule).
     fn announce_lsd(&mut self, now: u64) {
         if !self.cfg.lsd_enabled || self.cfg.proxy.is_some() || !self.udp_open {
             return; // disabled, or outbound-only mode must not leak presence
         }
+        let active = self.lsd_active_hashes();
+        if active.is_empty() {
+            self.lsd_last_active.clear();
+            return;
+        }
+        if self.lsd_last_active != active {
+            self.lsd_last_active = active.clone();
+            self.lsd.last_announce_at = now; // hold the round-robin back
+            for ih in active.iter().take(crate::lsd::LSD_ANNOUNCE_BURST_MAX) {
+                self.send_lsd_announce(ih);
+            }
+            return;
+        }
+        // Steady state: one hash per interval.
         if !self.lsd.due(now) {
             return;
         }
-        let active = self.lsd_active_hashes();
         let Some(ih) = self.lsd.next_announce(&active, now) else {
             return;
         };
+        self.send_lsd_announce(ih);
+    }
+
+    /// Build and multicast one LSD announce (v4 + v6 groups).
+    fn send_lsd_announce(&mut self, ih: &[u8; 20]) {
         let port = self.cfg.listen_port;
         let cookie = self.lsd.cookie;
         let msg4 = crate::lsd::build_announce(ih, port, Some(&cookie), crate::lsd::LSD_GROUP_V4);
@@ -2029,6 +2048,10 @@ impl<H: Host> Engine<H> {
                         .as_ref()
                         .map(|c| c.code_str())
                         .unwrap_or_else(|| String::from("未知")),
+                    cc: match p.addr {
+                        crate::platform::NetAddr::V4(ip, _) => crate::geo::ipv4_country(ip),
+                        crate::platform::NetAddr::V6(..) => [0, 0],
+                    },
                     phase: match p.phase {
                         crate::swarm::PeerPhase::Connecting => 0,
                         crate::swarm::PeerPhase::Handshake => 1,
@@ -2493,6 +2516,139 @@ mod tests {
         assert!(
             attached,
             "LSD-discovered LAN peer (192.168.1.50:6882) must be attached to the swarm"
+        );
+    }
+
+    /// Host that counts LSD multicast announces (v4 + v6 each count once).
+    struct BurstHost {
+        sends: usize,
+    }
+
+    impl crate::platform::Host for BurstHost {
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+        fn fill_random(&mut self, b: &mut [u8]) {
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = (i as u8).wrapping_mul(7);
+            }
+        }
+        fn log(&mut self, _l: crate::platform::LogLevel, _m: &str) {}
+        fn http_get(
+            &mut self,
+            _u: &str,
+            _t: u64,
+            _o: &mut alloc::vec::Vec<u8>,
+        ) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn resolve_host(&self, _host: &str, _port: u16) -> Option<NetAddr> {
+            None
+        }
+        fn tcp_connect(&mut self, _a: &NetAddr) -> crate::error::Result<ConnId> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_connect_done(&mut self, _id: ConnId) -> crate::error::Result<()> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_send(&mut self, _id: ConnId, _d: &[u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::NotSupported)
+        }
+        fn tcp_recv(&mut self, _id: ConnId, _b: &mut [u8]) -> crate::error::Result<usize> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn tcp_close(&mut self, _id: ConnId) {}
+        fn udp_open(&mut self, _p: u16) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_send(&mut self, _a: &NetAddr, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_multicast_send(&mut self, _a: &NetAddr, _d: &[u8]) -> crate::error::Result<()> {
+            self.sends += 1;
+            Ok(())
+        }
+        fn udp_join_multicast(&mut self, _a: NetAddr) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_recv(&mut self, _b: &mut [u8]) -> crate::error::Result<(NetAddr, usize)> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn udp_open_lsd(&mut self, _p: u16) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_join_multicast_lsd(&mut self, _a: NetAddr) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn udp_recv_lsd(&mut self, _b: &mut [u8]) -> crate::error::Result<(NetAddr, usize)> {
+            Err(crate::error::Error::WouldBlock)
+        }
+        fn disk_open(&mut self, _p: &str) -> crate::error::Result<DiskId> {
+            Ok(1)
+        }
+        fn disk_read(
+            &mut self,
+            _id: DiskId,
+            _o: u64,
+            _b: &mut [u8],
+        ) -> crate::error::Result<usize> {
+            Ok(0)
+        }
+        fn disk_write(&mut self, _id: DiskId, _o: u64, _d: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_prealloc(&mut self, _id: DiskId, _s: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_flush(&mut self, _id: DiskId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn disk_close(&mut self, _id: DiskId) {}
+    }
+
+    #[test]
+    fn lsd_burst_announces_when_active_set_changes() {
+        // A freshly-started (or just-completed) seed must be discoverable by
+        // LAN neighbours within seconds, not after the round-robin's next
+        // minute boundary. The active-set-change burst is the mechanism.
+        let host = BurstHost { sends: 0 };
+        let mut engine = Engine::new(host, EngineConfig::default());
+        let t1 = make_torrent();
+        let h1 = t1.info_hash;
+        engine.add_torrent_obj(t1, "/tmp").expect("add");
+        engine.start(&h1).expect("start");
+        engine.tick().expect("tick");
+        // startup: set changed {} -> {h1} → burst 1 hash × (v4+v6) = 2 sends
+        assert_eq!(
+            engine.host.sends, 2,
+            "startup burst must announce the one active hash on both groups"
+        );
+
+        // Steady state: an immediate second tick must NOT re-announce
+        // (round-robin is held back by the burst).
+        engine.tick().expect("tick");
+        assert_eq!(engine.host.sends, 2, "no re-announce without a set change");
+
+        // A second torrent becomes active → set changes → immediate burst of
+        // BOTH hashes (2 × 2 groups = 4 sends).
+        let mut t2 = make_torrent();
+        // give it a distinct infohash (the torrent is only used for the
+        // session hash; pieces are never fetched in this test)
+        let b = t2.info_hash.as_bytes();
+        let mut alt = [0u8; 20];
+        if b.len() >= 20 {
+            alt.copy_from_slice(&b[..20]);
+        }
+        alt[19] ^= 0xFF;
+        t2.info_hash = crate::metainfo::InfoHash::v1(alt);
+        let h2 = t2.info_hash;
+        engine.add_torrent_obj(t2, "/tmp").expect("add");
+        engine.start(&h2).expect("start");
+        engine.tick().expect("tick");
+        assert_eq!(
+            engine.host.sends,
+            2 + 4,
+            "set change must burst-announce all active hashes"
         );
     }
 

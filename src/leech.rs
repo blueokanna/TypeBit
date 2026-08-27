@@ -6,6 +6,7 @@
 //! (bans, disconnects) come only from measured misbehavior. Depends only
 //! on [`crate::platform`], so algorithms are unit-testable in isolation.
 
+use crate::monitoring::DiscoverySource;
 use crate::platform::{ConnId, NetAddr};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -125,9 +126,7 @@ pub enum BanReason {
     Protocol,
     /// Reserved for explicit free-rider bans.
     FreeRide,
-    /// Too many consecutive request timeouts (mechanism 2): the peer
-    /// accepted our requests but never delivered within the timeout window
-    /// `max_request_timeouts` times in a row.
+    /// Too many consecutive request timeouts
     Timeout,
 }
 
@@ -728,6 +727,10 @@ impl Default for LeechConfig {
 pub struct PeerChokeView {
     /// Connection id.
     pub id: ConnId,
+    /// How the peer was discovered (drives the local-network exemption from
+    /// identity-based anti-leech: LAN peers are trusted neighbours, not
+    /// internet leech clients).
+    pub source: DiscoverySource,
     /// Fingerprinted client (may be `None` pre-handshake).
     pub client: Option<ClientId>,
     /// Bytes this peer has uploaded to us (`Peer::down_total`).
@@ -761,6 +764,44 @@ fn permyriad(numer: u64, denom: u64) -> u32 {
     (numer.saturating_mul(10_000) / denom).min(u32::MAX as u64) as u32
 }
 
+/// Whether the identity-based **hard block** applies to a peer.
+///
+/// Three guards keep it from being a blunt instrument (the previous version
+/// starved every known-leech client forever, which broke LAN/LSD peers and
+/// punished newcomers before they could contribute):
+/// 1. **Local peers are exempt** — a peer found via LSD (BEP-14 LAN
+///    multicast) is a neighbour on our own network, not an internet leech
+///    client. A local client that is "leech-only by design" (只进不出) must
+///    still be served, so identity-based anti-leech never applies to it.
+/// 2. **Probation** — inside [`LeechConfig::recip_grace_ms`] a newcomer is
+///    never identity-blocked; it may prove itself.
+/// 3. **Contribution** — a peer that has actually uploaded at least
+///    [`LeechConfig::free_ride_floor_bytes`] to us is a contributor, not a
+///    leech, regardless of its client tag (BitComet-style contribution
+///    measurement beats fingerprinting).
+///
+/// Behavioral anti-leech (free-ride ratio, snub, corrupt) still applies to
+/// everyone — this only gates the identity-based hard floor.
+fn hard_blocked(cfg: &LeechConfig, v: &PeerChokeView) -> bool {
+    if !cfg.block_leech_clients {
+        return false;
+    }
+    let is_leech = v
+        .client
+        .map(|c| c.class == ClientClass::Leech)
+        .unwrap_or(false);
+    if !is_leech {
+        return false;
+    }
+    if matches!(v.source, DiscoverySource::Lsd) {
+        return false; // local/LAN peers are never identity-blocked
+    }
+    if v.age_ms < cfg.recip_grace_ms {
+        return false; // probation: give the newcomer a chance to contribute
+    }
+    v.given < cfg.free_ride_floor_bytes // still no contribution → hard block
+}
+
 /// Anti-leech choke score for one peer. Higher = more deserving of a slot.
 ///
 /// Seeding: reward peers that return data, penalize free-riders, snubs,
@@ -770,13 +811,11 @@ fn permyriad(numer: u64, denom: u64) -> u32 {
 /// Guards: a **grace period** ([`LeechConfig::recip_grace_ms`]) delays
 /// reciprocity penalties so newcomers can warm up; the reward is
 /// **clamped** ([`LeechConfig::max_reciprocity_reward`]) so lifetime bytes
-/// never shield behavioral penalties.
+/// never shield behavioral penalties. The identity hard block
+/// ([`Self::hard_blocked`]) applies only to contributing-less internet
+/// leech clients past probation — local/LSD peers are exempt.
 pub fn choke_score(cfg: &LeechConfig, seeding: bool, v: &PeerChokeView) -> i64 {
-    if cfg.block_leech_clients
-        && v.client
-            .map(|c| c.class == ClientClass::Leech)
-            .unwrap_or(false)
-    {
+    if hard_blocked(cfg, v) {
         return i64::MIN / 4;
     }
     let mut s: i64 = 0;
@@ -811,8 +850,10 @@ pub fn choke_score(cfg: &LeechConfig, seeding: bool, v: &PeerChokeView) -> i64 {
     if v.snubbed {
         s -= cfg.snub_score_penalty;
     }
+    // The soft client penalty (identity) never applies to local/LAN peers —
+    // they may legitimately be leech-only by design and must keep working.
     if let Some(c) = v.client {
-        if c.class == ClientClass::Leech {
+        if c.class == ClientClass::Leech && !matches!(v.source, DiscoverySource::Lsd) {
             s -= cfg.client_leech_penalty;
         }
     }
@@ -852,12 +893,10 @@ where
     let mut cands: Vec<Cand> = views
         .iter()
         .filter(|v| v.interested || !seeding)
-        .filter(|v| {
-            !(cfg.block_leech_clients
-                && v.client
-                    .map(|c| c.class == ClientClass::Leech)
-                    .unwrap_or(false))
-        })
+        // Identity-blocked peers are excluded from candidacy entirely
+        // (probationary / contributing / local leech clients stay in the
+        // pool and can earn a slot through contribution).
+        .filter(|v| !hard_blocked(cfg, v))
         .map(|v| Cand {
             id: v.id,
             score: choke_score(cfg, seeding, v),
@@ -973,6 +1012,7 @@ mod tests {
     fn view(id: ConnId, given: u64, taken: u64, rate_up: u32, interested: bool) -> PeerChokeView {
         PeerChokeView {
             id,
+            source: DiscoverySource::Tracker,
             client: None,
             given,
             taken,
@@ -1073,6 +1113,83 @@ mod tests {
         assert!(
             set.contains(&1),
             "with blocking off the leech client is only softly penalized"
+        );
+    }
+
+    #[test]
+    fn lsd_leech_clients_are_never_identity_blocked() {
+        // Local (LSD) peers are trusted neighbours: identity-based anti-leech
+        // must not starve them, even if they are "leech-only by design".
+        let cfg = LeechConfig::default();
+        let mut leech = view(1, 0, 0, 0, true);
+        leech.source = DiscoverySource::Lsd;
+        leech.client = Some(ClientId::new(b"XL", ClientClass::Leech));
+        assert!(
+            !hard_blocked(&cfg, &leech),
+            "an LSD peer is never identity-blocked"
+        );
+        // A single-slot swarm must still serve it.
+        let cfg1 = LeechConfig {
+            leeching_slots: 1,
+            ..Default::default()
+        };
+        let set = select_unchoke_set(&[leech], false, &cfg1, |_| false, None);
+        assert!(set.contains(&1), "LSD leech client gets a slot");
+    }
+
+    #[test]
+    fn leech_client_within_grace_is_probationary() {
+        // A brand-new internet leech client is NOT instantly starved — it
+        // gets the reciprocity grace period to prove it uploads.
+        let cfg = LeechConfig::default();
+        let mut leech = view(1, 0, 0, 0, true);
+        leech.client = Some(ClientId::new(b"XL", ClientClass::Leech));
+        leech.age_ms = 5_000; // < recip_grace_ms (45 s)
+        assert!(
+            !hard_blocked(&cfg, &leech),
+            "newcomer is on probation, not identity-blocked"
+        );
+        // The optimistic slot can serve it during probation.
+        let views = [leech];
+        let set = select_unchoke_set(&views, false, &cfg, |_| false, Some(1));
+        assert!(set.contains(&1));
+    }
+
+    #[test]
+    fn contributing_leech_client_is_not_blocked() {
+        // BitComet-style: contribution beats fingerprinting. A known-leech
+        // client that actually uploads to us is a contributor, not a leech.
+        let cfg = LeechConfig::default();
+        let mut leech = view(
+            1,
+            cfg.free_ride_floor_bytes,
+            10 * 1024 * 1024,
+            300_000,
+            true,
+        );
+        leech.client = Some(ClientId::new(b"XL", ClientClass::Leech));
+        assert!(
+            !hard_blocked(&cfg, &leech),
+            "a leech client that contributed is not identity-blocked"
+        );
+        let views = [leech];
+        let set = select_unchoke_set(&views, false, &cfg, |_| false, None);
+        assert!(set.contains(&1), "contributing leech gets a slot");
+    }
+
+    #[test]
+    fn non_contributing_internet_leech_is_still_blocked() {
+        // Past the grace period with zero contribution, an internet leech
+        // client stays hard-blocked (the "适当" anti-leech floor).
+        let cfg = LeechConfig::default();
+        let mut leech = view(1, 0, 10 * 1024 * 1024, 0, true);
+        leech.client = Some(ClientId::new(b"XL", ClientClass::Leech));
+        assert!(hard_blocked(&cfg, &leech));
+        let views = [leech];
+        let set = select_unchoke_set(&views, false, &cfg, |_| false, Some(1));
+        assert!(
+            !set.contains(&1),
+            "non-contributing internet leech is blocked"
         );
     }
 

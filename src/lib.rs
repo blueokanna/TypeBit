@@ -19,6 +19,7 @@ pub mod dht;
 pub mod disk_cache;
 pub mod engine;
 pub mod error;
+pub mod geo;
 pub mod leech;
 pub mod links;
 pub mod lsd;
