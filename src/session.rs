@@ -3414,12 +3414,7 @@ impl TorrentSession {
                 // not drain them to the end).
                 match peer.current_piece.filter(|&p| {
                     !self.pieces.is_have(p)
-                        && self
-                            .piece_priorities
-                            .get(p as usize)
-                            .copied()
-                            .unwrap_or(1)
-                            > 0
+                        && self.piece_priorities.get(p as usize).copied().unwrap_or(1) > 0
                 }) {
                     Some(p) => p,
                     None => match Picker::pick_piece(
@@ -4738,11 +4733,7 @@ mod tests {
         };
         let cfg = SessionConfig {
             save_dir: String::from("/tmp"),
-            file_priorities: vec![
-                FilePriority::Skip,
-                FilePriority::Normal,
-                FilePriority::Skip,
-            ],
+            file_priorities: vec![FilePriority::Skip, FilePriority::Normal, FilePriority::Skip],
             ..Default::default()
         };
         let mut s = TorrentSession::from_torrent(t, cfg, 1_000_000).expect("session");
@@ -4773,10 +4764,7 @@ mod tests {
             );
             match p {
                 Some(p) => {
-                    assert!(
-                        (4..8).contains(&p),
-                        "picker returned a skipped piece {p}"
-                    );
+                    assert!((4..8).contains(&p), "picker returned a skipped piece {p}");
                     picked.insert(p);
                     s.pieces.set_in_flight(p, true);
                 }
@@ -4831,11 +4819,7 @@ mod tests {
             },
             SessionConfig {
                 save_dir: String::from("/tmp"),
-                file_priorities: vec![
-                    FilePriority::Skip,
-                    FilePriority::Normal,
-                    FilePriority::Skip,
-                ],
+                file_priorities: vec![FilePriority::Skip, FilePriority::Normal, FilePriority::Skip],
                 ..Default::default()
             },
             1_000_000,
@@ -4866,10 +4850,7 @@ mod tests {
         );
         let seg = remote_handshake_plus_first_messages([9u8; 20], true);
         s2.on_data(1, &seg, &mut ctx);
-        assert!(
-            s2.peers.contains_key(&1),
-            "seed dropped during handshake"
-        );
+        assert!(s2.peers.contains_key(&1), "seed dropped during handshake");
         s2.peers.get_mut(&1).unwrap().am_interested = true;
         s2.fill_pipeline(1, &mut ctx);
         let requested: Vec<u32> = s2.requested_by.keys().map(|(p, _)| *p).collect();
