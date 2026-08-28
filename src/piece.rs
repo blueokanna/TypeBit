@@ -56,8 +56,6 @@ impl PieceBytes {
         if new_bytes == 0 {
             return 0;
         }
-        // Insert then merge overlapping/adjacent ranges (the list stays
-        // tiny in practice — at most a handful of fragments per piece).
         self.ranges.push((start, end));
         self.ranges.sort_unstable();
         let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.ranges.len());
