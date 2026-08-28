@@ -61,6 +61,40 @@ impl Challenge {
         }
     }
 
+    /// Deterministic self-issued challenge derived from a node secret.
+    ///
+    /// Used when a node attests its own download (self-issued receipt): the
+    /// id/nonce are derived with SHA-256 over
+    /// `node_secret ‖ content_root ‖ range ‖ epoch` so any party holding the
+    /// node's public key context can recompute the same challenge — no RNG
+    /// needed, reproducible, and still unpredictable to outsiders (the
+    /// secret is required to derive it).
+    pub fn derive(
+        content_root: [u8; 32],
+        range: (u64, u64),
+        issued_epoch: u64,
+        node_secret: &[u8; 32],
+    ) -> Self {
+        let mut m = Vec::with_capacity(32 + 32 + 16 + 8);
+        m.extend_from_slice(node_secret);
+        m.extend_from_slice(&content_root);
+        m.extend_from_slice(&range.0.to_be_bytes());
+        m.extend_from_slice(&range.1.to_be_bytes());
+        m.extend_from_slice(&issued_epoch.to_be_bytes());
+        let h = Sha256::digest(&m);
+        let mut id = [0u8; 16];
+        let mut nonce = [0u8; 16];
+        id.copy_from_slice(&h[..16]);
+        nonce.copy_from_slice(&h[16..32]);
+        Challenge {
+            id,
+            content_root,
+            range,
+            issued_epoch,
+            nonce,
+        }
+    }
+
     /// Commitment to the challenge (what goes into the receipt).
     pub fn digest(&self) -> [u8; 32] {
         let mut m = Vec::with_capacity(16 + 32 + 16 + 8 + 16);
@@ -303,6 +337,39 @@ impl ReceiptBook {
         Some(Sha256::digest(&m))
     }
 
+    /// Build a receipt for `range` within `[epoch_start, epoch_end]` (the
+    /// wall-clock window, in unix seconds). The challenge is self-issued
+    /// deterministically from `secret_key` (see [`Challenge::derive`]).
+    /// Returns `None` when coverage is below [`MIN_COVERAGE_PERMILLE`].
+    pub fn build_receipt_unix(
+        &self,
+        range: (u64, u64),
+        epoch_start_unix: u64,
+        epoch_end_unix: u64,
+        secret_key: &[u8; 32],
+    ) -> Option<Receipt> {
+        let total = range.1.saturating_sub(range.0);
+        let covered = self.coverage(range.0, range.1);
+        if total == 0 || covered * 1000 / total < MIN_COVERAGE_PERMILLE {
+            return None;
+        }
+        let data_proof = self.data_proof(range.0, range.1)?;
+        let challenge = Challenge::derive(self.content_root, range, epoch_start_unix, secret_key);
+        let payload = ReceiptPayload {
+            version: RECEIPT_VERSION,
+            content_root: self.content_root.to_vec(),
+            node_id: ed25519::public_key(secret_key).to_vec(),
+            range_start: range.0,
+            range_end: range.1,
+            epoch_start: epoch_start_unix as i64,
+            epoch_end: epoch_end_unix as i64,
+            bytes_received: covered,
+            challenge_digest: challenge.digest().to_vec(),
+            data_proof: data_proof.to_vec(),
+        };
+        Receipt::sign(payload, secret_key).ok()
+    }
+
     /// Build a receipt for `range` within `[epoch_start, epoch_end]`.
     /// Returns `None` if coverage is below [`MIN_COVERAGE_PERMILLE`].
     pub fn build_receipt(
@@ -313,14 +380,14 @@ impl ReceiptBook {
         challenge: &Challenge,
         secret_key: &[u8; 32],
     ) -> Option<Receipt> {
+        let epoch_start = epoch_start.to_unix_seconds().ok()?.0;
+        let epoch_end = epoch_end.to_unix_seconds().ok()?.0;
         let total = range.1 - range.0;
         let covered = self.coverage(range.0, range.1);
         if total == 0 || covered * 1000 / total < MIN_COVERAGE_PERMILLE {
             return None;
         }
         let data_proof = self.data_proof(range.0, range.1)?;
-        let epoch_start = epoch_start.to_unix_seconds().ok()?.0;
-        let epoch_end = epoch_end.to_unix_seconds().ok()?.0;
         let payload = ReceiptPayload {
             version: RECEIPT_VERSION,
             content_root: self.content_root.to_vec(),
@@ -490,6 +557,61 @@ mod tests {
             )
             .unwrap();
         assert!(r.verify_against_challenge(&challenge, &ed25519::public_key(&sk)));
+    }
+
+    #[test]
+    fn build_receipt_unix_self_issued_and_verifiable() {
+        let (sk, pk) = key_pair(7);
+        let mut book = ReceiptBook::new([7u8; 32]);
+
+        // no coverage → cannot build
+        assert!(book
+            .build_receipt_unix((0, 1000), 1_700_000_000, 1_700_000_060, &sk)
+            .is_none());
+
+        // 50% coverage → still below the 90% bar
+        book.record_range(0, 500);
+        assert!(book
+            .build_receipt_unix((0, 1000), 1_700_000_000, 1_700_000_060, &sk)
+            .is_none());
+
+        // full coverage + a real sample → builds, verifies, self-challenge binds
+        book.record_range(500, 1000);
+        book.record_sample(64, Sha256::digest(b"held-block"));
+        let r = book
+            .build_receipt_unix((0, 1000), 1_700_000_000, 1_700_000_060, &sk)
+            .unwrap();
+        assert!(r.verify());
+        assert_eq!(r.payload.node_id, pk.to_vec());
+        assert_eq!(r.payload.bytes_received, 1000);
+        // The deterministic self-challenge recomputes to the same digest.
+        let expected = Challenge::derive([7u8; 32], (0, 1000), 1_700_000_000, &sk).digest();
+        assert_eq!(r.payload.challenge_digest, expected.to_vec());
+        // A receipt built by a different node carries THAT node's identity —
+        // it can never claim pk1's identity without sk1.
+        let (sk2, pk2) = key_pair(8);
+        let r2 = book
+            .build_receipt_unix((0, 1000), 1_700_000_000, 1_700_000_060, &sk2)
+            .unwrap();
+        assert!(r2.verify());
+        assert_eq!(r2.payload.node_id, pk2.to_vec());
+        assert_ne!(r2.payload.node_id, pk.to_vec());
+        // Tampering the attested bytes breaks verification.
+        let mut tampered = r.clone();
+        tampered.payload.bytes_received = 0;
+        assert!(!tampered.verify());
+    }
+
+    #[test]
+    fn challenge_derive_is_deterministic_and_secret_bound() {
+        let sk = [42u8; 32];
+        let a = Challenge::derive([1u8; 32], (0, 1024), 1_700_000_000, &sk);
+        let b = Challenge::derive([1u8; 32], (0, 1024), 1_700_000_000, &sk);
+        assert_eq!(a.digest(), b.digest(), "same inputs → same challenge");
+        let c = Challenge::derive([2u8; 32], (0, 1024), 1_700_000_000, &sk);
+        assert_ne!(a.digest(), c.digest(), "different content root → different");
+        let d = Challenge::derive([1u8; 32], (0, 1024), 1_700_000_000, &[43u8; 32]);
+        assert_ne!(a.digest(), d.digest(), "different secret → different");
     }
 
     #[test]

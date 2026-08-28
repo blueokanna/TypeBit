@@ -1,11 +1,11 @@
 [package]
 name = "typebit"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.95"
 license-file = "LICENSE"
 authors = ["blueokanna, HyphenTeam"]
-description = "An universal download engine core: BitTorrent v1/v2 (DHT, PEX, web seeds, LSD, uTP), eD2k, Xunlei, IPFS, Kad, direct HTTP(S), with provable-download receipts and a semantic utility scheduler."
+description = "A no_std BitTorrent v1/v2 engine core (DHT, PEX, LSD, uTP, web seeds, trackers, SOCKS5) with provable-download receipts and a semantic utility scheduler; unified link parser for eD2k/Xunlei/IPFS/Kad/netdisk (parsing only)."
 homepage = "https://github.com/blueokanna/TypeBit"
 repository = "https://github.com/blueokanna/TypeBit"
 documentation = "https://docs.rs/typebit"

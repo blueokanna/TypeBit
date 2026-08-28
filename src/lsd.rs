@@ -53,6 +53,19 @@ pub const LSD_REPLY_GAP_MS: u64 = 10_000;
 /// every state flip; steady state stays at one hash per interval.
 pub const LSD_ANNOUNCE_BURST_MAX: usize = 20;
 
+/// **LAN-aware adaptive pacing.** A neighbour heard within this window (ms)
+/// proves the LAN is live — the effective announce interval drops to
+/// [`LSD_ACTIVE_INTERVAL_MS`] so a freshly-added torrent reaches the
+/// listening neighbour within seconds (mutual discovery latency is the
+/// whole point of LSD). When no neighbour has been heard for this long, the
+/// LAN is treated as quiet and the standard interval applies — we do not
+/// spam a dead network.
+pub const LSD_NEIGHBOR_WINDOW_MS: u64 = 90_000;
+/// Effective announce interval (ms) while a LAN neighbour is live. Bounded
+/// by the same hard floor reasoning as [`LSD_INTERVAL_MIN_MS`] — never a
+/// storm, just noticeably faster mutual discovery.
+pub const LSD_ACTIVE_INTERVAL_MS: u64 = 20_000;
+
 /// Upper bound on infohashes accepted from a single announce datagram.
 pub const MAX_INFOHASHES_PER_ANNOUNCE: usize = 32;
 
@@ -243,6 +256,12 @@ pub fn parse(data: &[u8]) -> Option<LsdAnnounce> {
 /// intervals, matching BEP-14's "~5 minutes per torrent"). The interval is
 /// configurable but clamped to a hard floor ([`LSD_INTERVAL_MIN_MS`]) so a
 /// config can never turn the LAN broadcast into a storm.
+///
+/// The scheduler supports **LAN-aware adaptive pacing**: when a live
+/// neighbour has been heard recently, the effective interval drops to
+/// [`LSD_ACTIVE_INTERVAL_MS`] so a freshly-added torrent reaches the
+/// listening neighbour within seconds; when the LAN is quiet, the standard
+/// interval applies and we do not spam a dead network.
 #[derive(Debug)]
 pub struct LsdScheduler {
     /// Opaque cookie used to recognise our own multicast echoes.
@@ -267,19 +286,33 @@ impl LsdScheduler {
         }
     }
 
-    /// Whether an announce is due (rate-limit elapsed). Cheap check the
-    /// engine performs *before* building the active-hash list.
+    /// Whether an announce is due at the scheduler's base interval.
     pub fn due(&self, now: u64) -> bool {
-        now.saturating_sub(self.last_announce_at) >= self.interval_ms
+        self.due_with(now, self.interval_ms)
     }
 
-    /// Pick the next infohash to announce, if enough time has passed.
-    /// Returns `None` when we must stay quiet (rate limit).
+    /// Whether an announce is due at a specific effective interval.
+    pub fn due_with(&self, now: u64, interval_ms: u64) -> bool {
+        now.saturating_sub(self.last_announce_at) >= interval_ms
+    }
+
+    /// Pick the next infohash to announce at the base interval.
     pub fn next_announce<'a>(&mut self, active: &'a [[u8; 20]], now: u64) -> Option<&'a [u8; 20]> {
+        self.next_announce_with(active, now, self.interval_ms)
+    }
+
+    /// Pick the next infohash to announce at a specific effective interval.
+    /// Returns `None` when we must stay quiet (rate limit).
+    pub fn next_announce_with<'a>(
+        &mut self,
+        active: &'a [[u8; 20]],
+        now: u64,
+        interval_ms: u64,
+    ) -> Option<&'a [u8; 20]> {
         if active.is_empty() {
             return None;
         }
-        if now.saturating_sub(self.last_announce_at) < self.interval_ms {
+        if now.saturating_sub(self.last_announce_at) < interval_ms {
             return None;
         }
         let ih = &active[self.cursor % active.len()];
@@ -394,6 +427,30 @@ mod tests {
         assert!(s.next_announce(&active_two(), 1_020_000).is_none());
         // Due after the floor.
         assert!(s.next_announce(&active_two(), 1_031_000).is_some());
+    }
+
+    #[test]
+    fn adaptive_interval_allows_faster_announce_when_neighbour_active() {
+        let cookie = [0u8; 8];
+        let mut s = LsdScheduler::new(cookie, 1_000_000, LSD_INTERVAL_MS);
+        let active = active_two();
+
+        // Base interval (60 s) not yet elapsed 30 s after the last announce
+        // (the constructor back-dated it, so the first call fires).
+        assert!(s.next_announce(&active, 1_000_000).is_some());
+
+        // 20 s later the base interval has NOT elapsed → quiet at base.
+        assert!(!s.due_with(1_020_000, LSD_INTERVAL_MS));
+        // …but a live neighbour makes the effective interval 20 s → due.
+        assert!(s.due_with(1_020_000, LSD_ACTIVE_INTERVAL_MS));
+        let ih = s.next_announce_with(&active, 1_020_000, LSD_ACTIVE_INTERVAL_MS);
+        assert_eq!(ih, Some(&[2u8; 20]));
+
+        // After announcing at the active interval, the hard floor still
+        // applies: 10 s later is not due even with a live neighbour.
+        assert!(!s.due_with(1_030_000, LSD_ACTIVE_INTERVAL_MS));
+        // 20 s after the announce → due again.
+        assert!(s.due_with(1_040_000, LSD_ACTIVE_INTERVAL_MS));
     }
 
     fn active_two() -> [[u8; 20]; 2] {

@@ -70,6 +70,10 @@ pub struct EngineConfig {
     pub connect_timeout_ms: u64,
     /// Per-torrent defaults.
     pub session: SessionConfig,
+    /// Optional node identity (Ed25519 seed, 32 bytes) for
+    /// proof-of-download receipts. `None` = mint a fresh one at
+    /// construction (and persist it via [`Engine::save_state`]).
+    pub node_secret: Option<[u8; 32]>,
 }
 
 impl Default for EngineConfig {
@@ -89,6 +93,7 @@ impl Default for EngineConfig {
             proxy: None,
             connect_timeout_ms: 30_000,
             session: SessionConfig::default(),
+            node_secret: None,
         }
     }
 }
@@ -140,6 +145,8 @@ pub struct Engine<H: Host> {
     /// Config.
     pub cfg: EngineConfig,
     peer_id: [u8; 20],
+    /// Node identity (Ed25519 seed) for proof-of-download receipts.
+    node_secret: [u8; 32],
     sessions: BTreeMap<InfoHash, TorrentSession>,
     conn_owner: BTreeMap<ConnId, InfoHash>,
     cache: DiskCache,
@@ -197,6 +204,20 @@ pub struct Engine<H: Host> {
     lsd_sent: u64,
     lsd_received: u64,
     lsd_discovered: u64,
+    /// Wall-clock (ms) of the last valid LAN announce received. Drives the
+    /// **LAN-aware adaptive pacing**: while a neighbour is live the LSD
+    /// round-robin runs at [`crate::lsd::LSD_ACTIVE_INTERVAL_MS`], so a
+    /// freshly-added torrent reaches the listening neighbour within
+    /// seconds; a quiet LAN falls back to the configured interval.
+    lsd_last_recv_at: u64,
+    /// LAN sources promoted into the DHT routing table (addr → last
+    /// promotion time). **Discover → route**: a valid LSD announce proves
+    /// the source is a live BT node on our LAN, so it becomes a DHT
+    /// neighbour (low-latency, high-uptime) — a real discovery win on
+    /// networks where the public bootstrap routers are slow or blocked.
+    /// Bounded and TTL'd ([`crate::lsd::LSD_NEIGHBOR_WINDOW_MS`]) so a
+    /// chatty neighbour cannot bloat the table.
+    lsd_dht_promoted: BTreeMap<crate::platform::NetAddr, u64>,
     /// Last time a spontaneous `find_node` (bucket refresh) was started.
     last_dht_find_node: u64,
     /// Counter for deriving refresh targets (cheap deterministic random).
@@ -227,7 +248,6 @@ impl<H: Host> Engine<H> {
     /// disabled and inbound connections are rejected — the configuration
     /// the caller sees afterwards reflects that.
     pub fn new(host: H, mut cfg: EngineConfig) -> Self {
-        // Anonymity hardening (single source of truth = cfg.proxy).
         if cfg.proxy.is_some() {
             cfg.dht_enabled = false;
             cfg.port_mapping = false;
@@ -238,6 +258,11 @@ impl<H: Host> Engine<H> {
         h.fill_random(&mut seed);
         let mut rng = Rng::from_seed(seed);
         let peer_id = crate::peer_id::generate(&mut rng);
+        let node_secret = cfg.node_secret.unwrap_or_else(|| {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            k
+        });
         let mut lsd_cookie = [0u8; 8];
         rng.fill(&mut lsd_cookie);
         let dht = if cfg.dht_enabled {
@@ -288,6 +313,7 @@ impl<H: Host> Engine<H> {
         Engine {
             host: h,
             peer_id,
+            node_secret,
             sessions: BTreeMap::new(),
             conn_owner: BTreeMap::new(),
             cache: DiskCache::new(cfg.cache_bytes),
@@ -317,6 +343,8 @@ impl<H: Host> Engine<H> {
             lsd_sent: 0,
             lsd_received: 0,
             lsd_discovered: 0,
+            lsd_last_recv_at: 0,
+            lsd_dht_promoted: BTreeMap::new(),
             last_dht_find_node: now,
             dht_refresh_serial: 0,
             verify_pool,
@@ -1968,11 +1996,25 @@ impl<H: Host> Engine<H> {
             }
             return;
         }
-        // Steady state: one hash per interval.
-        if !self.lsd.due(now) {
+        // Steady state: one hash per interval. **LAN-aware adaptive
+        // pacing**: while a live neighbour has been heard recently, the
+        // effective interval drops to LSD_ACTIVE_INTERVAL_MS so a
+        // freshly-added torrent reaches the listening neighbour within
+        // seconds; on a quiet LAN the configured interval applies and we do
+        // not spam a dead network.
+        let effective_interval =
+            if now.saturating_sub(self.lsd_last_recv_at) < crate::lsd::LSD_NEIGHBOR_WINDOW_MS {
+                crate::lsd::LSD_ACTIVE_INTERVAL_MS
+            } else {
+                self.lsd.interval_ms
+            };
+        if !self.lsd.due_with(now, effective_interval) {
             return;
         }
-        let Some(ih) = self.lsd.next_announce(&active, now) else {
+        let Some(ih) = self
+            .lsd
+            .next_announce_with(&active, now, effective_interval)
+        else {
             return;
         };
         self.send_lsd_announce(ih);
@@ -2036,6 +2078,30 @@ impl<H: Host> Engine<H> {
             self.lsd_last_reply
                 .retain(|_, t| now.saturating_sub(*t) < crate::lsd::LSD_REPLY_GAP_MS);
         }
+        // A valid announce proves a live BT neighbour on our LAN. Record it
+        // for the adaptive pacing, and promote it into the DHT routing
+        // table (**discover → route**): LAN nodes are low-latency,
+        // high-uptime DHT neighbours, and on networks where the public
+        // bootstrap routers are slow or blocked this materially improves
+        // node discovery. Promoted at most once per neighbour window, like
+        // bootstrap (ZERO placeholder → ping for the real id).
+        self.lsd_last_recv_at = now;
+        if now.saturating_sub(self.lsd_dht_promoted.get(&addr).copied().unwrap_or(0))
+            >= crate::lsd::LSD_NEIGHBOR_WINDOW_MS
+        {
+            let lan_peer = match addr {
+                NetAddr::V4(ip, _) => Some(NetAddr::V4(ip, ann.port)),
+                NetAddr::V6(..) => None, // DHT routing is IPv4-practical here
+            };
+            if let (Some(lan), Some(d)) = (lan_peer, self.dht.as_mut()) {
+                d.bootstrap(&[lan], now);
+                self.lsd_dht_promoted.insert(addr, now);
+                if self.lsd_dht_promoted.len() > 1024 {
+                    self.lsd_dht_promoted
+                        .retain(|_, t| now.saturating_sub(*t) < crate::lsd::LSD_NEIGHBOR_WINDOW_MS);
+                }
+            }
+        }
         let group = match addr {
             NetAddr::V4(..) => crate::lsd::LSD_GROUP_V4,
             NetAddr::V6(..) => crate::lsd::LSD_GROUP_V6,
@@ -2067,6 +2133,13 @@ impl<H: Host> Engine<H> {
     /// peers_discovered_via_lsd)`. Lets the UI show LAN discovery is alive.
     pub fn lsd_stats(&self) -> (u64, u64, u64) {
         (self.lsd_sent, self.lsd_received, self.lsd_discovered)
+    }
+
+    /// Number of distinct LAN sources promoted into the DHT routing table
+    /// (discover → route). Bounded and TTL'd; a counter, not the table size
+    /// (ZERO placeholders collapse in the routing table by id).
+    pub fn lsd_dht_promotions(&self) -> usize {
+        self.lsd_dht_promoted.len()
     }
 
     /// Number of trackers currently considered active across all sessions:
@@ -2192,16 +2265,54 @@ impl<H: Host> Engine<H> {
         if let Some(d) = &self.dht {
             st.dht_nodes = d.export_nodes(160);
         }
+        st.node_secret = self.node_secret.to_vec();
         st
     }
 
     /// Restore persisted state. Torrents are not reconstructed here (the
     /// host re-adds them via `add_torrent`); this restores the DHT routing
-    /// table so the next session boots with known peers.
+    /// table so the next session boots with known peers, and the persisted
+    /// node identity so receipts stay verifiable across restarts.
     pub fn load_state(&mut self, st: &crate::state::SessionState, now: u64) {
         if let Some(d) = self.dht.as_mut() {
             d.import_nodes(&st.dht_nodes, now);
         }
+        if st.node_secret.len() == 32 {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&st.node_secret[..32]);
+            self.node_secret = k;
+        }
+    }
+
+    /// The node's Ed25519 public key (the identity inside every receipt).
+    pub fn node_public_key(&self) -> [u8; 32] {
+        crate::crypto::ed25519::public_key(&self.node_secret)
+    }
+
+    /// Export a signed proof-of-download receipt for `hash` over `range`
+    /// (absolute byte offsets, inclusive start / exclusive end), attested to
+    /// the given wall-clock window (unix seconds).
+    ///
+    /// The challenge is derived deterministically from the node secret (see
+    /// [`crate::receipt::Challenge::derive`]) — self-issued, reproducible,
+    /// and signed by the node's identity. Returns `None` when the session
+    /// does not exist or its **verified** coverage of `range` is below
+    /// [`crate::receipt::MIN_COVERAGE_PERMILLE`] — receipts cannot be
+    /// fabricated from bytes that were never verified.
+    pub fn export_receipt(
+        &self,
+        hash: &InfoHash,
+        range: (u64, u64),
+        epoch_start_unix: u64,
+        epoch_end_unix: u64,
+    ) -> Option<crate::receipt::Receipt> {
+        let s = self.sessions.get(hash)?;
+        s.receipt_book.build_receipt_unix(
+            range,
+            epoch_start_unix,
+            epoch_end_unix,
+            &self.node_secret,
+        )
     }
 }
 
@@ -2570,6 +2681,59 @@ mod tests {
         assert!(
             attached,
             "LSD-discovered LAN peer (192.168.1.50:6882) must be attached to the swarm"
+        );
+    }
+
+    #[test]
+    fn lsd_lan_node_is_promoted_into_dht_routing_table() {
+        use crate::lsd;
+        let host = LsdHost {
+            lsd_open: 0,
+            lsd_joins: 0,
+            feed: None,
+        };
+        let mut engine = Engine::new(host, EngineConfig::default());
+        let t = make_torrent();
+        let hash = t.info_hash;
+        engine.add_torrent_obj(t, "/tmp").expect("add");
+        engine.start(&hash).expect("start");
+        engine.tick().expect("tick");
+
+        // An empty DHT table (no bootstrap seeds in this test host).
+        assert_eq!(engine.dht().unwrap().table().size(), 0);
+
+        // A valid LAN announce for our torrent → the source must be
+        // promoted into the DHT routing table (discover → route), so the
+        // LAN node becomes a low-latency DHT neighbour.
+        let mut ih20 = [0u8; 20];
+        ih20.copy_from_slice(hash.as_bytes());
+        let msg = lsd::build_announce(&ih20, 6882, None, lsd::LSD_GROUP_V4);
+        engine.host.feed = Some((NetAddr::V4([192, 168, 1, 77], 6771), msg));
+        engine.tick().expect("tick");
+
+        assert!(
+            engine.dht().unwrap().table().size() >= 1,
+            "the announcing LAN node must be promoted into the DHT routing table"
+        );
+        assert_eq!(
+            engine.lsd_dht_promotions(),
+            1,
+            "one distinct LAN source promoted"
+        );
+
+        // The same neighbour announcing again within the window is not
+        // re-promoted (bounded) — but a NEW neighbour is. (ZERO placeholders
+        // collapse by id in the routing table, so we assert on the promotion
+        // counter, not the table size.)
+        let mut ih20b = [0u8; 20];
+        ih20b.copy_from_slice(hash.as_bytes());
+        let msg2 = lsd::build_announce(&ih20b, 6883, None, lsd::LSD_GROUP_V4);
+        engine.host.feed = Some((NetAddr::V4([192, 168, 1, 88], 6771), msg2));
+        engine.tick().expect("tick");
+        assert_eq!(
+            engine.lsd_dht_promotions(),
+            2,
+            "a second distinct LAN node must also be promoted"
         );
     }
 

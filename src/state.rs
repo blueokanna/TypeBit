@@ -46,6 +46,10 @@ pub struct SessionState {
     pub torrents: Vec<TorrentState>,
     /// DHT nodes to re-bootstrap from (compact 26-byte entries).
     pub dht_nodes: Vec<Vec<u8>>,
+    /// Node identity secret (Ed25519 seed, 32 bytes) used to sign
+    /// proof-of-download receipts.
+    #[njson(default)]
+    pub node_secret: Vec<u8>,
 }
 
 impl SessionState {
@@ -93,6 +97,7 @@ mod tests {
                 info_raw: vec![4, 5, 6],
             }],
             dht_nodes: vec![vec![2u8; 26]],
+            node_secret: vec![7u8; 32],
         }
     }
 

@@ -1,7 +1,11 @@
-//! `no_std + alloc` universal download engine: BitTorrent (v1/v2, DHT, PEX,
-//! web seeds), eD2k, Xunlei, IPFS, Kad, direct HTTP(S) — plus provable
-//! download receipts, a utility scheduler and a disk cache. Transport is
-//! injected via [`platform::Host`]; crypto is in-tree under [`crypto`].
+//! `no_std + alloc` download-engine core: **BitTorrent v1/v2** (peer wire,
+//! DHT, PEX, LSD, uTP, web seeds, UDP/HTTP trackers, magnet, SOCKS5) — plus
+//! provable download receipts, a utility scheduler and a disk cache.
+//! [`links::parse_link`] also *parses* eD2k / Thunder / QQDL / FlashGet /
+//! IPFS / Kad / Baidu / Xunlei-Netdisk links into typed [`links::DownloadLink`]
+//! values (parsing only — no fetch adapters for those protocols yet, see the
+//! README protocol matrix). Transport is injected via [`platform::Host`];
+//! crypto is in-tree under [`crypto`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "ffi"), deny(unsafe_code))]
