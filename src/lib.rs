@@ -104,7 +104,13 @@ pub mod consts {
     pub const REQUEST_TIMEOUT_MS: u64 = 20_000;
     /// Default number of consecutive request timeouts on one peer before it
     /// is disconnected and blacklisted (mechanism 2's punishment limit).
-    pub const MAX_REQUEST_TIMEOUTS: u32 = 5;
+    ///
+    /// Deliberately forgiving (8): the request timeout is pipeline-aware, and
+    /// the counter resets on ANY delivered block, so a peer must deliver
+    /// NOTHING across 8 full timeout windows to earn a ban. Aggressive
+    /// values (e.g. 2–3) burn healthy seeds on congested links and collapse
+    /// the swarm mid-download.
+    pub const MAX_REQUEST_TIMEOUTS: u32 = 8;
     /// Recommended write-back cache budget (bytes).
     pub const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
     /// Upper bound on magnet metadata size (a .torrent info dict is small).

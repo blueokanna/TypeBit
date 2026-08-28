@@ -57,6 +57,21 @@ const HTTP_ANNOUNCE_PENDING_MS: u64 = 5_000;
 /// tracker must not be parked just because the rotation is fast.
 const HTTP_ANNOUNCE_TIMEOUT_MS: u64 = 15_000;
 
+/// Extra per-outstanding-block time added to the per-request timeout
+/// (Issue 2 resilience). A deep pipeline means the LAST block a peer owes
+/// us has every earlier block ahead of it in the peer's upload queue; a
+/// flat timeout that ignores pipeline depth burns healthy seeds as "too
+/// slow" and the swarm collapses mid-download ("fast, then suddenly
+/// disconnected"). Effective timeout = `request_timeout_ms` +
+/// `requests_in_flight × PIPELINE_TIMEOUT_GRACE_MS`.
+const PIPELINE_TIMEOUT_GRACE_MS: u64 = 250;
+
+/// How long after losing the last ready peer the session waits before
+/// force-refreshing the swarm (tracker announce + DHT lookup). Without
+/// this, a download that drops all peers waits out the announce interval
+/// (up to 30 s+) doing nothing.
+const SWARM_EMPTY_REANNOUNCE_MS: u64 = 5_000;
+
 /// How many HTTP trackers one announce call fires at once (bounded by the
 /// async worker's concurrency). Batched announce means a magnet (metadata
 /// fetch) reaches its full tracker set quickly instead of one tracker per
@@ -333,6 +348,11 @@ pub struct TrackerState {
     pub url: Vec<u8>,
     /// Transport kind.
     pub kind: TrackerKind,
+    /// BEP-12 tier index (0 = the torrent's own first tier). Announcements
+    /// walk tiers in order; within a tier, trackers are round-robined.
+    /// URLs not declared in the torrent (config extras, community
+    /// fallbacks) share the tier after the highest declared one.
+    pub tier: u32,
     /// Announce interval.
     pub interval: u64,
     /// Next announce time (ms).
@@ -357,6 +377,10 @@ pub struct UdpTrackerState {
     phase: UdpPhase,
     conn_id: u64,
     tid: u32,
+    /// Consecutive transmissions of the current request (connect or
+    /// announce) without a reply; past [`Self::MAX_ATTEMPTS`] the endpoint
+    /// is rotated and the tracker counts a failure.
+    attempts: u32,
     /// Resolved endpoints for the tracker hostname (all DNS records, so a
     /// dead/misbehaving record falls back to the next one). The first
     /// element is the one currently in use.
@@ -366,12 +390,20 @@ pub struct UdpTrackerState {
     sent_at: u64,
 }
 
+impl UdpTrackerState {
+    /// Retransmissions before the endpoint is rotated and the tracker
+    /// counts a failure (UDP is lossy; a single dropped packet must not
+    /// cost a 15 s stall).
+    const MAX_ATTEMPTS: u32 = 3;
+}
+
 impl Default for UdpTrackerState {
     fn default() -> Self {
         UdpTrackerState {
             phase: UdpPhase::Idle,
             conn_id: 0,
             tid: 0,
+            attempts: 0,
             addrs: Vec::new(),
             addr_idx: 0,
             sent_at: 0,
@@ -408,12 +440,35 @@ pub struct MetadataFetch {
     pub outstanding: u32,
 }
 
+/// One parallel in-flight web-seed (BEP-19) block fetch.
+#[derive(Debug, Clone, Copy)]
+pub struct WebSeedJob {
+    /// Async HTTP job id (routes the result back).
+    pub job_id: u64,
+    /// Piece being fetched.
+    pub piece: u32,
+    /// Block index within the piece.
+    pub block: u16,
+    /// Expected body length.
+    pub len: u64,
+    /// Mirror (index into `web_seeds`) this block was assigned to.
+    pub seed: usize,
+}
+
 /// One in-progress web-seed (BEP-19) piece fetch.
 ///
-/// Web seeds are fetched one 16 KiB block at a time through the host's
-/// async HTTP seam (falling back to the blocking range GET on hosts without
-/// a worker), so the engine thread never stalls on a web-seed request and
-/// the memory footprint stays a single piece.
+/// Web seeds are fetched through the host's async HTTP seam (falling back
+/// to the blocking range GET on hosts without a worker), so the engine
+/// thread never stalls on a web-seed request and the memory footprint stays
+/// a single piece.
+///
+/// **Multi-mirror (多镜像下载):** a torrent's `url-list` mirrors are used
+/// **simultaneously** — up to [`Self::MAX_INFLIGHT`] blocks are in flight
+/// at once, each assigned to a different mirror (round-robin, skipping
+/// mirrors that have failed [`WebSeedConfig::max_fails`] times). Mirror A
+/// does not wait for mirror B, so aggregate download speed scales with the
+/// number of healthy mirrors instead of being serialized one block at a
+/// time.
 #[derive(Debug, Clone, Default)]
 pub struct WebSeedState {
     /// Piece currently being fetched (None = idle).
@@ -424,24 +479,21 @@ pub struct WebSeedState {
     pub total_blocks: u16,
     /// Assembled piece bytes (len == piece length).
     pub data: Vec<u8>,
-    /// Index of the web seed currently in use (round robin).
+    /// Round-robin cursor across mirrors.
     pub seed_idx: usize,
-    /// Consecutive failures on the current seed.
-    pub fails: u32,
-    /// Backoff deadline (ms) before retrying after all seeds failed.
+    /// Consecutive failures per mirror (index-aligned with `web_seeds`).
+    pub seed_fails: Vec<u32>,
+    /// Backoff deadline (ms) before retrying after ALL mirrors failed.
     pub retry_at: u64,
-    /// Async HTTP job id of the in-flight block fetch (0 = idle). The
-    /// engine never blocks on web seeds: the request runs on the host's
-    /// worker and the block is applied by [`TorrentSession::on_range_job_done`].
-    pub job_id: u64,
-    /// Piece index of the in-flight block fetch (valid while `job_id != 0`).
-    pub job_piece: u32,
-    /// Block index of the in-flight block fetch.
-    pub job_block: u16,
-    /// Expected body length of the in-flight block fetch.
-    pub job_len: u64,
-    /// Seed index used for the in-flight block fetch (for failure rotation).
-    pub job_seed: usize,
+    /// Parallel in-flight block fetches across mirrors.
+    pub in_flight: Vec<WebSeedJob>,
+}
+
+impl WebSeedState {
+    /// Max parallel block fetches (16 KiB each → ≤ 64 KiB in flight per
+    /// session). Large enough to spread a piece across several mirrors,
+    /// small enough to bound memory and HTTP worker pressure.
+    const MAX_INFLIGHT: usize = 4;
 }
 
 /// The per-torrent session.
@@ -472,8 +524,19 @@ pub struct TorrentSession {
     pub availability: Vec<u32>,
     /// Assembling piece buffers (piece → bytes).
     assembling: BTreeMap<u32, Vec<u8>>,
-    /// Open file handles aligned with torrent.files.
-    files: Vec<crate::platform::DiskId>,
+    /// Open file handles aligned with torrent.files; `None` = the file is
+    /// SKIPPED (no selected piece) and is never opened or preallocated, so
+    /// a selective download never even creates a `.part` file for files the
+    /// user did not choose.
+    files: Vec<Option<crate::platform::DiskId>>,
+    /// Set when per-file priorities change at runtime: `tick` re-runs
+    /// [`Self::open_files`] so files newly selected get opened (and freshly
+    /// skipped ones simply stay closed).
+    files_need_reopen: bool,
+    /// Set when per-piece priorities change (a file skipped at runtime):
+    /// `tick` cancels outstanding requests for now-unwanted pieces and
+    /// returns their global in-flight slots (needs the cache, hence ctx).
+    requests_need_priority_sweep: bool,
     /// Trackers.
     pub trackers: Vec<TrackerState>,
     /// Tracker round-robin position.
@@ -554,9 +617,15 @@ pub struct TorrentSession {
     hold_data_until_priorities: bool,
     /// Piece index → supplier connection ids (corrupt-block attribution).
     piece_suppliers: BTreeMap<u32, Vec<ConnId>>,
+    /// Exact received-byte accounting per assembling piece (byte-exact
+    /// completion — see [`crate::piece::PieceBytes`]).
+    piece_bytes: BTreeMap<u32, crate::piece::PieceBytes>,
     /// Assembled pieces handed to the verifier (piece → bytes), drained by
     /// the engine each tick.
     pending_verify: BTreeMap<u32, Vec<u8>>,
+    /// Last time the swarm became empty and was force-refreshed (ms;
+    /// 0 = never) — bounds the resilience re-announce.
+    last_swarm_empty_at: u64,
     /// Pieces currently being verified (piece → total blocks); keeps the
     /// picker away until the result lands.
     verifying: BTreeMap<u32, u32>,
@@ -603,9 +672,9 @@ impl TorrentSession {
             torrent
                 .announce_list
                 .iter()
-                .flatten()
-                .cloned()
-                .chain(torrent.announce.iter().cloned()),
+                .enumerate()
+                .flat_map(|(ti, tier)| tier.iter().cloned().map(move |url| (ti as u32, url)))
+                .chain(torrent.announce.iter().cloned().map(|url| (0u32, url))),
             &cfg,
         );
 
@@ -618,7 +687,10 @@ impl TorrentSession {
         let (piece_priorities, selected_piece_count) =
             compute_piece_priorities(&torrent, &cfg.file_priorities);
         let max_bans = cfg.leech.max_bans;
-        let upload_limit = TokenBucket::new(cfg.upload_limit_bps, now);
+        // Per-task upload limits use the tolerance-tight bucket (the same
+        // ceiling spec as the global upload limit); download keeps the
+        // classic burst so a fresh task can fill the pipe.
+        let upload_limit = TokenBucket::new_upload(cfg.upload_limit_bps, now);
         let download_limit = TokenBucket::new(cfg.download_limit_bps, now);
         Ok(TorrentSession {
             info_hash,
@@ -633,6 +705,8 @@ impl TorrentSession {
             availability: vec![0; piece_count as usize],
             assembling: BTreeMap::new(),
             files: Vec::new(),
+            files_need_reopen: false,
+            requests_need_priority_sweep: false,
             trackers,
             tracker_cursor: 0,
             announce_at: 0,
@@ -673,8 +747,10 @@ impl TorrentSession {
             selected_piece_count,
             hold_data_until_priorities: false,
             piece_suppliers: BTreeMap::new(),
+            piece_bytes: BTreeMap::new(),
             pending_verify: BTreeMap::new(),
             verifying: BTreeMap::new(),
+            last_swarm_empty_at: 0,
             torrent: Some(torrent),
             cfg,
         })
@@ -684,7 +760,13 @@ impl TorrentSession {
     pub fn from_magnet(magnet: &Magnet, cfg: SessionConfig, now: u64) -> Result<TorrentSession> {
         let info_hash = magnet.info_hash.ok_or(Error::Magnet)?;
         let tracker_hash = tracker_hash_of(&info_hash);
-        let trackers = seed_trackers(magnet.trackers.iter().map(|s| s.as_bytes().to_vec()), &cfg);
+        let trackers = seed_trackers(
+            magnet
+                .trackers
+                .iter()
+                .map(|s| (0u32, s.as_bytes().to_vec())),
+            &cfg,
+        );
         let mut web_seeds: Vec<String> = Vec::new();
         for s in magnet.web_seeds.iter().chain(magnet.sources.iter()) {
             let t = s.trim();
@@ -700,7 +782,7 @@ impl TorrentSession {
         );
         let monitor = SwarmMonitor::new(info_hash.to_hex(), 0, now, 1);
         let max_bans = cfg.leech.max_bans;
-        let upload_limit = TokenBucket::new(cfg.upload_limit_bps, now);
+        let upload_limit = TokenBucket::new_upload(cfg.upload_limit_bps, now);
         let download_limit = TokenBucket::new(cfg.download_limit_bps, now);
         Ok(TorrentSession {
             torrent: None,
@@ -716,6 +798,8 @@ impl TorrentSession {
             availability: Vec::new(),
             assembling: BTreeMap::new(),
             files: Vec::new(),
+            files_need_reopen: false,
+            requests_need_priority_sweep: false,
             trackers,
             tracker_cursor: 0,
             announce_at: 0,
@@ -757,8 +841,10 @@ impl TorrentSession {
             selected_piece_count: 0,
             hold_data_until_priorities: false,
             piece_suppliers: BTreeMap::new(),
+            piece_bytes: BTreeMap::new(),
             pending_verify: BTreeMap::new(),
             verifying: BTreeMap::new(),
+            last_swarm_empty_at: 0,
             cfg,
         })
     }
@@ -856,30 +942,59 @@ impl TorrentSession {
             ctx.host.tcp_close(c);
         }
         self.peers.clear();
-        for f in self.files.drain(..) {
+        for f in self.files.drain(..).flatten() {
             let _ = ctx.host.disk_flush(f);
             ctx.host.disk_close(f);
         }
         self.status = SessionStatus::Stopped;
     }
 
-    /// Open all files and apply the configured allocation strategy.
+    /// Open the files that carry at least one SELECTED piece and apply the
+    /// configured allocation strategy. Index-aligned with `torrent.files`:
+    /// skipped files stay `None` — never opened, never preallocated, so a
+    /// selective download does not even create an empty `.part` file for
+    /// them. Idempotent: already-open handles are left untouched, and
+    /// newly-selected files (runtime priority change) are opened on demand.
     fn open_files<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) -> Result<()> {
-        if self.files.is_empty() {
-            if let Some(t) = &self.torrent {
-                let alloc = self.cfg.preallocation;
-                for f in &t.files {
-                    let path = self.file_path(f);
-                    let id = ctx.host.disk_open(&path)?;
-                    if alloc != Preallocation::Off {
-                        let _ = ctx.host.disk_set_alloc(id, alloc.code());
-                        let _ = ctx.host.disk_prealloc(id, f.length);
-                    }
-                    self.files.push(id);
-                }
-            }
+        let t = match &self.torrent {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+        if self.files.len() != t.files.len() {
+            self.files = alloc::vec![None; t.files.len()];
         }
+        let alloc = self.cfg.preallocation;
+        let pl = t.piece_length as u64;
+        let mut abs = 0u64;
+        for (fi, f) in t.files.iter().enumerate() {
+            let selected = self.file_has_selected_piece(abs, f.length, pl);
+            if selected && self.files[fi].is_none() {
+                let path = self.file_path(f);
+                let id = ctx.host.disk_open(&path)?;
+                if alloc != Preallocation::Off {
+                    let _ = ctx.host.disk_set_alloc(id, alloc.code());
+                    let _ = ctx.host.disk_prealloc(id, f.length);
+                }
+                self.files[fi] = Some(id);
+            }
+            abs = abs.saturating_add(f.length);
+        }
+        self.files_need_reopen = false;
         Ok(())
+    }
+
+    /// Whether the byte range `[abs, abs+len)` overlaps at least one piece
+    /// with a non-zero priority multiplier (i.e. a selected file's pieces).
+    fn file_has_selected_piece(&self, abs: u64, len: u64, pl: u64) -> bool {
+        let n = self.pieces.piece_count() as usize;
+        let first = (abs / pl) as usize;
+        let last = ((abs + len).div_ceil(pl)) as usize;
+        let lo = first.min(n);
+        let hi = last.min(n);
+        if lo >= hi {
+            return false;
+        }
+        self.piece_priorities[lo..hi].iter().any(|&p| p > 0)
     }
 
     /// Build the absolute host path for a file entry.
@@ -930,6 +1045,9 @@ impl TorrentSession {
         }
         self.cfg.file_priorities[idx] = prio;
         self.recompute_priorities();
+        // A newly-selected file must be opened (and a freshly-skipped one
+        // simply stays closed) on the next tick.
+        self.files_need_reopen = true;
         Ok(())
     }
 
@@ -940,6 +1058,7 @@ impl TorrentSession {
     pub fn set_hold_data(&mut self, hold: bool) {
         self.hold_data_until_priorities = hold;
         self.recompute_priorities();
+        self.files_need_reopen = true;
     }
 
     /// Whether the session is currently holding off data downloads while
@@ -964,6 +1083,7 @@ impl TorrentSession {
             .extend(priorities[..n].iter().copied());
         self.hold_data_until_priorities = false;
         self.recompute_priorities();
+        self.files_need_reopen = true;
         if self.status != SessionStatus::Failed {
             if self.selected_piece_count == 0 {
                 self.status = SessionStatus::Seeding;
@@ -1016,7 +1136,14 @@ impl TorrentSession {
         reputation: &[u8],
         now: u64,
     ) -> Result<()> {
-        self.pieces.restore(have, partial)?;
+        // Restore ONLY the verified `have` bitfield. Byte-exact assembly
+        // means a persisted partial-block bitmap cannot be trusted — a
+        // standard block slot may only be partially filled, so reusing it
+        // could let a zero-filled hole reach the hasher (permanent hash
+        // failures on large pieces). Every partial piece is re-downloaded.
+        self.pieces
+            .set_have_from_bytes(have, self.pieces.piece_count())?;
+        let _ = partial;
         if !priorities.is_empty() {
             let t = match &self.torrent {
                 Some(t) => t.clone(),
@@ -1042,10 +1169,11 @@ impl TorrentSession {
     }
 
     /// Manually add a tracker URL (deduped). Returns `true` if added.
+    /// Runtime-added trackers join tier 0 (the first to be announced).
     pub fn add_tracker(&mut self, url: &str) -> bool {
         let b = url.as_bytes().to_vec();
         let before = self.trackers.len();
-        push_tracker(&mut self.trackers, b);
+        push_tracker(&mut self.trackers, b, 0);
         self.trackers.len() > before
     }
 
@@ -1083,8 +1211,62 @@ impl TorrentSession {
             self.piece_priorities.iter_mut().for_each(|p| *p = 0);
             self.selected_piece_count = 0;
         }
+        // A piece whose priority just dropped to 0 (the user skipped its
+        // file at runtime) must have its outstanding requests cancelled —
+        // otherwise in-flight blocks still land and write into the "not
+        // wanted" file. The actual cancellation runs in `tick` (it needs the
+        // shared cache to return the global in-flight slots).
+        self.requests_need_priority_sweep = true;
         // the selection may have shrunk below what we already have
         self.refresh_completion();
+    }
+
+    /// Cancel every outstanding block request for pieces that are no longer
+    /// selected (runtime priority change to Skip). Sends `Cancel` to each
+    /// requesting peer, returns the global in-flight slots to the shared
+    /// cache and makes the blocks pickable again. Runs from `tick` when
+    /// [`Self::requests_need_priority_sweep`] is set.
+    fn cancel_skipped_piece_requests<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
+        self.requests_need_priority_sweep = false;
+        if self.requested_by.is_empty() {
+            return;
+        }
+        let to_cancel: Vec<(u32, u16)> = self
+            .requested_by
+            .keys()
+            .copied()
+            .filter(|(p, _)| self.piece_priorities.get(*p as usize).copied().unwrap_or(1) <= 0)
+            .collect();
+        if to_cancel.is_empty() {
+            return;
+        }
+        for (piece, block) in to_cancel {
+            let Some(reqs) = self.requested_by.remove(&(piece, block)) else {
+                continue;
+            };
+            let begin = (block as u32) * BLOCK_LEN;
+            let len = self
+                .torrent
+                .as_ref()
+                .and_then(|t| t.piece_info(piece).ok())
+                .map(|pi| core::cmp::min(BLOCK_LEN, pi.len - begin))
+                .unwrap_or(BLOCK_LEN);
+            for c in reqs {
+                if let Some(p) = self.peers.get_mut(&c) {
+                    p.send(&Message::Cancel {
+                        index: piece,
+                        begin,
+                        length: len,
+                    });
+                    p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
+                }
+                // Each resolved request returns one global in-flight slot.
+                ctx.cache.inflight_dec();
+            }
+            self.requested_at.remove(&(piece, block));
+            let bc = self.block_count(piece);
+            self.pieces.clear_block_requested(piece, block, bc);
+        }
     }
 
     // ---------- tick ----------
@@ -1094,6 +1276,15 @@ impl TorrentSession {
         match self.status {
             SessionStatus::Stopped | SessionStatus::Paused | SessionStatus::Failed => return,
             _ => {}
+        }
+        // A runtime priority change may have selected files that were never
+        // opened — open them now (idempotent, skipped files stay closed).
+        if self.files_need_reopen && self.open_files(ctx).is_err() {
+            self.status = SessionStatus::Failed;
+        }
+        // Cancel outstanding requests for pieces the user just skipped.
+        if self.requests_need_priority_sweep {
+            self.cancel_skipped_piece_requests(ctx);
         }
         // re-announce: a queued `Started` announce fires before the normal cadence
         // (the blocking HTTP path is deferred out of start/resume, so DHT already went out).
@@ -1222,6 +1413,7 @@ impl TorrentSession {
                 self.webseed.next_block = 0;
                 self.webseed.total_blocks = block_count_for(len);
                 self.webseed.data = vec![0u8; len as usize];
+                self.webseed.seed_fails = vec![0u32; self.web_seeds.len()];
             } else {
                 return; // nothing fetchable right now
             }
@@ -1230,100 +1422,146 @@ impl TorrentSession {
             Some(p) => p,
             None => return,
         };
-        // (b) resolve this block's URL and byte window (immutable snapshot)
-        let (url, range_start, range_end, blen) = {
-            let t = match self.torrent.as_ref() {
-                Some(t) => t,
-                None => return,
-            };
-            match self.webseed_block(t, piece, self.webseed.next_block) {
-                Some(m) => m,
-                None => {
-                    self.abort_webseed_piece();
-                    return;
+        // (b) keep the parallel mirror window full. Each new block is
+        // assigned to the next healthy mirror (round-robin, skipping
+        // mirrors that already failed `max_fails` times this piece).
+        let max_inflight = WebSeedState::MAX_INFLIGHT;
+        while self.webseed.in_flight.len() < max_inflight
+            && self.webseed.next_block < self.webseed.total_blocks
+        {
+            // Pick the next healthy mirror (rotate until one qualifies).
+            let n_seeds = self.web_seeds.len();
+            let mut picked_seed = None;
+            for _ in 0..n_seeds {
+                let s = self.webseed.seed_idx % n_seeds;
+                self.webseed.seed_idx = self.webseed.seed_idx.saturating_add(1);
+                let failed = self.webseed.seed_fails.get(s).copied().unwrap_or(0)
+                    >= self.cfg.webseed.max_fails;
+                if !failed {
+                    picked_seed = Some(s);
+                    break;
                 }
             }
-        };
-        if self.webseed.job_id != 0 {
-            return;
-        }
-        if self.cfg.proxy.is_none() {
-            let job_id = ctx.host.http_get_range_async(
-                &url,
-                range_start,
-                range_end,
-                self.cfg.webseed.timeout_ms,
-            );
-            if job_id != 0 {
-                self.webseed.job_id = job_id;
-                self.webseed.job_piece = piece;
-                self.webseed.job_block = self.webseed.next_block;
-                self.webseed.job_len = blen;
-                self.webseed.job_seed = self.webseed.seed_idx;
+            let Some(seed) = picked_seed else {
+                // Every mirror is failing → back off and retry the piece
+                // from scratch after the backoff window.
+                self.webseed.retry_at = now.saturating_add(self.cfg.webseed.backoff_ms);
+                self.abort_webseed_piece();
                 return;
+            };
+            let (url, range_start, range_end, blen) = {
+                let t = match self.torrent.as_ref() {
+                    Some(t) => t,
+                    None => return,
+                };
+                match self.webseed_block(t, piece, self.webseed.next_block, seed) {
+                    Some(m) => m,
+                    None => {
+                        self.abort_webseed_piece();
+                        return;
+                    }
+                }
+            };
+            let block = self.webseed.next_block;
+            if self.cfg.proxy.is_none() {
+                let job_id = ctx.host.http_get_range_async(
+                    &url,
+                    range_start,
+                    range_end,
+                    self.cfg.webseed.timeout_ms,
+                );
+                if job_id != 0 {
+                    self.webseed.in_flight.push(WebSeedJob {
+                        job_id,
+                        piece,
+                        block,
+                        len: blen,
+                        seed,
+                    });
+                    self.webseed.next_block = self.webseed.next_block.saturating_add(1);
+                    continue;
+                }
             }
+            // Sync fallback (host without an async worker, or proxy mode):
+            // one block per tick, so the engine thread never stalls.
+            let timeout = self.cfg.webseed.timeout_ms;
+            let mut body = Vec::new();
+            let got = match &self.cfg.proxy {
+                Some(p) => socks_mod::socks_http_get_range(
+                    ctx.host,
+                    p,
+                    &url,
+                    range_start,
+                    range_end,
+                    timeout,
+                    &mut body,
+                ),
+                None => ctx
+                    .host
+                    .http_get_range(&url, range_start, range_end, timeout, &mut body),
+            };
+            self.webseed_apply_block(seed, block, blen, got, &body, now);
+            break; // one sync fetch per tick
         }
-        // Sync fallback (host without an async worker, or proxy mode).
-        let timeout = self.cfg.webseed.timeout_ms;
-        let mut body = Vec::new();
-        let got = match &self.cfg.proxy {
-            Some(p) => socks_mod::socks_http_get_range(
-                ctx.host,
-                p,
-                &url,
-                range_start,
-                range_end,
-                timeout,
-                &mut body,
-            ),
-            None => ctx
-                .host
-                .http_get_range(&url, range_start, range_end, timeout, &mut body),
-        };
-        self.webseed_apply_block(got, &body, blen, ctx.now);
     }
 
     /// Apply one fetched block (success or failure) and advance the piece
     /// state machine. Shared by the synchronous and the async paths.
-    fn webseed_apply_block(&mut self, got: Result<()>, body: &[u8], blen: u64, now: u64) {
+    fn webseed_apply_block(
+        &mut self,
+        seed: usize,
+        block: u16,
+        blen: u64,
+        got: Result<()>,
+        body: &[u8],
+        now: u64,
+    ) {
         let piece = match self.webseed.piece {
             Some(p) => p,
             None => return,
         };
+        let mut ok = false;
         match got {
             Ok(()) if body.len() as u64 == blen => {
-                let off = (self.webseed.next_block as u32 * BLOCK_LEN) as usize;
+                let off = (block as u32 * BLOCK_LEN) as usize;
                 // Defense-in-depth: never copy past the assembled buffer.
                 if off + body.len() <= self.webseed.data.len() {
                     self.webseed.data[off..off + body.len()].copy_from_slice(body);
                     self.downloaded_bytes += body.len() as u64;
                     self.monitor
                         .record_piece_cover(NetAddr::V4([0, 0, 0, 0], 0), piece);
-                    self.webseed.fails = 0;
-                    self.webseed.next_block = self.webseed.next_block.saturating_add(1);
-                } else {
-                    // range not honored / oversized: the data is untrustworthy
-                    self.webseed.fails = self.webseed.fails.saturating_add(1);
+                    ok = true;
                 }
             }
-            Ok(()) => {
-                // range not honored / truncated: the data is untrustworthy
-                self.webseed.fails = self.webseed.fails.saturating_add(1);
-            }
-            Err(_) => {
-                self.webseed.fails = self.webseed.fails.saturating_add(1);
-            }
+            _ => {}
         }
-        if self.webseed.fails >= self.cfg.webseed.max_fails {
-            self.webseed.fails = 0;
-            self.webseed.seed_idx = (self.webseed.seed_idx + 1) % self.web_seeds.len();
-            if self.webseed.seed_idx == 0 {
+        if ok {
+            // The mirror delivered: its failure ledger resets.
+            if let Some(f) = self.webseed.seed_fails.get_mut(seed) {
+                *f = 0;
+            }
+        } else {
+            // Range not honored / truncated / I/O error: count against this
+            // mirror only (other mirrors keep feeding the piece).
+            if let Some(f) = self.webseed.seed_fails.get_mut(seed) {
+                *f = f.saturating_add(1);
+            }
+            if self
+                .webseed
+                .seed_fails
+                .iter()
+                .all(|f| *f >= self.cfg.webseed.max_fails)
+            {
+                // Every mirror failed → back off and retry the piece later.
                 self.webseed.retry_at = now.saturating_add(self.cfg.webseed.backoff_ms);
+                self.abort_webseed_piece();
+                return;
             }
-            self.abort_webseed_piece();
-            return;
         }
-        if self.webseed.next_block >= self.webseed.total_blocks {
+        // When the last in-flight block of a complete piece lands, hand the
+        // assembled bytes to the verification pipeline.
+        if self.webseed.in_flight.is_empty() && self.webseed.next_block >= self.webseed.total_blocks
+        {
             let buf = core::mem::take(&mut self.webseed.data);
             self.pieces.set_in_flight(piece, true);
             self.verifying
@@ -1332,6 +1570,7 @@ impl TorrentSession {
             self.webseed.piece = None;
             self.webseed.next_block = 0;
             self.webseed.total_blocks = 0;
+            self.webseed.seed_fails.clear();
         }
     }
 
@@ -1364,8 +1603,8 @@ impl TorrentSession {
         None
     }
 
-    /// Resolve the next block's web-seed URL and byte window within the
-    /// containing file. Returns `(url, range_start, range_end, len)`.
+    /// Resolve a block's web-seed URL and byte window within the containing
+    /// file. Returns `(url, range_start, range_end, len)`.
     ///
     /// The Range is **relative to the file resource** (the web seed serves
     /// each file as a separate URL): `pi.offset + begin`. Using the
@@ -1376,6 +1615,7 @@ impl TorrentSession {
         t: &Torrent,
         piece: u32,
         block: u16,
+        seed: usize,
     ) -> Option<(String, u64, u64, u64)> {
         let pi = t.piece_info(piece).ok()?;
         let begin = (block as u32) * BLOCK_LEN;
@@ -1385,10 +1625,7 @@ impl TorrentSession {
         let blen = core::cmp::min(BLOCK_LEN, pi.len - begin) as u64;
         let range_start = pi.offset + begin as u64;
         let range_end = range_start + blen - 1;
-        let base = self
-            .web_seeds
-            .get(self.webseed.seed_idx % self.web_seeds.len())?
-            .clone();
+        let base = self.web_seeds.get(seed % self.web_seeds.len())?.clone();
         let url = if t.files.len() == 1 {
             // single-file torrent: the web seed URL points at the file
             base
@@ -1423,6 +1660,8 @@ impl TorrentSession {
         self.webseed.next_block = 0;
         self.webseed.total_blocks = 0;
         self.webseed.data.clear();
+        self.webseed.seed_fails.clear();
+        self.webseed.in_flight.clear();
     }
 
     fn choke_pass<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
@@ -1492,7 +1731,7 @@ impl TorrentSession {
                     Some(p) => p,
                     None => continue,
                 };
-                p.should_be_interested(self.pieces.have_bitfield())
+                p.should_be_interested(self.pieces.have_bitfield(), &self.piece_priorities)
             };
             let send = {
                 let p = match self.peers.get_mut(&c) {
@@ -1952,6 +2191,7 @@ impl TorrentSession {
             self.clear_metadata_requests();
         }
         self.recompute_availability();
+        self.maybe_reannounce_empty_swarm(ctx);
     }
 
     /// Drop a peer with a failure category.
@@ -1990,6 +2230,7 @@ impl TorrentSession {
         }
         ctx.host.tcp_close(conn);
         self.recompute_availability();
+        self.maybe_reannounce_empty_swarm(ctx);
     }
 
     fn block_count(&self, piece: u32) -> u16 {
@@ -2145,7 +2386,7 @@ impl TorrentSession {
             if p.phase != PeerPhase::Ready {
                 return;
             }
-            p.should_be_interested(&our_have)
+            p.should_be_interested(&our_have, &self.piece_priorities)
         };
         let p = match self.peers.get_mut(&conn) {
             Some(p) => p,
@@ -2630,12 +2871,52 @@ impl TorrentSession {
                 }
                 TrackerKind::Udp => {
                     let st = &mut self.trackers[idx];
-                    if st.udp.phase != UdpPhase::Idle
-                        && ctx.now.saturating_sub(st.udp.sent_at) >= 15_000
-                    {
-                        st.udp.phase = UdpPhase::Idle;
-                        let _ = st.udp.next_addr();
-                        st.fails = st.fails.saturating_add(1);
+                    // Fast retransmit (Issue 3, UDP tracker robustness): a
+                    // single dropped UDP packet must not stall the handshake
+                    // for 15 s. Connect requests are retried every 3 s (up to
+                    // MAX_ATTEMPTS), then the endpoint is rotated and the
+                    // tracker counts a failure; announce requests keep the
+                    // longer window (they are only sent after a successful
+                    // connect, so the path is already proven).
+                    if st.udp.phase != UdpPhase::Idle {
+                        let retry_ms = if st.udp.phase == UdpPhase::ConnectSent {
+                            3_000
+                        } else {
+                            15_000
+                        };
+                        if ctx.now.saturating_sub(st.udp.sent_at) >= retry_ms {
+                            if st.udp.attempts >= UdpTrackerState::MAX_ATTEMPTS {
+                                st.udp.phase = UdpPhase::Idle;
+                                st.udp.attempts = 0;
+                                let _ = st.udp.next_addr();
+                                st.fails = st.fails.saturating_add(1);
+                                st.failure = Some(String::from("udp tracker timeout"));
+                            } else if st.udp.phase == UdpPhase::ConnectSent {
+                                // Re-send the stateless connect request.
+                                st.udp.attempts += 1;
+                                st.udp.sent_at = ctx.now;
+                                st.udp.tid = rand_u32(ctx.now);
+                                let req = tracker::udp::build_connect_request(st.udp.tid);
+                                if let Some(a) = st.udp.current_addr() {
+                                    if ctx.host.udp_send(&a, &req).is_err() {
+                                        st.udp.phase = UdpPhase::Idle;
+                                        st.udp.attempts = 0;
+                                        st.fails = st.fails.saturating_add(1);
+                                        st.failure = Some(String::from("udp send failed"));
+                                        let _ = st.udp.next_addr();
+                                    }
+                                }
+                                self.tracker_cursor = (idx + 1) % total;
+                                self.announce_at = ctx.now + 3_000;
+                                return;
+                            } else {
+                                st.udp.phase = UdpPhase::Idle;
+                                st.udp.attempts = 0;
+                                let _ = st.udp.next_addr();
+                                st.fails = st.fails.saturating_add(1);
+                                st.failure = Some(String::from("udp tracker timeout"));
+                            }
+                        }
                     }
                     if st.udp.phase == UdpPhase::Idle {
                         if st.udp.addrs.is_empty() {
@@ -2647,6 +2928,7 @@ impl TorrentSession {
                         if let Some(a) = st.udp.current_addr() {
                             st.udp.tid = rand_u32(ctx.now);
                             st.udp.sent_at = ctx.now;
+                            st.udp.attempts = 0;
                             let req = tracker::udp::build_connect_request(st.udp.tid);
                             if ctx.host.udp_send(&a, &req).is_err() {
                                 st.fails = st.fails.saturating_add(1);
@@ -2663,7 +2945,7 @@ impl TorrentSession {
                     }
                     if st.udp.phase == UdpPhase::ConnectSent {
                         self.tracker_cursor = (idx + 1) % total;
-                        self.announce_at = ctx.now + 15_000;
+                        self.announce_at = ctx.now + 3_000;
                         return;
                     }
                 }
@@ -2722,7 +3004,8 @@ impl TorrentSession {
     /// Whether this session owns the async HTTP job `id` (tracker announce
     /// or web-seed block fetch). The engine uses this to route results.
     pub fn owns_http_job(&self, id: u64) -> bool {
-        self.trackers.iter().any(|t| t.http_job_id == id) || self.webseed.job_id == id
+        self.trackers.iter().any(|t| t.http_job_id == id)
+            || self.webseed.in_flight.iter().any(|j| j.job_id == id)
     }
 
     /// Apply a completed async HTTP tracker announce. The engine polls the
@@ -2767,25 +3050,28 @@ impl TorrentSession {
         }
     }
 
-    /// Apply a completed async web-seed (BEP-19) range fetch.
+    /// Apply a completed async web-seed (BEP-19) range fetch. The result is
+    /// routed to the matching parallel job (mirror), which is removed from
+    /// the in-flight set before the block is applied.
     pub fn on_range_job_done<H: Host>(
         &mut self,
         id: u64,
         result: Result<Vec<u8>>,
         ctx: &'_ mut SessionCtx<'_, H>,
     ) {
-        if self.webseed.job_id != id {
-            return;
-        }
-        self.webseed.job_id = 0;
-        let blen = self.webseed.job_len;
+        let pos = match self.webseed.in_flight.iter().position(|j| j.job_id == id) {
+            Some(p) => p,
+            None => return,
+        };
+        let job = self.webseed.in_flight.remove(pos);
+        let blen = job.len;
         let body = result.unwrap_or_default();
         let got = if body.len() as u64 == blen {
             Ok(())
         } else {
             Err(Error::Protocol)
         };
-        self.webseed_apply_block(got, &body, blen, ctx.now);
+        self.webseed_apply_block(job.seed, job.block, blen, got, &body, ctx.now);
     }
 
     /// Handle a UDP tracker datagram routed to this session.
@@ -2815,6 +3101,7 @@ impl TorrentSession {
                         .take(128)
                         .collect::<String>();
                     st.udp.phase = UdpPhase::Idle;
+                    st.udp.attempts = 0;
                     st.fails = st.fails.saturating_add(1);
                     st.failure = Some(if reason.is_empty() {
                         String::from("udp tracker error")
@@ -2833,6 +3120,7 @@ impl TorrentSession {
                             st.udp.phase = UdpPhase::AnnounceSent;
                             st.udp.tid = rand_u32(ctx.now);
                             st.udp.sent_at = ctx.now;
+                            st.udp.attempts = 0;
                             let left = self
                                 .torrent
                                 .as_ref()
@@ -2853,6 +3141,7 @@ impl TorrentSession {
                             if let Some(a) = st.udp.current_addr() {
                                 if ctx.host.udp_send(&a, &req).is_err() {
                                     st.udp.phase = UdpPhase::Idle;
+                                    st.udp.attempts = 0;
                                     st.fails = st.fails.saturating_add(1);
                                     st.failure = Some(String::from("udp send failed"));
                                     let _ = st.udp.next_addr();
@@ -2864,6 +3153,7 @@ impl TorrentSession {
                         }
                         Err(_) => {
                             st.udp.phase = UdpPhase::Idle;
+                            st.udp.attempts = 0;
                             st.fails = st.fails.saturating_add(1);
                             let _ = st.udp.next_addr();
                             self.announce_at = ctx.now + 15_000;
@@ -2880,6 +3170,7 @@ impl TorrentSession {
                             st.interval = interval;
                             st.next_announce = ctx.now + interval * 1000;
                             st.udp.phase = UdpPhase::Idle;
+                            st.udp.attempts = 0;
                             st.fails = 0;
                             st.failure = None;
                             self.announce_at = ctx.now + interval * 1000;
@@ -2889,6 +3180,7 @@ impl TorrentSession {
                         }
                         Err(_) => {
                             st.udp.phase = UdpPhase::Idle;
+                            st.udp.attempts = 0;
                             handled = true;
                             break;
                         }
@@ -3091,6 +3383,9 @@ impl TorrentSession {
     fn fill_pipeline<H: Host>(&mut self, conn: ConnId, ctx: &'_ mut SessionCtx<'_, H>) {
         let opts = PickOptions {
             endgame: self.endgame,
+            // Streaming torrents (video) download head-first then strictly
+            // in file order, so the file is playable while it downloads.
+            sequential: self.scheduler.goal() == ContentGoal::Streaming,
         };
         let mut guard = 0u32;
         while guard < 512 {
@@ -3113,7 +3408,19 @@ impl TorrentSession {
                     Some(p) => p,
                     None => return,
                 };
-                match peer.current_piece.filter(|&p| !self.pieces.is_have(p)) {
+                // A committed piece is honoured only while it is still
+                // wanted: not already verified AND still selected (a runtime
+                // priority change to Skip must stop its in-flight blocks,
+                // not drain them to the end).
+                match peer.current_piece.filter(|&p| {
+                    !self.pieces.is_have(p)
+                        && self
+                            .piece_priorities
+                            .get(p as usize)
+                            .copied()
+                            .unwrap_or(1)
+                            > 0
+                }) {
                     Some(p) => p,
                     None => match Picker::pick_piece(
                         &self.pieces,
@@ -3163,7 +3470,9 @@ impl TorrentSession {
             if avail < len as u64 {
                 break;
             }
-            if self.tick_down_remaining < len as u64 {
+            // Shared per-tick global download budget (refilled once per
+            // engine tick; every session draws from the same pool).
+            if ctx.cache.tick_down_budget() < len as u64 {
                 break;
             }
             // Mechanism 3: the global in-flight window is exhausted (the
@@ -3173,7 +3482,7 @@ impl TorrentSession {
                 break;
             }
             self.download_limit.consume(len as u64, ctx.now);
-            self.tick_down_remaining -= len as u64;
+            ctx.cache.tick_down_consume(len as u64);
             self.pieces.mark_block_requested(piece, b, total_blocks);
             self.requested_by.entry((piece, b)).or_default().push(conn);
             self.requested_at.insert((piece, b), ctx.now);
@@ -3204,15 +3513,25 @@ impl TorrentSession {
     /// next pipeline fill.
     fn sweep_request_timeouts<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
         let now = ctx.now;
-        let timeout_ms = self.cfg.request_timeout_ms.max(1_000);
         let max_timeouts = self.cfg.max_request_timeouts.max(1);
         if self.requested_at.is_empty() {
             return;
         }
+        // Per-request timeout is pipeline-aware (Issue 2 resilience): a
+        // peer with N outstanding requests legitimately answers the LAST
+        // request after every earlier one has been served. Using a flat
+        // timeout here burned healthy-but-deep-pipeline seeds as "too slow",
+        // the swarm emptied mid-download and only a restart (which clears
+        // the in-memory ban list) made it work again.
+        let effective_timeout = self
+            .cfg
+            .request_timeout_ms
+            .max(1_000)
+            .saturating_add(self.cfg.request_pipeline as u64 * PIPELINE_TIMEOUT_GRACE_MS);
         let stale: Vec<(u32, u16)> = self
             .requested_at
             .iter()
-            .filter(|(_, t)| now.saturating_sub(**t) >= timeout_ms)
+            .filter(|(_, t)| now.saturating_sub(**t) >= effective_timeout)
             .map(|((p, b), _)| (*p, *b))
             .collect();
         if stale.is_empty() {
@@ -3239,6 +3558,9 @@ impl TorrentSession {
                         length: len,
                     });
                     p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
+                    // `requests_timed_out` is reset to 0 whenever the peer
+                    // delivers ANY block, so this counter is strictly
+                    // "consecutive timeouts with zero delivery in between".
                     p.requests_timed_out = p.requests_timed_out.saturating_add(1);
                     if p.requests_timed_out >= max_timeouts {
                         to_ban.push(c);
@@ -3265,7 +3587,49 @@ impl TorrentSession {
         }
     }
 
+    /// Resilience: a download that just lost its last ready peer must refill
+    /// its swarm quickly instead of sitting out the announce interval
+    /// (which can be 30 s+). Bounded to once per
+    /// [`SWARM_EMPTY_REANNOUNCE_MS`].
+    fn maybe_reannounce_empty_swarm<H: Host>(&mut self, ctx: &'_ mut SessionCtx<'_, H>) {
+        if self.status != SessionStatus::Downloading
+            && self.status != SessionStatus::FetchingMetadata
+        {
+            return;
+        }
+        if self.peers.values().any(|p| p.phase == PeerPhase::Ready) {
+            return;
+        }
+        let now = ctx.now;
+        if now.saturating_sub(self.last_swarm_empty_at) < SWARM_EMPTY_REANNOUNCE_MS {
+            return;
+        }
+        self.last_swarm_empty_at = now;
+        self.announce_at = now;
+        self.announce_to_tracker(ctx, TrackerEvent::None);
+        if let Some(dht) = ctx.dht.as_mut() {
+            dht.get_peers(self.tracker_hash, ctx.port, now);
+        }
+    }
+
     /// A block (piece message) arrived.
+    ///
+    /// Validation is deliberately **lenient**: the block must lie fully
+    /// inside the piece and be no larger than [`BLOCK_LEN`] — we do NOT
+    /// require the canonical 16 KiB sizing or 16 KiB alignment. Some
+    /// real-world clients send the exact tail remainder or odd-sized blocks;
+    /// strict checks turned those into protocol violations, dropped healthy
+    /// seeds mid-download, and (with block-level accounting) could leave a
+    /// piece permanently unverifiable. **Byte-exact assembly** (see
+    /// [`crate::piece::PieceBytes`]) makes any valid window safe:
+    ///   * only previously-missing bytes are written (a hostile peer cannot
+    ///     rewrite bytes another supplier already delivered);
+    ///   * a piece is "data-complete" only when EVERY byte is present, so a
+    ///     zero-filled hole can never reach the hasher (this is what made
+    ///     large-piece — e.g. 16 MiB — torrents fail their integrity check
+    ///     forever);
+    ///   * a standard block slot is marked received only once fully covered,
+    ///     so a partial block is transparently re-requested until it is.
     fn on_piece<H: Host>(
         &mut self,
         conn: ConnId,
@@ -3280,36 +3644,42 @@ impl TorrentSession {
         };
         let pi = t.piece_info(index)?;
         let total_blocks = block_count_for(pi.len);
-        let block = begin / BLOCK_LEN;
-        if (block as u16) >= total_blocks || !begin.is_multiple_of(BLOCK_LEN) {
+        let blen = data.len();
+        if blen == 0 || blen > BLOCK_LEN as usize || begin as usize + blen > pi.len as usize {
             return Err(Error::Protocol);
         }
-        if data.len() as u32 != core::cmp::min(BLOCK_LEN, pi.len - begin) {
+        // Standard block slots overlapped by `[begin, begin+blen)` (at most
+        // two, since a block is ≤ BLOCK_LEN).
+        let first_block = begin / BLOCK_LEN;
+        let last_block = (begin + blen as u32 - 1) / BLOCK_LEN;
+        if last_block as u16 >= total_blocks {
             return Err(Error::Protocol);
         }
-        // Resolve every outstanding request for this block: the delivering
-        // peer's request lands, the others (endgame duplicates) are
-        // cancelled. The (piece, block) entry is fully removed, so release
-        // one global in-flight slot per resolved request (mechanism 3).
-        if let Some(reqs) = self.requested_by.get(&(index, block as u16)) {
-            for &c in reqs {
-                if c != conn {
-                    if let Some(p) = self.peers.get_mut(&c) {
-                        p.send(&Message::Cancel {
-                            index,
-                            begin,
-                            length: data.len() as u32,
-                        });
-                        p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
+        // Resolve every outstanding request for the overlapped standard
+        // blocks: the delivering peer's request lands, the others (endgame
+        // duplicates) are cancelled. Each resolved request releases one
+        // global in-flight slot (mechanism 3).
+        for b in first_block..=last_block {
+            let b = b as u16;
+            if let Some(reqs) = self.requested_by.get(&(index, b)) {
+                for &c in reqs {
+                    if c != conn {
+                        if let Some(p) = self.peers.get_mut(&c) {
+                            p.send(&Message::Cancel {
+                                index,
+                                begin,
+                                length: data.len() as u32,
+                            });
+                            p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
+                        }
                     }
+                    ctx.cache.inflight_dec();
                 }
-                ctx.cache.inflight_dec();
             }
+            self.requested_by.remove(&(index, b));
+            self.requested_at.remove(&(index, b));
+            self.pieces.clear_block_requested(index, b, total_blocks);
         }
-        self.requested_by.remove(&(index, block as u16));
-        self.requested_at.remove(&(index, block as u16));
-        self.pieces
-            .clear_block_requested(index, block as u16, total_blocks);
         if let Some(p) = self.peers.get_mut(&conn) {
             p.requests_in_flight = p.requests_in_flight.saturating_sub(1);
             p.last_real_at = ctx.now;
@@ -3317,28 +3687,55 @@ impl TorrentSession {
             // resets (mechanism 2).
             p.requests_timed_out = 0;
         }
-        let newly = self
-            .pieces
-            .mark_block_received(index, block as u16, total_blocks);
-        if !newly {
-            // Duplicate / out-of-window block: the bytes are discarded.
-            self.discarded_bytes = self.discarded_bytes.saturating_add(data.len() as u64);
+        // Byte-exact accounting: only write previously-missing bytes.
+        // NOTE: `new_ranges` must be computed BEFORE `add` (the add merges
+        // the window into the tracker, after which nothing is "new").
+        let (new_ranges, newly) = {
+            let pb = self.piece_bytes.entry(index).or_default();
+            let ranges = pb.new_ranges(begin, begin + blen as u32);
+            let new_total = pb.add(begin, begin + blen as u32);
+            (ranges, new_total)
+        };
+        self.downloaded_bytes += blen as u64;
+        if newly == 0 {
+            // Fully duplicate / out-of-window: the bytes are discarded.
+            self.discarded_bytes = self.discarded_bytes.saturating_add(blen as u64);
             return Ok(());
         }
-        self.piece_suppliers.entry(index).or_default().push(conn);
         let entry = self
             .assembling
             .entry(index)
             .or_insert_with(|| vec![0u8; pi.len as usize]);
-        if begin as usize + data.len() <= entry.len() {
-            entry[begin as usize..begin as usize + data.len()].copy_from_slice(&data);
-        } else {
-            // Oversized / unaligned frame: untrustworthy, discard.
-            self.discarded_bytes = self.discarded_bytes.saturating_add(data.len() as u64);
+        for (s, e) in &new_ranges {
+            let src = (s - begin) as usize;
+            let dst = *s as usize;
+            let n = (e - s) as usize;
+            entry[dst..dst + n].copy_from_slice(&data[src..src + n]);
         }
-        self.downloaded_bytes += data.len() as u64;
+        self.piece_suppliers.entry(index).or_default().push(conn);
+        // A standard block slot is "received" only once fully covered.
+        for b in first_block..=last_block {
+            let b_begin = b * BLOCK_LEN;
+            let b_len = core::cmp::min(BLOCK_LEN, pi.len - b_begin);
+            if self
+                .piece_bytes
+                .get(&index)
+                .map(|pb| pb.covers(b_begin, b_begin + b_len))
+                .unwrap_or(false)
+            {
+                self.pieces
+                    .mark_block_received(index, b as u16, total_blocks);
+            }
+        }
         self.monitor.record_piece_cover(self.peer_addr(conn), index);
-        if self.pieces.piece_data_complete(index, total_blocks) {
+        // Byte-exact completion: every byte present (not merely every
+        // standard block slot "marked").
+        let complete = self
+            .piece_bytes
+            .get(&index)
+            .map(|pb| pb.total() >= pi.len as u64)
+            .unwrap_or(false);
+        if complete {
             if let Some(buf) = self.assembling.remove(&index) {
                 self.pieces.set_in_flight(index, true);
                 self.verifying.insert(index, total_blocks as u32);
@@ -3434,6 +3831,8 @@ impl TorrentSession {
         self.write_abs(ctx, abs, &buf)?;
         self.pieces.mark_piece_have(index);
         self.piece_suppliers.remove(&index);
+        self.piece_bytes.remove(&index);
+        self.assembling.remove(&index);
         let conns: Vec<ConnId> = self.peers.keys().copied().collect();
         for c in conns {
             if let Some(p) = self.peers.get_mut(&c) {
@@ -3468,6 +3867,8 @@ impl TorrentSession {
         ctx: &'_ mut SessionCtx<'_, H>,
     ) {
         self.pieces.reset_piece(index);
+        self.piece_bytes.remove(&index);
+        self.assembling.remove(&index);
         self.monitor.record_hash_failure(index);
         self.scheduler.mark_suspicious(index);
         self.punish_corrupt_suppliers(index, total_blocks, ctx);
@@ -3692,7 +4093,12 @@ impl TorrentSession {
             if take == 0 {
                 break;
             }
-            let disk = *self.files.get(file_idx as usize).ok_or(Error::NotFound)?;
+            let disk = match self.files.get(file_idx as usize).and_then(|o| *o) {
+                Some(d) => d,
+                // Skipped file: no handle was ever opened. Reads only ever
+                // target verified (selected) pieces, so this is defensive.
+                None => break,
+            };
             let n = ctx
                 .cache
                 .read(ctx.host, disk, file_off, &mut buf[got..got + take as usize])?;
@@ -3725,14 +4131,19 @@ impl TorrentSession {
             if take == 0 {
                 break;
             }
-            let disk = *self.files.get(file_idx as usize).ok_or(Error::NotFound)?;
+            let disk = match self.files.get(file_idx as usize).and_then(|o| *o) {
+                Some(d) => d,
+                // Skipped file: no handle was ever opened. Writes only ever
+                // target verified (selected) pieces, so this is defensive.
+                None => return Err(Error::NotFound),
+            };
             ctx.cache
                 .write(ctx.host, disk, file_off, &data[off..off + take as usize])?;
             off += take as usize;
             pos += take;
         }
         // flush the piece right away so verified data hits disk promptly
-        if let Some(disk) = self.files.first().copied() {
+        if let Some(disk) = self.files.iter().find_map(|o| *o) {
             let _ = ctx.cache.flush_disk(ctx.host, disk);
         }
         Ok(())
@@ -3891,7 +4302,7 @@ where
 /// session (so a torrent with dead/blocked trackers still finds peers);
 /// only when nothing at all was declared do we fall back to the full
 /// built-in public list (qBittorrent/BitComet compatible).
-fn seed_trackers<I: IntoIterator<Item = Vec<u8>>>(
+fn seed_trackers<I: IntoIterator<Item = (u32, Vec<u8>)>>(
     from: I,
     cfg: &SessionConfig,
 ) -> Vec<TrackerState> {
@@ -3899,35 +4310,42 @@ fn seed_trackers<I: IntoIterator<Item = Vec<u8>>>(
     // real IP and leak it, so they are dropped at load time.
     let anonymous = cfg.proxy.is_some();
     let mut out: Vec<TrackerState> = Vec::new();
-    for url in from {
-        push_tracker_if_allowed(&mut out, url, anonymous);
+    // BEP-12: tiers from the torrent first; config extras and community
+    // fallbacks share the tier after the highest declared one so the
+    // torrent's OWN trackers are always announced before the extras.
+    let mut next_tier = 0u32;
+    for (tier, url) in from {
+        next_tier = core::cmp::max(next_tier, tier.saturating_add(1));
+        push_tracker_if_allowed(&mut out, url, tier, anonymous);
     }
     for url in &cfg.trackers {
-        push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
+        push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), next_tier, anonymous);
     }
     // Always give every torrent a few reliable extra announce targets
     // (unless the user explicitly disabled default trackers).
     if cfg.use_default_trackers {
         for url in crate::trackerlist::FALLBACK_TRACKERS {
-            push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
+            push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), next_tier, anonymous);
         }
     }
     if out.is_empty() && cfg.use_default_trackers {
         for url in crate::trackerlist::DEFAULT_TRACKERS {
-            push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), anonymous);
+            push_tracker_if_allowed(&mut out, url.as_bytes().to_vec(), next_tier, anonymous);
         }
     }
+    // Stable tier-major order: primary trackers always come first.
+    out.sort_by_key(|t| t.tier);
     out
 }
 
-fn push_tracker_if_allowed(out: &mut Vec<TrackerState>, url: Vec<u8>, anonymous: bool) {
+fn push_tracker_if_allowed(out: &mut Vec<TrackerState>, url: Vec<u8>, tier: u32, anonymous: bool) {
     if anonymous && detect_tracker_kind(&url) == TrackerKind::Udp {
         return;
     }
-    push_tracker(out, url);
+    push_tracker(out, url, tier);
 }
 
-fn push_tracker(out: &mut Vec<TrackerState>, url: Vec<u8>) {
+fn push_tracker(out: &mut Vec<TrackerState>, url: Vec<u8>, tier: u32) {
     if out.iter().any(|t| t.url == url) {
         return;
     }
@@ -3935,6 +4353,7 @@ fn push_tracker(out: &mut Vec<TrackerState>, url: Vec<u8>) {
     out.push(TrackerState {
         url,
         kind,
+        tier,
         interval: 1800,
         next_announce: 0,
         http_pending_until: 0,
@@ -4267,6 +4686,200 @@ mod tests {
             .any(|w| w == Message::Interested.encode().as_slice()));
     }
 
+    /// Selective download: of 3 files the user keeps only the middle one.
+    /// The engine must (a) derive per-piece priorities that exclude every
+    /// piece of the skipped files, (b) never offer a skipped piece to the
+    /// picker — even from a have_all seed — and (c) never send a block
+    /// request for a skipped piece through the real pipeline.
+    #[test]
+    fn selective_download_picks_only_the_selected_file() {
+        use crate::picker::{PickOptions, Picker};
+        // 3 files × 4 pieces (64 KiB each) → 12 pieces, contiguous v1 layout:
+        // file 0 = pieces 0..4, file 1 = pieces 4..8, file 2 = pieces 8..12.
+        let pl = 64 * 1024u32;
+        let mut hashes = Vec::new();
+        for _ in 0..12 {
+            hashes.push([0xAAu8; 20]);
+        }
+        let t = Torrent {
+            name: String::from("sel"),
+            piece_length: pl,
+            total_size: pl as u64 * 12,
+            files: vec![
+                FileEntry {
+                    path: vec![b"a.bin".to_vec()],
+                    length: pl as u64 * 4,
+                    root: None,
+                },
+                FileEntry {
+                    path: vec![b"b.bin".to_vec()],
+                    length: pl as u64 * 4,
+                    root: None,
+                },
+                FileEntry {
+                    path: vec![b"c.bin".to_vec()],
+                    length: pl as u64 * 4,
+                    root: None,
+                },
+            ],
+            kind: TorrentKind::V1,
+            info_hash: InfoHash::v1([9u8; 20]),
+            v1_hashes: Some(hashes),
+            v2_hashes: None,
+            announce: None,
+            announce_list: Vec::new(),
+            web_seeds: Vec::new(),
+            private: false,
+            piece_layers: Vec::new(),
+            info_raw: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+        };
+        let cfg = SessionConfig {
+            save_dir: String::from("/tmp"),
+            file_priorities: vec![
+                FilePriority::Skip,
+                FilePriority::Normal,
+                FilePriority::Skip,
+            ],
+            ..Default::default()
+        };
+        let mut s = TorrentSession::from_torrent(t, cfg, 1_000_000).expect("session");
+        // Only file b (4 pieces) is selected.
+        assert_eq!(s.selected_piece_count(), 4);
+        for p in 0..12 {
+            let prio = s.piece_priorities.get(p as usize).copied().unwrap_or(1);
+            let expected = if (4..8).contains(&p) { 1 } else { 0 };
+            assert_eq!(prio, expected, "piece {p} priority");
+        }
+        // (b) The picker must never offer a skipped piece, even from a
+        // have_all seed whose bitfield covers everything.
+        let mut peer = Bitfield::new(12);
+        peer.set_all();
+        let util = vec![0i64; 12];
+        let avail = vec![1u32; 12];
+        let opts = PickOptions::default();
+        let mut picked = alloc::collections::BTreeSet::new();
+        for _ in 0..12 {
+            let p = Picker::pick_piece(
+                &s.pieces,
+                &util,
+                &avail,
+                &peer,
+                true,
+                &s.piece_priorities,
+                opts,
+            );
+            match p {
+                Some(p) => {
+                    assert!(
+                        (4..8).contains(&p),
+                        "picker returned a skipped piece {p}"
+                    );
+                    picked.insert(p);
+                    s.pieces.set_in_flight(p, true);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(picked.len(), 4, "only the selected pieces are pickable");
+
+        // (c) The real pipeline must never request a skipped piece.
+        let mut s2 = TorrentSession::from_torrent(
+            {
+                // rebuild (s was mutated above)
+                let mut hashes = Vec::new();
+                for _ in 0..12 {
+                    hashes.push([0xAAu8; 20]);
+                }
+                Torrent {
+                    name: String::from("sel"),
+                    piece_length: pl,
+                    total_size: pl as u64 * 12,
+                    files: vec![
+                        FileEntry {
+                            path: vec![b"a.bin".to_vec()],
+                            length: pl as u64 * 4,
+                            root: None,
+                        },
+                        FileEntry {
+                            path: vec![b"b.bin".to_vec()],
+                            length: pl as u64 * 4,
+                            root: None,
+                        },
+                        FileEntry {
+                            path: vec![b"c.bin".to_vec()],
+                            length: pl as u64 * 4,
+                            root: None,
+                        },
+                    ],
+                    kind: TorrentKind::V1,
+                    info_hash: InfoHash::v1([9u8; 20]),
+                    v1_hashes: Some(hashes),
+                    v2_hashes: None,
+                    announce: None,
+                    announce_list: Vec::new(),
+                    web_seeds: Vec::new(),
+                    private: false,
+                    piece_layers: Vec::new(),
+                    info_raw: Vec::new(),
+                    comment: None,
+                    created_by: None,
+                    creation_date: None,
+                }
+            },
+            SessionConfig {
+                save_dir: String::from("/tmp"),
+                file_priorities: vec![
+                    FilePriority::Skip,
+                    FilePriority::Normal,
+                    FilePriority::Skip,
+                ],
+                ..Default::default()
+            },
+            1_000_000,
+        )
+        .expect("session2");
+        s2.status = SessionStatus::Downloading;
+        let mut host = NoopHost;
+        let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        cache.set_tick_down_budget(u64::MAX);
+        let mut events = Vec::new();
+        let mut ctx = SessionCtx {
+            host: &mut host,
+            cache: &mut cache,
+            peer_id: [7u8; 20],
+            port: 6881,
+            now: 1_000_000,
+            dht: None,
+            events: &mut events,
+        };
+        // Handshake must carry THIS torrent's tracker hash ([9;20]) or the
+        // seed is dropped as "unknown torrent".
+        s2.attach_peer(
+            1,
+            NetAddr::V4([93, 184, 216, 34], 6881),
+            true,
+            DiscoverySource::Tracker,
+            &mut ctx,
+        );
+        let seg = remote_handshake_plus_first_messages([9u8; 20], true);
+        s2.on_data(1, &seg, &mut ctx);
+        assert!(
+            s2.peers.contains_key(&1),
+            "seed dropped during handshake"
+        );
+        s2.peers.get_mut(&1).unwrap().am_interested = true;
+        s2.fill_pipeline(1, &mut ctx);
+        let requested: Vec<u32> = s2.requested_by.keys().map(|(p, _)| *p).collect();
+        assert!(!requested.is_empty(), "pipeline must issue requests");
+        assert!(
+            requested.iter().all(|p| (4..8).contains(p)),
+            "pipeline requested skipped pieces: {requested:?}"
+        );
+    }
+
     /// A one-piece, one-block v1 torrent whose sole piece is a known byte
     /// pattern (so its SHA-1 can be computed up front and the piece will
     /// verify when the seed sends it back).
@@ -4313,6 +4926,9 @@ mod tests {
         let mut s = TorrentSession::from_torrent(t, cfg, 1_000_000).expect("session");
         let mut host = NoopHost;
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        // Unlimited shared per-tick download budget for direct (non-engine)
+        // test harnesses — the engine refills this each tick in production.
+        cache.set_tick_down_budget(u64::MAX);
         let mut events = Vec::new();
         let mut ctx = SessionCtx {
             host: &mut host,
@@ -4339,7 +4955,6 @@ mod tests {
             assert!(!p.peer_choking, "seed unchoke not processed");
             assert!(p.am_interested, "not interested in a have_all seed");
         }
-        s.tick_down_remaining = u64::MAX;
         s.tick_up_allowance = u64::MAX;
         s.fill_pipeline(1, &mut ctx);
         {
@@ -4498,17 +5113,17 @@ mod tests {
     fn webseed_block_resolves_url_and_file_relative_range() {
         let s = session();
         let t = test_torrent();
-        let (url, start, end, len) = s.webseed_block(&t, 0, 0).unwrap();
+        let (url, start, end, len) = s.webseed_block(&t, 0, 0, 0).unwrap();
         assert_eq!(url, "http://seed.example/base/dir/a.bin");
         assert_eq!(start, 0);
         assert_eq!(end, (BLOCK_LEN - 1) as u64);
         assert_eq!(len, BLOCK_LEN as u64);
-        let (url, start, end, len) = s.webseed_block(&t, 2, 0).unwrap();
+        let (url, start, end, len) = s.webseed_block(&t, 2, 0, 0).unwrap();
         assert_eq!(url, "http://seed.example/base/b.bin");
         assert_eq!(start, 256 * 1024u64);
         assert_eq!(end, 256 * 1024u64 + 99);
         assert_eq!(len, 100);
-        assert!(s.webseed_block(&t, 2, 1).is_none());
+        assert!(s.webseed_block(&t, 2, 1, 0).is_none());
     }
 
     #[test]
@@ -4597,6 +5212,7 @@ mod tests {
         s.trackers.push(TrackerState {
             url: b"http://tracker.example.com/announce".to_vec(),
             kind: TrackerKind::Http,
+            tier: 0,
             interval: 1800,
             next_announce: 0,
             http_pending_until: 0,
@@ -4660,6 +5276,7 @@ mod tests {
         s.trackers.push(TrackerState {
             url: b"http://tracker.example.com/announce".to_vec(),
             kind: TrackerKind::Http,
+            tier: 0,
             interval: 1800,
             next_announce: 0,
             http_pending_until: 0,
@@ -4711,7 +5328,7 @@ mod tests {
     }
 
     #[test]
-    fn async_webseed_fetches_block_and_releases_job() {
+    fn async_webseed_fetches_blocks_in_parallel_and_releases_jobs() {
         let mut s = session();
         s.status = SessionStatus::Downloading;
         s.web_seeds = vec![String::from("http://seed.example/base/")];
@@ -4720,6 +5337,7 @@ mod tests {
         s.webseed.next_block = 0;
         s.webseed.total_blocks = block_count_for(256 * 1024);
         s.webseed.data = vec![0u8; 256 * 1024];
+        s.webseed.seed_fails = vec![0u32; 1];
         let mut host = AsyncHttpHost {
             next_job: 0,
             urls: Vec::new(),
@@ -4727,7 +5345,7 @@ mod tests {
         };
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
         let mut events = Vec::new();
-        // Phase 1: drive_webseed fires an async range job (never blocks).
+        // Phase 1: drive_webseed fills the parallel window (never blocks).
         {
             let mut ctx = SessionCtx {
                 host: &mut host,
@@ -4740,13 +5358,20 @@ mod tests {
             };
             s.drive_webseed(&mut ctx);
         }
-        assert_eq!(host.urls.len(), 1, "range job must be enqueued");
-        let job_id = s.webseed.job_id;
-        assert_ne!(job_id, 0, "job id recorded");
-        // Phase 2: the worker returns the 16 KiB block.
-        let blen = s.webseed.job_len as usize;
-        host.done.push((job_id, Ok(vec![0x42u8; blen])));
-        let jobs = host.http_take_done();
+        let n = s.webseed.in_flight.len();
+        assert_eq!(n, WebSeedState::MAX_INFLIGHT, "parallel window filled");
+        assert_eq!(host.urls.len(), n, "range jobs enqueued");
+        assert_eq!(
+            s.webseed.next_block, n as u16,
+            "block cursor advanced by the window"
+        );
+        // Phase 2: the worker returns every 16 KiB block.
+        let jobs: Vec<u64> = s.webseed.in_flight.iter().map(|j| j.job_id).collect();
+        let blen = BLOCK_LEN as usize;
+        for id in &jobs {
+            host.done.push((*id, Ok(vec![0x42u8; blen])));
+        }
+        let done = host.http_take_done();
         {
             let mut ctx = SessionCtx {
                 host: &mut host,
@@ -4757,17 +5382,17 @@ mod tests {
                 dht: None,
                 events: &mut events,
             };
-            for (id, res) in jobs {
+            for (id, res) in done {
                 s.on_range_job_done(id, res, &mut ctx);
             }
         }
-        assert_eq!(
-            s.webseed.job_id, 0,
-            "job released so the next block is fetched"
-        );
-        assert_eq!(s.webseed.next_block, 1, "block advanced");
         assert!(
-            s.webseed.data[..blen].iter().all(|&b| b == 0x42),
+            s.webseed.in_flight.is_empty(),
+            "all jobs released so the window refills"
+        );
+        assert_eq!(s.webseed.next_block, n as u16, "blocks advanced");
+        assert!(
+            s.webseed.data[..n * blen].iter().all(|&b| b == 0x42),
             "block bytes applied"
         );
     }
@@ -4794,6 +5419,7 @@ mod tests {
             s.webseed.next_block = 0;
             s.webseed.total_blocks = block_count_for(256 * 1024);
             s.webseed.data = vec![0u8; 256 * 1024];
+            s.webseed.seed_fails = vec![0u32; 2];
         };
         let mut host = AsyncHttpHost {
             next_job: 0,
@@ -4803,8 +5429,7 @@ mod tests {
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
         let mut events = Vec::new();
 
-        // Drive one fetch, then fail it (returns through on_range_job_done).
-        let mut drive_then_fail = |s: &mut TorrentSession, host: &mut AsyncHttpHost| {
+        let mut drive_then_fail_all = |s: &mut TorrentSession, host: &mut AsyncHttpHost| {
             {
                 let mut ctx = SessionCtx {
                     host: &mut *host,
@@ -4817,10 +5442,12 @@ mod tests {
                 };
                 s.drive_webseed(&mut ctx);
             }
-            assert_ne!(s.webseed.job_id, 0, "a job must be in flight");
-            let job_id = s.webseed.job_id;
-            host.done.push((job_id, Err(crate::error::Error::Io)));
-            let jobs = host.http_take_done();
+            assert!(!s.webseed.in_flight.is_empty(), "jobs must be in flight");
+            let jobs: Vec<u64> = s.webseed.in_flight.iter().map(|j| j.job_id).collect();
+            for id in &jobs {
+                host.done.push((*id, Err(crate::error::Error::Io)));
+            }
+            let done = host.http_take_done();
             {
                 let mut ctx = SessionCtx {
                     host: &mut *host,
@@ -4831,44 +5458,29 @@ mod tests {
                     dht: None,
                     events: &mut events,
                 };
-                for (id, res) in jobs {
+                for (id, res) in done {
                     s.on_range_job_done(id, res, &mut ctx);
                 }
             }
         };
 
-        // Failure 1: counted on seed 0, no rotation.
+        // One parallel window: 4 blocks across 2 mirrors (2 per mirror, per
+        // the MAX_INFLIGHT window). With max_fails = 2 both mirrors hit
+        // their limit in a single round → the piece is aborted and the
+        // session backs off (the OLD code never backed off with >1 mirror).
         prime_piece(&mut s);
-        drive_then_fail(&mut s, &mut host);
-        assert_eq!(s.webseed.fails, 1, "first failure counted");
-        assert_eq!(s.webseed.seed_idx, 0, "still on seed 0");
-        assert_eq!(s.webseed.retry_at, 0, "no backoff after one failure");
-
-        // Failure 2: seed 0 hits max_fails -> rotate to seed 1 (no backoff yet).
-        drive_then_fail(&mut s, &mut host);
-        assert_eq!(s.webseed.seed_idx, 1, "rotated to seed 1");
-        assert_eq!(s.webseed.fails, 0, "fails reset per seed");
-        assert_eq!(
-            s.webseed.retry_at, 0,
-            "no backoff after only one seed tried"
+        drive_then_fail_all(&mut s, &mut host);
+        assert!(
+            s.webseed.seed_fails.iter().all(|f| *f >= 2),
+            "every mirror accumulated its failure limit: {:?}",
+            s.webseed.seed_fails
         );
-
-        // Failure 3: first failure on seed 1.
-        prime_piece(&mut s);
-        drive_then_fail(&mut s, &mut host);
-        assert_eq!(s.webseed.fails, 1, "seed 1 first failure");
-        assert_eq!(s.webseed.seed_idx, 1, "still on seed 1");
-
-        // Failure 4: seed 1 hits max_fails -> wraps to seed 0 -> BACK OFF.
-        drive_then_fail(&mut s, &mut host);
-        assert_eq!(s.webseed.seed_idx, 0, "wrapped back to seed 0");
-        assert_eq!(s.webseed.fails, 0, "fails reset for the new round");
+        assert!(s.webseed.piece.is_none(), "piece aborted during backoff");
         assert!(
             s.webseed.retry_at > 1_000_000,
             "backoff must be scheduled after ALL seeds failed (retry_at={})",
             s.webseed.retry_at
         );
-        assert!(s.webseed.piece.is_none(), "piece aborted during backoff");
 
         // While backing off, drive_webseed must NOT fire a new job.
         let before = host.urls.len();
@@ -4965,9 +5577,11 @@ mod tests {
         // ignored the config and always used the 256-block crate constant).
         let mut s = session();
         s.cfg.request_pipeline = 3;
-        s.tick_down_remaining = u64::MAX;
         let mut host = NoopHost;
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        // Unlimited shared per-tick download budget for direct (non-engine)
+        // test harnesses — the engine refills this each tick in production.
+        cache.set_tick_down_budget(u64::MAX);
         let mut events = Vec::new();
         let mut ctx = SessionCtx {
             host: &mut host,
@@ -5001,9 +5615,11 @@ mod tests {
         let mut s = session();
         s.cfg.request_pipeline = 2;
         s.cfg.request_timeout_ms = 5_000;
-        s.tick_down_remaining = u64::MAX;
         let mut host = NoopHost;
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        // Unlimited shared per-tick download budget for direct (non-engine)
+        // test harnesses — the engine refills this each tick in production.
+        cache.set_tick_down_budget(u64::MAX);
         let mut events = Vec::new();
         let mut ctx = SessionCtx {
             host: &mut host,
@@ -5051,9 +5667,11 @@ mod tests {
         s.cfg.request_pipeline = 1;
         s.cfg.request_timeout_ms = 5_000;
         s.cfg.max_request_timeouts = 2;
-        s.tick_down_remaining = u64::MAX;
         let mut host = NoopHost;
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        // Unlimited shared per-tick download budget for direct (non-engine)
+        // test harnesses — the engine refills this each tick in production.
+        cache.set_tick_down_budget(u64::MAX);
         let mut events = Vec::new();
         let mut ctx = SessionCtx {
             host: &mut host,
@@ -5100,9 +5718,11 @@ mod tests {
         // sessions — no further requests are issued until blocks land.
         let mut s = session();
         s.cfg.request_pipeline = 8;
-        s.tick_down_remaining = u64::MAX;
         let mut host = NoopHost;
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        // Unlimited shared per-tick download budget for direct (non-engine)
+        // test harnesses — the engine refills this each tick in production.
+        cache.set_tick_down_budget(u64::MAX);
         assert_eq!(cache.max_inflight_blocks(), 64);
         for _ in 0..63 {
             cache.inflight_inc();
@@ -5133,9 +5753,11 @@ mod tests {
         // window slot returns and a fresh request is issued.
         let mut s = session();
         s.cfg.request_pipeline = 8;
-        s.tick_down_remaining = u64::MAX;
         let mut host = NoopHost;
         let mut cache = crate::disk_cache::DiskCache::new(1024 * 1024);
+        // Unlimited shared per-tick download budget for direct (non-engine)
+        // test harnesses — the engine refills this each tick in production.
+        cache.set_tick_down_budget(u64::MAX);
         // 62 blocks already outstanding → 2 free slots.
         for _ in 0..62 {
             cache.inflight_inc();

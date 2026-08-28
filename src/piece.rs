@@ -8,6 +8,121 @@ use crate::error::Result;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+/// Exact received-byte accounting for one assembling piece.
+///
+/// Standard block bitmaps cannot express partial or misaligned blocks: an
+/// 8 KiB block would mark a 16 KiB slot "received", leaving the missing
+/// half unrequestable (permanently stuck) or — worse — letting a zero-filled
+/// hole reach the hasher, which then fails verification forever. This
+/// tracker records the exact set of non-overlapping byte ranges actually
+/// copied into the piece buffer, so a piece is "data-complete" iff every
+/// byte is present. Real-world clients that send tail-remainder or
+/// odd-sized blocks are absorbed safely instead of poisoning the piece.
+#[derive(Debug, Clone, Default)]
+pub struct PieceBytes {
+    /// Sorted, non-overlapping received ranges `[start, end)`.
+    ranges: Vec<(u32, u32)>,
+    /// Total distinct bytes received.
+    total: u64,
+}
+
+impl PieceBytes {
+    /// Create an empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the byte window `[start, end)`; returns the number of bytes that
+    /// were previously missing (0 = fully duplicate). The window is merged
+    /// into the sorted range list.
+    pub fn add(&mut self, start: u32, end: u32) -> u64 {
+        if end <= start {
+            return 0;
+        }
+        let mut new_bytes = (end - start) as u64;
+        // Subtract bytes already covered by existing ranges (ranges are
+        // sorted and non-overlapping, so this is exact).
+        for &(rs, re) in &self.ranges {
+            if re <= start {
+                continue;
+            }
+            if rs >= end {
+                break;
+            }
+            let ov_s = core::cmp::max(start, rs);
+            let ov_e = core::cmp::min(end, re);
+            new_bytes = new_bytes.saturating_sub((ov_e - ov_s) as u64);
+        }
+        if new_bytes == 0 {
+            return 0;
+        }
+        // Insert then merge overlapping/adjacent ranges (the list stays
+        // tiny in practice — at most a handful of fragments per piece).
+        self.ranges.push((start, end));
+        self.ranges.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.ranges.len());
+        for (s, e) in self.ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = core::cmp::max(last.1, e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+        self.ranges = merged;
+        self.total = self.total.saturating_add(new_bytes);
+        new_bytes
+    }
+
+    /// Distinct bytes present.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Whether the window `[start, end)` is fully covered by received bytes.
+    pub fn covers(&self, start: u32, end: u32) -> bool {
+        for &(rs, re) in &self.ranges {
+            if rs <= start && re >= end {
+                return true;
+            }
+            if rs > start {
+                break;
+            }
+        }
+        false
+    }
+
+    /// The sub-windows of `[start, end)` that are **not** yet covered.
+    /// Used so an arriving block only ever writes previously-missing bytes —
+    /// a hostile peer must not be able to rewrite bytes another peer already
+    /// supplied (that would corrupt a good piece and frame an innocent
+    /// supplier).
+    pub fn new_ranges(&self, start: u32, end: u32) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        let mut cur = start;
+        for &(rs, re) in &self.ranges {
+            if re <= cur {
+                continue;
+            }
+            if rs >= end {
+                break;
+            }
+            if rs > cur {
+                out.push((cur, core::cmp::min(rs, end)));
+            }
+            cur = core::cmp::max(cur, core::cmp::min(re, end));
+            if cur >= end {
+                break;
+            }
+        }
+        if cur < end {
+            out.push((cur, end));
+        }
+        out
+    }
+}
+
 /// State of a single piece.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceState {
@@ -342,5 +457,42 @@ mod tests {
         t.set_in_flight(1, true);
         let cands: Vec<u32> = t.candidates().collect();
         assert_eq!(cands, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn piece_bytes_counts_only_new_bytes() {
+        let mut p = PieceBytes::new();
+        // First block: full 16 KiB.
+        assert_eq!(p.add(0, 16 * 1024), 16 * 1024);
+        assert_eq!(p.total(), 16 * 1024);
+        // Exact duplicate → nothing new.
+        assert_eq!(p.add(0, 16 * 1024), 0);
+        assert_eq!(p.total(), 16 * 1024);
+        // Adjoining second block → 16 KiB new, ranges merge into one.
+        assert_eq!(p.add(16 * 1024, 32 * 1024), 16 * 1024);
+        assert_eq!(p.total(), 32 * 1024);
+        assert!(p.covers(0, 32 * 1024));
+        assert!(!p.covers(32 * 1024, 48 * 1024));
+    }
+
+    #[test]
+    fn piece_bytes_handles_partial_and_misaligned_blocks() {
+        let mut p = PieceBytes::new();
+        // An 8 KiB half-block (short block / tail remainder style).
+        assert_eq!(p.add(0, 8 * 1024), 8 * 1024);
+        assert_eq!(p.total(), 8 * 1024);
+        assert!(!p.covers(0, 16 * 1024), "half block is not a full block");
+        // The missing half arrives later → counted, never double-counted.
+        assert_eq!(p.add(8 * 1024, 16 * 1024), 8 * 1024);
+        assert_eq!(p.total(), 16 * 1024);
+        assert!(p.covers(0, 16 * 1024));
+        // Misaligned tail block overlapping already-received bytes.
+        assert_eq!(p.add(12 * 1024, 20 * 1024), 4 * 1024);
+        assert_eq!(p.total(), 20 * 1024);
+        assert!(p.covers(12 * 1024, 20 * 1024));
+        // Whole-piece coverage after a final fragment.
+        assert_eq!(p.add(20 * 1024, 32 * 1024), 12 * 1024);
+        assert_eq!(p.total(), 32 * 1024);
+        assert!(p.covers(0, 32 * 1024));
     }
 }

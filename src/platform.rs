@@ -384,6 +384,16 @@ pub trait Host {
         Ok(())
     }
 
+    /// Send one datagram to a multicast group **from the dedicated LSD
+    /// socket** (BEP-14). Sending from the port-6771 socket makes the
+    /// announce/reply flow symmetric: a neighbour's unicast reply comes back
+    /// to 6771 (the socket that is always drained for LSD), instead of
+    /// depending on the shared BT-port socket. Falls back to the shared
+    /// socket when no dedicated LSD socket exists.
+    fn udp_multicast_send_lsd(&mut self, addr: &NetAddr, data: &[u8]) -> Result<()> {
+        self.udp_multicast_send(addr, data)
+    }
+
     /// Receive one datagram (non-blocking). `Err(WouldBlock)` = none pending.
     fn udp_recv(&mut self, buf: &mut [u8]) -> Result<(NetAddr, usize)>;
 

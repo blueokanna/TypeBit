@@ -41,6 +41,13 @@ pub struct CacheStats {
 /// before new requests are held back. The cap is derived from the byte
 /// budget (`budget / block size`), so a smaller cache automatically throttles
 /// concurrency and a bigger one lets a fat pipe stay full.
+///
+/// It additionally carries the **per-tick global download budget** (the
+/// shared half of the engine's token buckets): every session's
+/// `fill_pipeline` draws from the same counter, so active torrents
+/// collectively can never exceed the global download limit while a lone
+/// downloader gets the whole pipe (no more dividing the limit by the number
+/// of active torrents and wasting the idle ones' shares).
 #[derive(Debug)]
 pub struct DiskCache {
     budget: u64,
@@ -57,6 +64,10 @@ pub struct DiskCache {
     inflight_blocks: usize,
     /// Global in-flight block cap: `budget / BLOCK_LEN`, floored at one.
     max_inflight_blocks: usize,
+    /// Per-tick global download budget (bytes) — refilled once per engine
+    /// tick from the engine's global download bucket and shared by every
+    /// session's pipeline fill (see module docs).
+    tick_down_budget: u64,
     /// Stats.
     pub stats: CacheStats,
 }
@@ -86,6 +97,7 @@ impl DiskCache {
                 1,
                 (budget / crate::consts::BLOCK_LEN as u64) as usize,
             ),
+            tick_down_budget: 0,
             stats: CacheStats::default(),
         }
     }
@@ -122,6 +134,24 @@ impl DiskCache {
     /// the peer disconnected).
     pub fn inflight_dec(&mut self) {
         self.inflight_blocks = self.inflight_blocks.saturating_sub(1);
+    }
+
+    // -- shared per-tick global download budget -----------------------------
+
+    /// Refill the per-tick download budget (called once per engine tick
+    /// from the engine's global download bucket).
+    pub fn set_tick_down_budget(&mut self, v: u64) {
+        self.tick_down_budget = v;
+    }
+
+    /// Remaining per-tick global download budget (bytes).
+    pub fn tick_down_budget(&self) -> u64 {
+        self.tick_down_budget
+    }
+
+    /// Consume from the shared per-tick download budget.
+    pub fn tick_down_consume(&mut self, n: u64) {
+        self.tick_down_budget = self.tick_down_budget.saturating_sub(n);
     }
 
     /// Cache budget.

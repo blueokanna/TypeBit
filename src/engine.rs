@@ -191,6 +191,12 @@ pub struct Engine<H: Host> {
     /// immediately (bounded burst) so LAN neighbours find the new seed
     /// within seconds instead of waiting for the round-robin.
     lsd_last_active: Vec<[u8; 20]>,
+    /// LSD (BEP-14) diagnostics: announces multicast out, BT-SEARCH
+    /// datagrams received, peers discovered via LSD. Surfaces in the
+    /// snapshot so LAN discovery is verifiable (not a black box).
+    lsd_sent: u64,
+    lsd_received: u64,
+    lsd_discovered: u64,
     /// Last time a spontaneous `find_node` (bucket refresh) was started.
     last_dht_find_node: u64,
     /// Counter for deriving refresh targets (cheap deterministic random).
@@ -240,7 +246,10 @@ impl<H: Host> Engine<H> {
         } else {
             None
         };
-        let global_up = TokenBucket::new(cfg.global_upload_limit_bps, now);
+        // Upload bucket uses the tolerance-tight burst (any 1 s window stays
+        // within `limit × (1 + tol)`); the download bucket keeps the classic
+        // burst so a fresh download can legitimately fill the pipe.
+        let global_up = TokenBucket::new_upload(cfg.global_upload_limit_bps, now);
         let global_down = TokenBucket::new(cfg.global_download_limit_bps, now);
         let portmap = if cfg.port_mapping {
             let pc = PortMapConfig {
@@ -305,6 +314,9 @@ impl<H: Host> Engine<H> {
             lsd: crate::lsd::LsdScheduler::new(lsd_cookie, now, lsd_interval),
             lsd_last_reply: BTreeMap::new(),
             lsd_last_active: Vec::new(),
+            lsd_sent: 0,
+            lsd_received: 0,
+            lsd_discovered: 0,
             last_dht_find_node: now,
             dht_refresh_serial: 0,
             verify_pool,
@@ -931,20 +943,35 @@ impl<H: Host> Engine<H> {
                 });
             }
         }
-        let active = self
-            .sessions
-            .values()
-            .filter(|s| s.is_active())
-            .count()
-            .max(1) as u64;
-        let up_avail = self.global_up.available(now);
-        let down_avail = self.global_down.available(now);
-        let up_slice = up_avail / active;
-        let down_slice = down_avail / active;
+        // Global budget distribution. The OLD code pre-sliced the per-tick
+        // allowance by the number of active torrents (`up_avail / active`),
+        // which had two defects:
+        //   1. under-utilization — an active torrent with nothing to send
+        //      still reserved its share, so a lone downloader never reached
+        //      the configured limit;
+        //   2. burstiness — the whole (up to one-second) allowance was
+        //      handed to a session at once, producing a burst-then-stall
+        //      pattern instead of a steady stream at the limit.
+        // Now the GLOBAL buckets are the single authority:
+        //   * upload — every active session gets an unlimited per-tick
+        //     allowance, and `pump_connection` caps each send against
+        //     `global_up.available()` (tolerance-tight burst);
+        //   * download — the engine refills ONE shared per-tick budget on
+        //     the disk cache, and every session's `fill_pipeline` draws
+        //     from the same counter (no per-session slice, no waste).
+        let _up_avail = self.global_up.available(now);
+        // DRAIN the global download bucket into the shared per-tick budget:
+        // `consume(u64::MAX)` hands out every available token and zeroes the
+        // bucket, so the next tick refills exactly `rate × dt` — the bucket
+        // is the rate authority and the budget cannot silently regenerate to
+        // full capacity every tick (which would have made the global
+        // download limit a no-op).
+        let down_budget = self.global_down.consume(u64::MAX, now);
+        self.cache.set_tick_down_budget(down_budget);
         for s in self.sessions.values_mut() {
             if s.is_active() {
-                s.tick_up_allowance = up_slice;
-                s.tick_down_remaining = down_slice;
+                s.tick_up_allowance = u64::MAX;
+                s.tick_down_remaining = u64::MAX;
             } else {
                 s.tick_up_allowance = 0;
                 s.tick_down_remaining = 0;
@@ -1516,7 +1543,8 @@ impl<H: Host> Engine<H> {
                         None => break,
                     };
                     let own = s.upload_limit.available(now);
-                    core::cmp::min(s.tick_up_allowance, own)
+                    let share = core::cmp::min(s.tick_up_allowance, own);
+                    core::cmp::min(share, self.global_up.available(now))
                 };
                 if allowance == 0 {
                     break;
@@ -1950,18 +1978,30 @@ impl<H: Host> Engine<H> {
         self.send_lsd_announce(ih);
     }
 
-    /// Build and multicast one LSD announce (v4 + v6 groups).
+    /// Build and multicast one LSD announce (v4 + v6 groups). Sends from
+    /// the dedicated port-6771 socket when available (symmetric flow: the
+    /// neighbour's unicast reply returns to 6771, which is always drained
+    /// for LSD), falling back to the shared BT-port socket.
     fn send_lsd_announce(&mut self, ih: &[u8; 20]) {
         let port = self.cfg.listen_port;
         let cookie = self.lsd.cookie;
         let msg4 = crate::lsd::build_announce(ih, port, Some(&cookie), crate::lsd::LSD_GROUP_V4);
         let _ = self
             .host
-            .udp_multicast_send(&crate::lsd::LSD_GROUP_V4, &msg4);
+            .udp_multicast_send_lsd(&crate::lsd::LSD_GROUP_V4, &msg4);
         let msg6 = crate::lsd::build_announce(ih, port, Some(&cookie), crate::lsd::LSD_GROUP_V6);
         let _ = self
             .host
-            .udp_multicast_send(&crate::lsd::LSD_GROUP_V6, &msg6);
+            .udp_multicast_send_lsd(&crate::lsd::LSD_GROUP_V6, &msg6);
+        self.lsd_sent = self.lsd_sent.saturating_add(1);
+        self.host.log(
+            LogLevel::Debug,
+            &alloc::format!(
+                "LSD announce {} ({} total)",
+                crate::metainfo::InfoHash::v1(*ih).to_hex(),
+                self.lsd_sent
+            ),
+        );
     }
 
     /// Handle one LSD datagram: either a neighbour announcing a torrent we
@@ -1975,6 +2015,7 @@ impl<H: Host> Engine<H> {
     /// a hostile neighbour could spoof a victim's source address on a burst
     /// of `BT-SEARCH` datagrams and make us reflect traffic at them.
     fn handle_lsd_datagram(&mut self, addr: NetAddr, payload: &[u8], now: u64) {
+        self.lsd_received = self.lsd_received.saturating_add(1);
         let Some(ann) = crate::lsd::parse(payload) else {
             return;
         };
@@ -2018,7 +2059,14 @@ impl<H: Host> Engine<H> {
             s.enqueue_peer(peer_addr, crate::monitoring::DiscoverySource::Lsd, now);
             s.monitor
                 .record_discovery(crate::monitoring::DiscoverySource::Lsd);
+            self.lsd_discovered = self.lsd_discovered.saturating_add(1);
         }
+    }
+
+    /// LSD (BEP-14) diagnostics: `(announces_sent, datagrams_received,
+    /// peers_discovered_via_lsd)`. Lets the UI show LAN discovery is alive.
+    pub fn lsd_stats(&self) -> (u64, u64, u64) {
+        (self.lsd_sent, self.lsd_received, self.lsd_discovered)
     }
 
     /// Number of trackers currently considered active across all sessions:

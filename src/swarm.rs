@@ -209,27 +209,40 @@ impl Peer {
         self.have_all || self.have.get(p)
     }
 
-    /// Whether we should be interested (they have something we lack).
+    /// Whether we should be interested (they have a piece we WANT).
+    ///
+    /// "Want" is **selective-download aware**: a piece we lack is only
+    /// wanted when its per-piece priority is non-zero (it belongs to a
+    /// selected file). A peer that only carries skipped-file pieces must
+    /// not trigger `Interested` — otherwise we'd hold unchoke slots and
+    /// waste handshakes on peers we can never download from.
     ///
     /// Deliberately **independent of choke state**: gating interest on
     /// `peer_choking` deadlocks fresh downloads (a seed unchokes only
     /// interested peers, but we'd never declare interest while choked).
     /// Send `Interested` as soon as their availability shows a wanted piece.
-    pub fn should_be_interested(&self, our_have: &Bitfield) -> bool {
+    pub fn should_be_interested(&self, our_have: &Bitfield, priorities: &[i64]) -> bool {
         if self.have_none {
             return false;
         }
         if self.have_all {
-            return !our_have.all_set();
+            // Interested iff some SELECTED piece is still missing.
+            let n = our_have.len().min(priorities.len() as u32);
+            for p in 0..n {
+                if priorities[p as usize] > 0 && !our_have.get(p) {
+                    return true;
+                }
+            }
+            return false;
         }
-        // any piece they have that we don't
+        // any piece they have that we lack AND want
         let n = self.have.len().min(our_have.len());
         let mut i = self.have.first_set();
         while let Some(p) = i {
             if p >= n {
                 break;
             }
-            if !our_have.get(p) {
+            if priorities.get(p as usize).copied().unwrap_or(1) > 0 && !our_have.get(p) {
                 return true;
             }
             i = self.have.next_set_from(p + 1);
@@ -332,15 +345,48 @@ mod tests {
         p.have.set(5);
         let mut ours = Bitfield::new(64);
         ours.set(5);
-        assert!(!p.should_be_interested(&ours));
+        let all = [1i64; 64];
+        assert!(!p.should_be_interested(&ours, &all));
         ours.clear(5);
-        assert!(p.should_be_interested(&ours));
+        assert!(p.should_be_interested(&ours, &all));
         // choking must NOT suppress interest (interest ≠ unchoke) — a seed
         // that unchokes only interested peers would otherwise deadlock us.
         p.peer_choking = true;
-        assert!(p.should_be_interested(&ours));
+        assert!(p.should_be_interested(&ours, &all));
         // have_none (they have nothing) still suppresses interest
         p.have_none = true;
-        assert!(!p.should_be_interested(&ours));
+        assert!(!p.should_be_interested(&ours, &all));
+    }
+
+    #[test]
+    fn interest_is_selective_download_aware() {
+        // The peer owns pieces 5 and 6. We lack both, but piece 6 belongs
+        // to a SKIPPED file (priority 0) — we must NOT declare interest.
+        let mut p = peer(1);
+        p.have.set(5);
+        p.have.set(6);
+        let ours = Bitfield::new(64);
+        let mut prio = [1i64; 64];
+        prio[6] = 0; // skipped
+        assert!(p.should_be_interested(&ours, &prio), "wanted piece 5");
+        prio[5] = 0; // now every piece the peer has is skipped
+        assert!(
+            !p.should_be_interested(&ours, &prio),
+            "a peer with only skipped-file pieces must not trigger interest"
+        );
+        // have_all seed with every selected piece already verified → no
+        // interest either (avoids useless unchoke slots).
+        let mut p2 = peer(2);
+        p2.have_all = true;
+        let mut have = Bitfield::new(64);
+        for (i, &pr) in prio.iter().enumerate() {
+            if pr > 0 {
+                have.set(i as u32);
+            }
+        }
+        assert!(!p2.should_be_interested(&have, &prio));
+        // Missing a SELECTED piece (7) → interested again.
+        have.clear(7);
+        assert!(p2.should_be_interested(&have, &prio));
     }
 }
