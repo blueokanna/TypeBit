@@ -138,9 +138,6 @@ impl Sha1 {
             self.n = 0;
             data = &data[want..];
         }
-        // Full blocks are compressed straight out of the caller's buffer: the
-        // `try_into` is a reference cast, not a copy, and `chunks_exact`
-        // bounds-check-free for the compiler.
         let mut chunks = data.chunks_exact(64);
         for chunk in &mut chunks {
             let block: &[u8; 64] = chunk.try_into().unwrap();
@@ -207,8 +204,6 @@ pub fn digest_scalar(data: &[u8]) -> [u8; 20] {
     block[..rem.len()].copy_from_slice(rem);
     block[rem.len()] = 0x80;
     if rem.len() >= 56 {
-        // No room for the length word: compress the padding, then a block
-        // that carries nothing but the length.
         sha1_scalar(&mut state, &block);
         block = [0u8; 64];
     }
