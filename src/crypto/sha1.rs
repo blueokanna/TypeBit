@@ -48,11 +48,6 @@ mod hw {
 
     #[cfg(target_arch = "x86_64")]
     fn detect() -> bool {
-        // CPUID leaf 1: ECX bit 9 = SSSE3, bit 19 = SSE4.1;
-        // leaf 7 sub-leaf 0: EBX bit 29 = SHA extensions.
-        //
-        // Reading CPUID directly (instead of `is_x86_feature_detected!`) keeps
-        // detection working under `no_std`.
         let leaf1 = core::arch::x86_64::__cpuid(1);
         let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
         let ssse3 = leaf1.ecx & (1 << 9) != 0;
@@ -78,8 +73,6 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
     #[cfg(all(target_arch = "x86_64", feature = "simd"))]
     {
         if hw::available() {
-            // SAFETY: `hw::available` only reports `true` after CPUID confirmed
-            // `sha` + `ssse3` + `sse4.1`, and `block` is a full 64-byte block.
             unsafe { sha1_shani(state, block) };
             return;
         }
@@ -87,8 +80,6 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
     #[cfg(all(target_arch = "aarch64", feature = "simd"))]
     {
         if hw::available() {
-            // SAFETY: `hw::available` only reports `true` after HWCAP reported
-            // the ARMv8 SHA-1 extension, and `block` is a full 64-byte block.
             unsafe { sha1_armv8(state, block) };
             return;
         }
@@ -138,12 +129,10 @@ impl Sha1 {
             self.n = 0;
             data = &data[want..];
         }
-        let mut chunks = data.chunks_exact(64);
-        for chunk in &mut chunks {
-            let block: &[u8; 64] = chunk.try_into().unwrap();
+        let (chunks, rem) = data.as_chunks::<64>();
+        for block in chunks {
             compress(&mut self.state, block);
         }
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             self.block[..rem.len()].copy_from_slice(rem);
             self.n = rem.len();
@@ -193,12 +182,10 @@ pub fn digest_scalar(data: &[u8]) -> [u8; 20] {
         0x10325476,
         0xC3D2E1F0,
     ];
-    let mut chunks = data.chunks_exact(64);
-    for chunk in &mut chunks {
-        let block: &[u8; 64] = chunk.try_into().unwrap();
+    let (chunks, rem) = data.as_chunks::<64>();
+    for block in chunks {
         sha1_scalar(&mut state, block);
     }
-    let rem = chunks.remainder();
     let bit_len = (data.len() as u64).wrapping_mul(8);
     let mut block = [0u8; 64];
     block[..rem.len()].copy_from_slice(rem);
@@ -215,8 +202,6 @@ pub fn digest_scalar(data: &[u8]) -> [u8; 20] {
     }
     out
 }
-
-// ---------------------------------------------------------------- scalar path
 
 /// Name of the block-compression backend this process picked — `"sha-ni"` on
 /// x86_64 with the Intel SHA extensions, `"scalar"` everywhere else. Reported
@@ -321,8 +306,6 @@ fn sha1_scalar(state: &mut [u32; 5], block: &[u8; 64]) {
 unsafe fn sha1_shani(state: &mut [u32; 5], block: &[u8; 64]) {
     use core::arch::x86_64::*;
 
-    // Big-endian message words, highest word first (the layout `sha1rnds4`
-    // expects in its operand).
     let mask = _mm_set_epi64x(
         0x0001_0203_0405_0607u64 as i64,
         0x0809_0a0b_0c0d_0e0fu64 as i64,

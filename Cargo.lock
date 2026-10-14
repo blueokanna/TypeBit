@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "courierust"
-version = "1.0.2"
+version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7bb1a920b57e0d907847427287d74f2f0848c3ca89b74ae2e43c172586d581e"
+checksum = "3a028ca438579e10e069b61b81e796ed8180b0c60a7c27026dc1ef32d62d47e9"
 
 [[package]]
 name = "libc"
@@ -31,9 +31,9 @@ checksum = "84d8161c22b5b2d74b022b89480cdced97c716e9f819bf123fec0d810cb8bb86"
 
 [[package]]
 name = "rustbinary"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a4626197e4ea1997c2bcb74b6b54f2606db307d4a0edf1b01c484b4ce8b1ef"
+checksum = "229bae73c7a1daecd8f504d382ea8372683d1b2b30962048b051218ee96a6e7f"
 dependencies = [
  "nextjson",
 ]
@@ -61,9 +61,9 @@ dependencies = [
 
 [[package]]
 name = "tzcraft"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2f26e7052612413cd78cebbcef70a03ddfc0ae64998e16df5b72fc00703443c"
+checksum = "cec9458ae44ab93f5dfbbea23325c6dfef65cf1723358894785721e363e41635"
 
 [[package]]
 name = "windows-link"
