@@ -16,7 +16,14 @@ categories = [
     "cryptography",
     "web-programming::http-client",
 ]
-include = ["src/**", "README.md", "LICENSE", "docs/**", "examples/**"]
+include = [
+    "src/**",
+    "README.md",
+    "LICENSE",
+    "docs/**",
+    "examples/**",
+    "benches/**",
+]
 
 [lib]
 name = "typebit"
