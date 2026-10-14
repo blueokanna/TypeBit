@@ -50,10 +50,12 @@ before the CPU does.
 
 ## Honest gaps (next)
 
-* **aarch64** still runs the portable path: the ARMv8 SHA-1 instructions
-  (`SHA1C`/`SHA1M`/`SHA1P` + the schedule pipeline) are not wired up yet.
 * **SHA-256** (BitTorrent v2 / BEP-52 blocks, receipts) is still scalar; the
   same SHA-NI machinery covers it (`sha256rnds2`/`sha256msg1`/`sha256msg2`).
+* **ARMv8 numbers**: the aarch64 path is validated for *correctness* under
+  QEMU against the scalar reference (with the extension enabled and disabled),
+  and selected at runtime there — but QEMU cannot show its speed, so no
+  aarch64 throughput number is claimed here until it runs on real hardware.
 * Nothing here profiles the engine *outside* hashing — peer protocol, disk
-  staging and the JNI boundary are unmeasured, so any claim about them would
+  staging and the host boundary are unmeasured, so any claim about them would
   be a guess.

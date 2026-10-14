@@ -3,25 +3,28 @@
 //! Two interchangeable block-compression backends, both producing identical
 //! digests:
 //!
-//! * **x86 SHA-NI** — the Intel SHA extensions (`sha`, `ssse3`, `sse4.1`),
-//!   enabled by the default `simd` feature. Four rounds per instruction;
-//!   measured ~3× the scalar path per core (see `benches/sha1.rs`).
+//! * **hardware** (the default `simd` feature) — the Intel SHA extensions on
+//!   x86_64 (`sha`, `ssse3`, `sse4.1`) and the ARMv8 crypto extension on
+//!   aarch64 (`sha2`). Four rounds per instruction; measured ~4× the scalar
+//!   path per core on x86 (see `benches/sha1.rs`).
 //! * **scalar** — portable reference, byte-for-byte compatible with the FIPS
 //!   180-1 vectors and the differential-test target for the accelerated path.
 //!
-//! The backend is chosen once per process from CPUID and cached in a relaxed
-//! atomic, so no call pays for detection. Everything that is not x86_64 with
-//! SHA extensions — including aarch64 — runs the scalar path.
+//! The backend is chosen once per process from CPUID / HWCAP and cached in a
+//! relaxed atomic, so no call pays for detection. aarch64 needs `std` for
+//! `is_aarch64_feature_detected!`, so a `no_std` aarch64 build compiles the
+//! portable path.
 //!
 //! The scalar path itself is written so the common case costs little: no
 //! per-block copy, no 80-word schedule array (a rolling 16-word window keeps
 //! everything in registers) and one compression per finalised block instead
 //! of the previous byte-at-a-time padding loop.
 
-/// Backend detection: x86_64 with the `simd` feature only, so a portable
-/// build has no `unsafe` at all. The answer is cached in one atomic, because
-/// a piece hash calls the compressor for every 64 bytes.
-#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+/// Backend detection, cached in one atomic because a piece hash calls the
+/// compressor for every 64 bytes: x86 SHA extensions via CPUID, ARMv8 crypto
+/// via HWCAP (which needs `std`'s feature detection, so a `no_std` aarch64
+/// build uses the portable path).
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "simd"))]
 mod hw {
     use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -31,32 +34,41 @@ mod hw {
 
     static BACKEND: AtomicU8 = AtomicU8::new(UNKNOWN);
 
-    /// True when this CPU has the Intel SHA extensions.
+    /// True when this CPU has the needed instructions.
     #[inline]
     pub(super) fn available() -> bool {
         let cached = BACKEND.load(Ordering::Relaxed);
         if cached != UNKNOWN {
             return cached == HW;
         }
-        let detected = if has_sha_ni() { HW } else { SCALAR };
+        let detected = if detect() { HW } else { SCALAR };
         BACKEND.store(detected, Ordering::Relaxed);
         detected == HW
     }
 
-    /// CPUID leaf 1: ECX bit 9 = SSSE3, bit 19 = SSE4.1;
-    /// leaf 7 sub-leaf 0: EBX bit 29 = SHA extensions.
-    ///
-    /// Reading CPUID directly (instead of `is_x86_feature_detected!`) keeps
-    /// detection working under `no_std`.
-    fn has_sha_ni() -> bool {
-        // `__cpuid`/`__cpuid_count` are unconditionally available on x86_64
-        // and take no pointers; the data comes straight from the CPU.
+    #[cfg(target_arch = "x86_64")]
+    fn detect() -> bool {
+        // CPUID leaf 1: ECX bit 9 = SSSE3, bit 19 = SSE4.1;
+        // leaf 7 sub-leaf 0: EBX bit 29 = SHA extensions.
+        //
+        // Reading CPUID directly (instead of `is_x86_feature_detected!`) keeps
+        // detection working under `no_std`.
         let leaf1 = core::arch::x86_64::__cpuid(1);
         let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
         let ssse3 = leaf1.ecx & (1 << 9) != 0;
         let sse41 = leaf1.ecx & (1 << 19) != 0;
         let sha = leaf7.ebx & (1 << 29) != 0;
         ssse3 && sse41 && sha
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "std"))]
+    fn detect() -> bool {
+        std::arch::is_aarch64_feature_detected!("sha2")
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "std")))]
+    fn detect() -> bool {
+        false
     }
 }
 
@@ -69,6 +81,15 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
             // SAFETY: `hw::available` only reports `true` after CPUID confirmed
             // `sha` + `ssse3` + `sse4.1`, and `block` is a full 64-byte block.
             unsafe { sha1_shani(state, block) };
+            return;
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "simd"))]
+    {
+        if hw::available() {
+            // SAFETY: `hw::available` only reports `true` after HWCAP reported
+            // the ARMv8 SHA-1 extension, and `block` is a full 64-byte block.
+            unsafe { sha1_armv8(state, block) };
             return;
         }
     }
@@ -210,6 +231,12 @@ pub fn backend_name() -> &'static str {
     {
         if hw::available() {
             return "sha-ni";
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "simd"))]
+    {
+        if hw::available() {
+            return "armv8-crypto";
         }
     }
     "scalar"
@@ -431,6 +458,103 @@ unsafe fn sha1_shani(state: &mut [u32; 5], block: &[u8; 64]) {
     abcd = _mm_shuffle_epi32(abcd, 0x1B);
     _mm_storeu_si128(state.as_mut_ptr() as *mut __m128i, abcd);
     state[4] = _mm_extract_epi32(e0, 3) as u32;
+}
+
+// ------------------------------------------------------------- aarch64 path
+
+/// ARMv8 crypto compression: four rounds per `SHA1C`/`SHA1P`/`SHA1M`, with the
+/// message schedule produced by `SHA1SU0`/`SHA1SU1` four words at a time.
+///
+/// The schedule pair is used exactly as ARM documents it:
+/// `su1(su0(W[i..i+4], W[i+4..i+8], W[i+8..i+12]), W[i+12..i+16])` yields
+/// `W[i+16..i+20]` in lanes 0-3 — the "expected" column of the probe in
+/// `docs/performance.md`'s companion test, not an assumption.
+///
+/// E for the next group is SHA-1's own bookkeeping — `ROL30(A)` of the state
+/// going into the group — which `SHA1H` computes.
+#[cfg(all(target_arch = "aarch64", feature = "simd"))]
+#[target_feature(enable = "sha2")]
+unsafe fn sha1_armv8(state: &mut [u32; 5], block: &[u8; 64]) {
+    use core::arch::aarch64::*;
+
+    /// Big-endian words with the first word in lane 0.
+    macro_rules! words {
+        ($off:expr) => {{
+            let p = block.as_ptr().add($off);
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p)))
+        }};
+    }
+    /// The next four schedule words.
+    macro_rules! sched {
+        ($a:expr, $b:expr, $c:expr, $d:expr) => {
+            vsha1su1q_u32(vsha1su0q_u32($a, $b, $c), $d)
+        };
+    }
+    /// One group of four rounds (`$instr` picks the round function and hence
+    /// the round constant bucket).
+    macro_rules! rounds {
+        ($abcd:ident, $e:ident, $k:expr, $msg:expr, $instr:ident) => {{
+            let wk = vaddq_u32($msg, vdupq_n_u32($k));
+            let next_e = vsha1h_u32(vgetq_lane_u32($abcd, 0));
+            $abcd = $instr($abcd, $e, wk);
+            $e = next_e;
+        }};
+    }
+
+    const K0: u32 = 0x5A82_7999;
+    const K1: u32 = 0x6ED9_EBA1;
+    const K2: u32 = 0x8F1B_BCDC;
+    const K3: u32 = 0xCA62_C1D6;
+
+    let mut abcd = vld1q_u32(state.as_ptr());
+    let abcd_save = abcd;
+    let mut e = state[4];
+
+    let v0 = words!(0);
+    let v1 = words!(16);
+    let v2 = words!(32);
+    let v3 = words!(48);
+
+    rounds!(abcd, e, K0, v0, vsha1cq_u32);
+    rounds!(abcd, e, K0, v1, vsha1cq_u32);
+    rounds!(abcd, e, K0, v2, vsha1cq_u32);
+    rounds!(abcd, e, K0, v3, vsha1cq_u32);
+    let v4 = sched!(v0, v1, v2, v3);
+    rounds!(abcd, e, K0, v4, vsha1cq_u32);
+    let v5 = sched!(v1, v2, v3, v4);
+    rounds!(abcd, e, K1, v5, vsha1pq_u32);
+    let v6 = sched!(v2, v3, v4, v5);
+    rounds!(abcd, e, K1, v6, vsha1pq_u32);
+    let v7 = sched!(v3, v4, v5, v6);
+    rounds!(abcd, e, K1, v7, vsha1pq_u32);
+    let v8 = sched!(v4, v5, v6, v7);
+    rounds!(abcd, e, K1, v8, vsha1pq_u32);
+    let v9 = sched!(v5, v6, v7, v8);
+    rounds!(abcd, e, K1, v9, vsha1pq_u32);
+    let v10 = sched!(v6, v7, v8, v9);
+    rounds!(abcd, e, K2, v10, vsha1mq_u32);
+    let v11 = sched!(v7, v8, v9, v10);
+    rounds!(abcd, e, K2, v11, vsha1mq_u32);
+    let v12 = sched!(v8, v9, v10, v11);
+    rounds!(abcd, e, K2, v12, vsha1mq_u32);
+    let v13 = sched!(v9, v10, v11, v12);
+    rounds!(abcd, e, K2, v13, vsha1mq_u32);
+    let v14 = sched!(v10, v11, v12, v13);
+    rounds!(abcd, e, K2, v14, vsha1mq_u32);
+    let v15 = sched!(v11, v12, v13, v14);
+    rounds!(abcd, e, K3, v15, vsha1pq_u32);
+    let v16 = sched!(v12, v13, v14, v15);
+    rounds!(abcd, e, K3, v16, vsha1pq_u32);
+    let v17 = sched!(v13, v14, v15, v16);
+    rounds!(abcd, e, K3, v17, vsha1pq_u32);
+    let v18 = sched!(v14, v15, v16, v17);
+    rounds!(abcd, e, K3, v18, vsha1pq_u32);
+    let v19 = sched!(v15, v16, v17, v18);
+    rounds!(abcd, e, K3, v19, vsha1pq_u32);
+
+    abcd = vaddq_u32(abcd, abcd_save);
+    vst1q_u32(state.as_mut_ptr(), abcd);
+    state[4] = state[4].wrapping_add(e);
 }
 
 #[cfg(test)]
