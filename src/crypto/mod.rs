@@ -1,6 +1,7 @@
 //! In-tree cryptography (the engine may only link the four ecosystem
-//! crates). Implemented from scratch, `no_std`, `unsafe`-free, pinned
-//! against standard test vectors:
+//! crates). Implemented from scratch, `no_std`, and `unsafe`-free except for
+//! the hardware compression paths pulled in by the `simd` feature (SHA-NI
+//! today, see [`sha1::backend_name`]), pinned against standard test vectors:
 //!
 //! - [`sha1`] — FIPS 180-1 (BitTorrent v1)
 //! - [`sha256`] — FIPS 180-4 (BitTorrent v2 / BEP-52, receipts)
@@ -25,7 +26,7 @@ pub use base58::{decode as base58_decode, encode as base58_encode};
 pub use base64::{decode as base64_decode, encode as base64_encode, Variant};
 pub use md4::Md4;
 pub use rng::Rng;
-pub use sha1::Sha1;
+pub use sha1::{backend_name as sha1_backend_name, digest_scalar as sha1_digest_scalar, Sha1};
 pub use sha256::Sha256;
 pub use sha512::Sha512;
 

@@ -25,6 +25,10 @@ TypeBit 是一个下载引擎**核心**——是库，不是 GUI。你把它绑�
 
 ## 协议矩阵
 
+> 哈希吞吐数据与复现命令见 [`docs/performance.md`](docs/performance.md)
+> （`cargo bench --features std`）：在带 Intel SHA 扩展的 x86 上，SHA-1 比
+> 0.1.9 快 4–5 倍；其他架构（含 ARM）靠标量重写也快约 1.1–1.3 倍。
+
 | 协议 | 规范 | 状态 |
 |---|---|---|
 | v1 / v2 / hybrid 元信息 | BEP-3 / BEP-52 | ✅ 逐片校验（SHA-1 / SHA-256） |

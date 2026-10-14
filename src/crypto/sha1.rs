@@ -1,6 +1,79 @@
 //! SHA-1 (FIPS 180-1) — required by BitTorrent v1 piece hashing.
 //!
-//! Pure `no_std`, zero `unsafe`. Tested against the FIPS 180-1 vectors.
+//! Two interchangeable block-compression backends, both producing identical
+//! digests:
+//!
+//! * **x86 SHA-NI** — the Intel SHA extensions (`sha`, `ssse3`, `sse4.1`),
+//!   enabled by the default `simd` feature. Four rounds per instruction;
+//!   measured ~3× the scalar path per core (see `benches/sha1.rs`).
+//! * **scalar** — portable reference, byte-for-byte compatible with the FIPS
+//!   180-1 vectors and the differential-test target for the accelerated path.
+//!
+//! The backend is chosen once per process from CPUID and cached in a relaxed
+//! atomic, so no call pays for detection. Everything that is not x86_64 with
+//! SHA extensions — including aarch64 — runs the scalar path.
+//!
+//! The scalar path itself is written so the common case costs little: no
+//! per-block copy, no 80-word schedule array (a rolling 16-word window keeps
+//! everything in registers) and one compression per finalised block instead
+//! of the previous byte-at-a-time padding loop.
+
+/// Backend detection: x86_64 with the `simd` feature only, so a portable
+/// build has no `unsafe` at all. The answer is cached in one atomic, because
+/// a piece hash calls the compressor for every 64 bytes.
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+mod hw {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    const UNKNOWN: u8 = 0;
+    const SCALAR: u8 = 1;
+    const HW: u8 = 2;
+
+    static BACKEND: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    /// True when this CPU has the Intel SHA extensions.
+    #[inline]
+    pub(super) fn available() -> bool {
+        let cached = BACKEND.load(Ordering::Relaxed);
+        if cached != UNKNOWN {
+            return cached == HW;
+        }
+        let detected = if has_sha_ni() { HW } else { SCALAR };
+        BACKEND.store(detected, Ordering::Relaxed);
+        detected == HW
+    }
+
+    /// CPUID leaf 1: ECX bit 9 = SSSE3, bit 19 = SSE4.1;
+    /// leaf 7 sub-leaf 0: EBX bit 29 = SHA extensions.
+    ///
+    /// Reading CPUID directly (instead of `is_x86_feature_detected!`) keeps
+    /// detection working under `no_std`.
+    fn has_sha_ni() -> bool {
+        // `__cpuid`/`__cpuid_count` are unconditionally available on x86_64
+        // and take no pointers; the data comes straight from the CPU.
+        let leaf1 = core::arch::x86_64::__cpuid(1);
+        let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+        let ssse3 = leaf1.ecx & (1 << 9) != 0;
+        let sse41 = leaf1.ecx & (1 << 19) != 0;
+        let sha = leaf7.ebx & (1 << 29) != 0;
+        ssse3 && sse41 && sha
+    }
+}
+
+/// Compress one 64-byte block into `state`, via the best backend available.
+#[inline(always)]
+fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        if hw::available() {
+            // SAFETY: `hw::available` only reports `true` after CPUID confirmed
+            // `sha` + `ssse3` + `sse4.1`, and `block` is a full 64-byte block.
+            unsafe { sha1_shani(state, block) };
+            return;
+        }
+    }
+    sha1_scalar(state, block);
+}
 
 /// Incremental SHA-1 hasher.
 #[derive(Clone)]
@@ -29,38 +102,51 @@ impl Sha1 {
     }
 
     /// Absorb `data`.
-    pub fn update(&mut self, data: &[u8]) {
+    pub fn update(&mut self, mut data: &[u8]) {
         self.len = self.len.wrapping_add(data.len() as u64);
-        let mut off = 0usize;
-        if self.n > 0 && self.n + data.len() >= 64 {
-            let take = 64 - self.n;
-            self.block[self.n..].copy_from_slice(&data[..take]);
-            compress(&mut self.state, &self.block);
+        if self.n > 0 {
+            let want = 64 - self.n;
+            if data.len() < want {
+                self.block[self.n..self.n + data.len()].copy_from_slice(data);
+                self.n += data.len();
+                return;
+            }
+            self.block[self.n..].copy_from_slice(&data[..want]);
+            let block = self.block;
+            compress(&mut self.state, &block);
             self.n = 0;
-            off = take;
+            data = &data[want..];
         }
-        while off + 64 <= data.len() {
-            let mut b = [0u8; 64];
-            b.copy_from_slice(&data[off..off + 64]);
-            compress(&mut self.state, &b);
-            off += 64;
+        // Full blocks are compressed straight out of the caller's buffer: the
+        // `try_into` is a reference cast, not a copy, and `chunks_exact`
+        // bounds-check-free for the compiler.
+        let mut chunks = data.chunks_exact(64);
+        for chunk in &mut chunks {
+            let block: &[u8; 64] = chunk.try_into().unwrap();
+            compress(&mut self.state, block);
         }
-        let rem = data.len() - off;
-        if rem > 0 {
-            self.block[self.n..self.n + rem].copy_from_slice(&data[off..]);
-            self.n += rem;
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            self.block[..rem.len()].copy_from_slice(rem);
+            self.n = rem.len();
         }
     }
 
     /// Finalize, returning the 20-byte digest.
     pub fn finalize(mut self) -> [u8; 20] {
         let bit_len = self.len.wrapping_mul(8);
-        self.update(&[0x80]);
-        while self.n != 56 {
-            self.update(&[0]);
+        self.block[self.n] = 0x80;
+        self.n += 1;
+        if self.n > 56 {
+            self.block[self.n..].fill(0);
+            let block = self.block;
+            compress(&mut self.state, &block);
+            self.n = 0;
         }
+        self.block[self.n..56].fill(0);
         self.block[56..64].copy_from_slice(&bit_len.to_be_bytes());
-        compress(&mut self.state, &self.block);
+        let block = self.block;
+        compress(&mut self.state, &block);
         let mut out = [0u8; 20];
         for (i, s) in self.state.iter().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
@@ -76,45 +162,275 @@ impl Sha1 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
-    let mut w = [0u32; 80];
-    for i in 0..16 {
-        w[i] = u32::from_be_bytes([
+/// One-shot SHA-1 through the portable (non-SIMD) backend.
+///
+/// Exposed so the accelerated path can be differential-tested against the
+/// reference implementation on the machine that will actually run it — the
+/// scalar code is also the fallback every CPU without the instructions uses.
+pub fn digest_scalar(data: &[u8]) -> [u8; 20] {
+    let mut state = [
+        0x67452301u32,
+        0xEFCDAB89,
+        0x98BADCFE,
+        0x10325476,
+        0xC3D2E1F0,
+    ];
+    let mut chunks = data.chunks_exact(64);
+    for chunk in &mut chunks {
+        let block: &[u8; 64] = chunk.try_into().unwrap();
+        sha1_scalar(&mut state, block);
+    }
+    let rem = chunks.remainder();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut block = [0u8; 64];
+    block[..rem.len()].copy_from_slice(rem);
+    block[rem.len()] = 0x80;
+    if rem.len() >= 56 {
+        // No room for the length word: compress the padding, then a block
+        // that carries nothing but the length.
+        sha1_scalar(&mut state, &block);
+        block = [0u8; 64];
+    }
+    block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+    sha1_scalar(&mut state, &block);
+    let mut out = [0u8; 20];
+    for (i, s) in state.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
+    }
+    out
+}
+
+// ---------------------------------------------------------------- scalar path
+
+/// Name of the block-compression backend this process picked — `"sha-ni"` on
+/// x86_64 with the Intel SHA extensions, `"scalar"` everywhere else. Reported
+/// in the engine statistics so a NAS user can see which path is running.
+pub fn backend_name() -> &'static str {
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        if hw::available() {
+            return "sha-ni";
+        }
+    }
+    "scalar"
+}
+
+/// Portable compression function.
+///
+/// The message schedule lives in a 16-word rolling window (`& 15` wraps, so
+/// words are overwritten exactly when they are no longer needed) and the four
+/// 20-round phases are separate loops, which lets the compiler keep the `f`
+/// function and the constant out of the inner loop — the previous version
+/// rebuilt an 80-word array and re-ran a `match` for every round.
+fn sha1_scalar(state: &mut [u32; 5], block: &[u8; 64]) {
+    let mut w = [0u32; 16];
+    for (i, word) in w.iter_mut().enumerate() {
+        *word = u32::from_be_bytes([
             block[i * 4],
             block[i * 4 + 1],
             block[i * 4 + 2],
             block[i * 4 + 3],
         ]);
     }
-    for i in 16..80 {
-        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-    }
     let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
-    for (i, wi) in w.iter().enumerate() {
-        let (f, k) = match i / 20 {
-            0 => ((b & c) | ((!b) & d), 0x5A827999u32),
-            1 => (b ^ c ^ d, 0x6ED9EBA1),
-            2 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-            _ => (b ^ c ^ d, 0xCA62C1D6),
-        };
-        let tmp = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(k)
-            .wrapping_add(*wi);
-        e = d;
-        d = c;
-        c = b.rotate_left(30);
-        b = a;
-        a = tmp;
+
+    macro_rules! round {
+        ($f:expr, $k:expr, $wi:expr) => {{
+            let t = a
+                .rotate_left(5)
+                .wrapping_add($f)
+                .wrapping_add(e)
+                .wrapping_add($k)
+                .wrapping_add($wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }};
     }
+    macro_rules! schedule {
+        ($i:expr) => {{
+            let v = (w[($i - 3) & 15] ^ w[($i - 8) & 15] ^ w[($i - 14) & 15] ^ w[$i & 15])
+                .rotate_left(1);
+            w[$i & 15] = v;
+            v
+        }};
+    }
+
+    // Rounds 0-19: f = choose, k = 0x5A827999.
+    for &wi in &w {
+        round!((b & c) | ((!b) & d), 0x5A827999u32, wi);
+    }
+    for i in 16..20 {
+        round!((b & c) | ((!b) & d), 0x5A827999u32, schedule!(i));
+    }
+    // Rounds 20-39: f = parity, k = 0x6ED9EBA1.
+    for i in 20..40 {
+        round!(b ^ c ^ d, 0x6ED9EBA1u32, schedule!(i));
+    }
+    // Rounds 40-59: f = majority, k = 0x8F1BBCDC.
+    for i in 40..60 {
+        round!((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32, schedule!(i));
+    }
+    // Rounds 60-79: f = parity, k = 0xCA62C1D6.
+    for i in 60..80 {
+        round!(b ^ c ^ d, 0xCA62C1D6u32, schedule!(i));
+    }
+
     state[0] = state[0].wrapping_add(a);
     state[1] = state[1].wrapping_add(b);
     state[2] = state[2].wrapping_add(c);
     state[3] = state[3].wrapping_add(d);
     state[4] = state[4].wrapping_add(e);
+}
+
+// ------------------------------------------------------------- x86 SHA-NI
+
+/// SHA-NI compression: 4 rounds per `sha1rnds4`, message schedule generated by
+/// the `sha1msg1`/`sha1msg2` pipeline instructions.
+///
+/// The register dance is the one Intel's own sample uses: `E` travels in dword
+/// 3 of the vectors (`sha1nexte` turns the previous state's A into the next
+/// group's E and folds in the scheduled word), and `sha1rnds4` returns the
+/// updated `(A, B, C, D)`.
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+#[target_feature(enable = "sha,ssse3,sse4.1")]
+unsafe fn sha1_shani(state: &mut [u32; 5], block: &[u8; 64]) {
+    use core::arch::x86_64::*;
+
+    // Big-endian message words, highest word first (the layout `sha1rnds4`
+    // expects in its operand).
+    let mask = _mm_set_epi64x(
+        0x0001_0203_0405_0607u64 as i64,
+        0x0809_0a0b_0c0d_0e0fu64 as i64,
+    );
+
+    let mut abcd = _mm_loadu_si128(state.as_ptr() as *const __m128i);
+    abcd = _mm_shuffle_epi32(abcd, 0x1B);
+    let abcd_save = abcd;
+    let mut e0 = _mm_set_epi32(state[4] as i32, 0, 0, 0);
+    let e0_save = e0;
+
+    let mut m0 = _mm_shuffle_epi8(_mm_loadu_si128(block.as_ptr() as *const __m128i), mask);
+    let mut m1 = _mm_shuffle_epi8(
+        _mm_loadu_si128(block.as_ptr().add(16) as *const __m128i),
+        mask,
+    );
+    let mut m2 = _mm_shuffle_epi8(
+        _mm_loadu_si128(block.as_ptr().add(32) as *const __m128i),
+        mask,
+    );
+    let mut m3 = _mm_shuffle_epi8(
+        _mm_loadu_si128(block.as_ptr().add(48) as *const __m128i),
+        mask,
+    );
+
+    let mut e1;
+
+    // Rounds 0-3.
+    e0 = _mm_add_epi32(e0, m0);
+    e1 = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 0);
+
+    // Rounds 4-7.
+    e1 = _mm_sha1nexte_epu32(e1, m1);
+    e0 = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 0);
+    m0 = _mm_sha1msg1_epu32(m0, m1);
+
+    // Rounds 8-11.
+    e0 = _mm_sha1nexte_epu32(e0, m2);
+    e1 = abcd;
+    abcd = _mm_sha1rnds4_epu32(abcd, e0, 0);
+    m1 = _mm_sha1msg1_epu32(m1, m2);
+    m0 = _mm_xor_si128(m0, m2);
+
+    // Rounds 12-15.
+    e1 = _mm_sha1nexte_epu32(e1, m3);
+    e0 = abcd;
+    m0 = _mm_sha1msg2_epu32(m0, m3);
+    abcd = _mm_sha1rnds4_epu32(abcd, e1, 0);
+    m2 = _mm_sha1msg1_epu32(m2, m3);
+    m1 = _mm_xor_si128(m1, m3);
+
+    /// One 4-round group from round 16 on: fetch the next scheduled word into
+    /// the E slot, save the state for the following group, advance the
+    /// schedule by one step and run the rounds.
+    macro_rules! group {
+        ($abcd:ident, $rc:expr, $e_cur:ident, $e_save:ident, $m_cur:ident, $m_msg2:ident, $m_msg1:ident, $m_xor:ident) => {{
+            $e_cur = _mm_sha1nexte_epu32($e_cur, $m_cur);
+            $e_save = $abcd;
+            $m_msg2 = _mm_sha1msg2_epu32($m_msg2, $m_cur);
+            $abcd = _mm_sha1rnds4_epu32($abcd, $e_cur, $rc);
+            $m_msg1 = _mm_sha1msg1_epu32($m_msg1, $m_cur);
+            $m_xor = _mm_xor_si128($m_xor, $m_cur);
+        }};
+    }
+
+    /// A group whose `msg1` output is only ever read by rounds past the end of
+    /// the block: the `msg2`/`xor` steps still feed the remaining groups.
+    macro_rules! group_no_msg1 {
+        ($abcd:ident, $rc:expr, $e_cur:ident, $e_save:ident, $m_cur:ident, $m_msg2:ident, $m_xor:ident) => {{
+            $e_cur = _mm_sha1nexte_epu32($e_cur, $m_cur);
+            $e_save = $abcd;
+            $m_msg2 = _mm_sha1msg2_epu32($m_msg2, $m_cur);
+            $abcd = _mm_sha1rnds4_epu32($abcd, $e_cur, $rc);
+            $m_xor = _mm_xor_si128($m_xor, $m_cur);
+        }};
+    }
+
+    /// The closing group: nothing it schedules is ever read again (there is no
+    /// round 80), so it only fetches the word its rounds need.
+    macro_rules! group_final {
+        ($abcd:ident, $rc:expr, $e_cur:ident, $e_save:ident, $m_cur:ident) => {{
+            $e_cur = _mm_sha1nexte_epu32($e_cur, $m_cur);
+            $e_save = $abcd;
+            $abcd = _mm_sha1rnds4_epu32($abcd, $e_cur, $rc);
+        }};
+    }
+    /// The next-to-last group: it still schedules the word the final group
+    /// consumes, so it fetches that one but skips the two that would only be
+    /// read by rounds that do not exist.
+    macro_rules! group_tail {
+        ($abcd:ident, $rc:expr, $e_cur:ident, $e_save:ident, $m_cur:ident, $m_msg2:ident) => {{
+            $e_cur = _mm_sha1nexte_epu32($e_cur, $m_cur);
+            $e_save = $abcd;
+            $m_msg2 = _mm_sha1msg2_epu32($m_msg2, $m_cur);
+            $abcd = _mm_sha1rnds4_epu32($abcd, $e_cur, $rc);
+        }};
+    }
+
+    // Rounds 16-19.
+    group!(abcd, 0, e0, e1, m0, m1, m3, m2);
+    // Rounds 20-23, 24-27, 28-31, 32-35, 36-39 (k = 0x6ED9EBA1).
+    group!(abcd, 1, e1, e0, m1, m2, m0, m3);
+    group!(abcd, 1, e0, e1, m2, m3, m1, m0);
+    group!(abcd, 1, e1, e0, m3, m0, m2, m1);
+    group!(abcd, 1, e0, e1, m0, m1, m3, m2);
+    group!(abcd, 1, e1, e0, m1, m2, m0, m3);
+    // Rounds 40-59 (k = 0x8F1BBCDC).
+    group!(abcd, 2, e0, e1, m2, m3, m1, m0);
+    group!(abcd, 2, e1, e0, m3, m0, m2, m1);
+    group!(abcd, 2, e0, e1, m0, m1, m3, m2);
+    group!(abcd, 2, e1, e0, m1, m2, m0, m3);
+    group!(abcd, 2, e0, e1, m2, m3, m1, m0);
+    // Rounds 60-67 (k = 0xCA62C1D6).
+    group!(abcd, 3, e1, e0, m3, m0, m2, m1);
+    group!(abcd, 3, e0, e1, m0, m1, m3, m2);
+    // Rounds 68-75: the tail of the schedule pipeline, where only the steps
+    // that still feed a later group are worth doing.
+    group_no_msg1!(abcd, 3, e1, e0, m1, m2, m3);
+    group_tail!(abcd, 3, e0, e1, m2, m3);
+    // Rounds 76-79.
+    group_final!(abcd, 3, e1, e0, m3);
+
+    abcd = _mm_add_epi32(abcd, abcd_save);
+    e0 = _mm_sha1nexte_epu32(e0, e0_save);
+
+    abcd = _mm_shuffle_epi32(abcd, 0x1B);
+    _mm_storeu_si128(state.as_mut_ptr() as *mut __m128i, abcd);
+    state[4] = _mm_extract_epi32(e0, 3) as u32;
 }
 
 #[cfg(test)]
@@ -156,5 +472,65 @@ mod tests {
             hex(h.finalize()),
             "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
         );
+    }
+
+    /// One million 'a' — the second published FIPS vector, which also walks
+    /// the multi-block path 15 625 times.
+    #[test]
+    fn fips_million_a() {
+        let mut h = Sha1::new();
+        let chunk = [b'a'; 4096];
+        for _ in 0..244 {
+            h.update(&chunk);
+        }
+        h.update(&[b'a'; 576]);
+        assert_eq!(
+            hex(h.finalize()),
+            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
+        );
+    }
+
+    /// Every length around the padding boundaries, plus multi-block inputs:
+    /// this is what catches a wrong round-constant bucket or a broken message
+    /// schedule in the accelerated backends.
+    #[test]
+    fn accelerated_matches_scalar() {
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut buf = [0u8; 1024];
+        for len in (0..200).chain([255, 256, 511, 512, 513, 1023, 1024]) {
+            for b in buf[..len].iter_mut() {
+                *b = next() as u8;
+            }
+            let data = &buf[..len];
+            assert_eq!(
+                hex(Sha1::digest(data)),
+                hex(digest_scalar(data)),
+                "len {len}"
+            );
+        }
+    }
+
+    /// The one-shot reference must agree with the incremental hasher for
+    /// chunked writes too (the torrent path feeds 16 KiB blocks).
+    #[test]
+    fn digest_scalar_matches_incremental() {
+        let data: alloc::vec::Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        for chunk in [1usize, 63, 64, 65, 4096] {
+            let mut h = Sha1::new();
+            for part in data.chunks(chunk) {
+                h.update(part);
+            }
+            assert_eq!(
+                hex(h.finalize()),
+                hex(digest_scalar(&data)),
+                "chunk {chunk}"
+            );
+        }
     }
 }

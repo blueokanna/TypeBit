@@ -32,9 +32,17 @@ courierust = { version = "1.0", default-features = false }
 socket2 = { version = "0.6.5", optional = true }
 
 [features]
-default = []
+default = ["simd"]
+# Hardware block-compression paths (x86 SHA-NI today; the scalar reference is
+# always compiled in and is bit-identical). Off = portable build, no `unsafe`
+# outside the `ffi` module.
+simd = []
 std = ["nextjson/std", "tzcraft/std", "courierust/std", "socket2"]
 ffi = ["std"]
+
+[[bench]]
+name = "sha1"
+harness = false
 
 [[example]]
 name = "ffi_demo"

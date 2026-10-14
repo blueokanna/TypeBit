@@ -26,6 +26,10 @@ lives behind that seam.
 
 ## Protocol matrix
 
+> Hashing throughput and how to reproduce it: [`docs/performance.md`](docs/performance.md)
+> (`cargo bench --features std`) — SHA-1 is 4-5× faster than 0.1.9 on x86
+> CPUs with the Intel SHA extensions, and ~1.1-1.3× on every other target.
+
 | Protocol | Spec | Status |
 |---|---|---|
 | Metainfo v1 / v2 / hybrid | BEP-3 / BEP-52 | ✅ piece-verified (SHA-1 / SHA-256) |

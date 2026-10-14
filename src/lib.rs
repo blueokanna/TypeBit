@@ -8,7 +8,7 @@
 //! crypto is in-tree under [`crypto`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(not(feature = "ffi"), deny(unsafe_code))]
+#![cfg_attr(all(not(feature = "ffi"), not(feature = "simd")), deny(unsafe_code))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
